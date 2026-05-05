@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-zinc-950 text-zinc-100 antialiased font-sans;
+    font-feature-settings: 'cv11', 'ss01', 'ss03';
+  }
+
+  /* Subtle scrollbars to match the theme */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #27272a; border-radius: 8px; border: 2px solid #09090b; }
+  ::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+
+  /* Dark scheme for native form widgets (date/month pickers, etc.) */
+  input[type="month"],
+  input[type="date"] {
+    color-scheme: dark;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg text-sm font-medium transition-colors
+           disabled:opacity-50 disabled:cursor-not-allowed
+           focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-500/40;
+  }
+  .btn-primary  { @apply bg-emerald-500 hover:bg-emerald-400 text-zinc-950 px-4 py-2; }
+  .btn-secondary { @apply bg-zinc-900 hover:bg-zinc-800 text-zinc-100 border border-zinc-800 px-4 py-2; }
+  .btn-ghost    { @apply text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/60 px-3 py-2; }
+
+  .input {
+    @apply w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-zinc-100
+           placeholder-zinc-500 transition-colors
+           focus:outline-none focus:border-emerald-500/60 focus:ring-1 focus:ring-emerald-500/30;
+  }
+
+  .card {
+    @apply bg-zinc-900/50 border border-zinc-800 rounded-xl;
+  }
+
+  .label {
+    @apply block text-[11px] uppercase tracking-wider text-zinc-500 mb-2;
+  }
+}

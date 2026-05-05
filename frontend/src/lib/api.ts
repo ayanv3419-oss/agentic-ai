@@ -1,0 +1,210 @@
+/**
+ * API client. Reads the Groq API key from the Zustand store at call time and
+ * forwards it as `X-Groq-Api-Key`. Base URL is configurable via VITE_API_BASE_URL.
+ *
+ * Backend wiring: the FastAPI route should read `request.headers.get("X-Groq-Api-Key")`
+ * and prefer it over the env-configured key.
+ */
+import { useAppStore } from '@/store/useAppStore'
+import type {
+  AuthMe,
+  DashboardData,
+  DisconnectResponse,
+  DriveSyncResult,
+  SseEvent,
+  UploadResponse,
+  UploadsListResponse,
+} from '@/types'
+
+const BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '/api'
+
+export class ApiError extends Error {
+  status: number
+  detail?: unknown
+  constructor(message: string, status: number, detail?: unknown) {
+    super(message)
+    this.status = status
+    this.detail = detail
+  }
+}
+
+function buildHeaders(extra?: HeadersInit): Headers {
+  const apiKey = useAppStore.getState().shop.groqApiKey
+  const h = new Headers(extra)
+  if (!h.has('Content-Type')) h.set('Content-Type', 'application/json')
+  if (apiKey) h.set('X-Groq-Api-Key', apiKey)
+  return h
+}
+
+async function handle<T>(res: Response, label: string): Promise<T> {
+  if (!res.ok) {
+    const detail = await res.json().catch(() => undefined)
+    // Surface the structured backend error to DevTools so "Failed to fetch"
+    // never hides what the server actually said.
+    // eslint-disable-next-line no-console
+    console.error(`[api] ${label} → HTTP ${res.status}`, detail)
+    throw new ApiError(`${label} ${res.status}`, res.status, detail)
+  }
+  return (await res.json()) as T
+}
+
+/** fetch wrapper that turns network-level failures into a logged ApiError
+ * (status=0). Browsers translate every CORS / DNS / connection-refused
+ * failure into the opaque `TypeError: Failed to fetch`; this catches and
+ * re-emits with the URL + cause for easier diagnosis. */
+async function safeFetch(input: RequestInfo, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(input, init)
+  } catch (e) {
+    const url = typeof input === 'string' ? input : (input as Request).url
+    const cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e)
+    // eslint-disable-next-line no-console
+    console.error(`[api] network error reaching ${url}`, e)
+    throw new ApiError(
+      `Network error reaching ${url} (${cause}). Backend down, wrong port, or CORS blocked.`,
+      0,
+      { cause, url },
+    )
+  }
+}
+
+export async function apiGet<T>(path: string): Promise<T> {
+  const res = await safeFetch(`${BASE_URL}${path}`, {
+    headers: buildHeaders(),
+    credentials: 'include',
+  })
+  return handle<T>(res, `GET ${path}`)
+}
+
+export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
+  const res = await safeFetch(`${BASE_URL}${path}`, {
+    method: 'POST',
+    headers: buildHeaders(),
+    credentials: 'include',
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  return handle<T>(res, `POST ${path}`)
+}
+
+export async function uploadFile<T>(path: string, file: File, extra?: Record<string, string>): Promise<T> {
+  const apiKey = useAppStore.getState().shop.groqApiKey
+  const fd = new FormData()
+  fd.append('file', file)
+  Object.entries(extra ?? {}).forEach(([k, v]) => fd.append(k, v))
+  const headers: Record<string, string> = {}
+  if (apiKey) headers['X-Groq-Api-Key'] = apiKey
+  // eslint-disable-next-line no-console
+  console.info(`[api] UPLOAD ${path} file=${file.name} bytes=${file.size}`)
+  const res = await safeFetch(`${BASE_URL}${path}`, {
+    method: 'POST',
+    headers,
+    body: fd,
+    credentials: 'include',
+  })
+  return handle<T>(res, `UPLOAD ${path}`)
+}
+
+export async function uploadSales(file: File, target: 'sales' | 'purchase' = 'sales'): Promise<UploadResponse> {
+  return uploadFile<UploadResponse>('/upload', file, { target })
+}
+
+export async function fetchUploadsList(): Promise<UploadsListResponse> {
+  return apiGet<UploadsListResponse>('/uploads')
+}
+
+export async function disconnectUpload(batchId: string): Promise<DisconnectResponse> {
+  return apiPost<DisconnectResponse>(`/uploads/${encodeURIComponent(batchId)}/disconnect`)
+}
+
+/**
+ * Stream SSE events from POST /query_stream.
+ * Calls onEvent for each parsed `event:`/`data:` block. The data field is
+ * JSON-parsed when possible.
+ */
+export async function streamQuery(
+  question: string,
+  onEvent: (e: SseEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const apiKey = useAppStore.getState().shop.groqApiKey
+  const res = await safeFetch(`${BASE_URL}/query_stream`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+      ...(apiKey ? { 'X-Groq-Api-Key': apiKey } : {}),
+    },
+    body: JSON.stringify({ question }),
+    signal,
+  })
+  if (!res.ok || !res.body) {
+    const detail = await res.json().catch(() => undefined)
+    // eslint-disable-next-line no-console
+    console.error(`[api] POST /query_stream → HTTP ${res.status}`, detail)
+    throw new ApiError(`POST /query_stream ${res.status}`, res.status, detail)
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    const blocks = buf.split('\n\n')
+    buf = blocks.pop() ?? ''
+    for (const block of blocks) {
+      if (!block.trim()) continue
+      let event = 'message'
+      let data = ''
+      for (const line of block.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim()
+        else if (line.startsWith('data:')) data += line.slice(5).trim()
+      }
+      if (!data) continue
+      try {
+        onEvent({ event, data: JSON.parse(data) })
+      } catch {
+        onEvent({ event, data })
+      }
+    }
+  }
+}
+
+export async function fetchDashboard(month?: string): Promise<DashboardData> {
+  const q = month ? `?month=${encodeURIComponent(month)}` : ''
+  return apiGet<DashboardData>(`/dashboard${q}`)
+}
+
+// --- Auth + Drive --------------------------------------------------------
+
+export const googleLoginUrl = (): string => `${BASE_URL}/auth/google/login`
+
+export async function fetchAuthMe(): Promise<AuthMe> {
+  return apiGet<AuthMe>('/auth/me')
+}
+
+export async function logout(): Promise<{ ok: boolean }> {
+  return apiPost<{ ok: boolean }>('/auth/logout')
+}
+
+export async function syncDrive(): Promise<DriveSyncResult> {
+  return apiPost<DriveSyncResult>('/drive/sync')
+}
+
+/**
+ * AI Assistant streaming wrapper. Sends `message` to /query_stream and forwards
+ * each parsed SSE event to `onEvent`. The Groq API key is pulled from the store
+ * but can be overridden via opts.apiKey.
+ */
+export async function streamAIQuery(
+  message: string,
+  onEvent: (e: SseEvent) => void,
+  opts?: { apiKey?: string; signal?: AbortSignal },
+): Promise<void> {
+  const apiKey = opts?.apiKey ?? useAppStore.getState().shop.groqApiKey
+  if (!apiKey) {
+    throw new ApiError('Groq API key not configured. Set it in Shop Info.', 401)
+  }
+  return streamQuery(message, onEvent, opts?.signal)
+}

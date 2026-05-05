@@ -1,0 +1,19 @@
+{
+  "name": "agentic-ai",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Tool-using LLM analytics platform — single-command dev workflow.",
+  "scripts": {
+    "dev": "concurrently -k -n be,fe -c blue,green --kill-others-on-fail \"npm:dev:backend\" \"npm:dev:frontend\"",
+    "dev:backend": "cd backend && uvicorn main:app --reload --port 8000",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "build:frontend": "npm --prefix frontend run build",
+    "start:backend": "cd backend && uvicorn main:app --host 0.0.0.0 --port 8000",
+    "install:all": "npm install && npm --prefix frontend install && pip install -r backend/requirements.txt",
+    "typecheck": "npm --prefix frontend run typecheck"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
