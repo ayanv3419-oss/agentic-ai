@@ -17,6 +17,7 @@ import type {
   DashboardData,
   DisconnectResponse,
   DriveSyncResult,
+  LoginResponse,
   SseEvent,
   UploadResponse,
   UploadsListResponse,
@@ -50,16 +51,24 @@ export class ApiError extends Error {
 }
 
 function buildHeaders(extra?: HeadersInit): Headers {
-  const apiKey = useAppStore.getState().shop.groqApiKey
+  const { shop, auth } = useAppStore.getState()
   const h = new Headers(extra)
   if (!h.has('Content-Type')) h.set('Content-Type', 'application/json')
-  if (apiKey) h.set('X-Groq-Api-Key', apiKey)
+  if (shop.groqApiKey) h.set('X-Groq-Api-Key', shop.groqApiKey)
+  if (auth.token) h.set('Authorization', `Bearer ${auth.token}`)
   return h
 }
 
 async function handle<T>(res: Response, label: string): Promise<T> {
   if (!res.ok) {
     const detail = await res.json().catch(() => undefined)
+    // 401 from any non-login endpoint => session expired or invalidated.
+    // Drop the local auth state so the app falls back to the Login page.
+    if (res.status === 401 && !label.includes('/auth/login')) {
+      // eslint-disable-next-line no-console
+      console.warn(`[api] ${label} → 401, clearing auth`)
+      useAppStore.getState().clearAuth()
+    }
     // Surface the structured backend error to DevTools so "Failed to fetch"
     // never hides what the server actually said.
     // eslint-disable-next-line no-console
@@ -108,12 +117,13 @@ export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
 }
 
 export async function uploadFile<T>(path: string, file: File, extra?: Record<string, string>): Promise<T> {
-  const apiKey = useAppStore.getState().shop.groqApiKey
+  const { shop, auth } = useAppStore.getState()
   const fd = new FormData()
   fd.append('file', file)
   Object.entries(extra ?? {}).forEach(([k, v]) => fd.append(k, v))
   const headers: Record<string, string> = {}
-  if (apiKey) headers['X-Groq-Api-Key'] = apiKey
+  if (shop.groqApiKey) headers['X-Groq-Api-Key'] = shop.groqApiKey
+  if (auth.token) headers['Authorization'] = `Bearer ${auth.token}`
   // eslint-disable-next-line no-console
   console.info(`[api] UPLOAD ${path} file=${file.name} bytes=${file.size}`)
   const res = await safeFetch(`${BASE_URL}${path}`, {
@@ -147,19 +157,24 @@ export async function streamQuery(
   onEvent: (e: SseEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const apiKey = useAppStore.getState().shop.groqApiKey
+  const { shop, auth } = useAppStore.getState()
   const res = await safeFetch(`${BASE_URL}/query_stream`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
-      ...(apiKey ? { 'X-Groq-Api-Key': apiKey } : {}),
+      ...(shop.groqApiKey ? { 'X-Groq-Api-Key': shop.groqApiKey } : {}),
+      ...(auth.token ? { Authorization: `Bearer ${auth.token}` } : {}),
     },
     body: JSON.stringify({ question }),
     signal,
   })
   if (!res.ok || !res.body) {
     const detail = await res.json().catch(() => undefined)
+    // 401 → drop the session so the app falls back to Login.
+    if (res.status === 401) {
+      useAppStore.getState().clearAuth()
+    }
     // eslint-disable-next-line no-console
     console.error(`[api] POST /query_stream → HTTP ${res.status}`, detail)
     throw new ApiError(`POST /query_stream ${res.status}`, res.status, detail)
@@ -198,6 +213,22 @@ export async function fetchDashboard(month?: string): Promise<DashboardData> {
 }
 
 // --- Auth + Drive --------------------------------------------------------
+
+/** Admin login. Throws ApiError on bad credentials / network failure. */
+export async function login(username: string, password: string): Promise<LoginResponse> {
+  const res = await safeFetch(`${BASE_URL}/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  })
+  return handle<LoginResponse>(res, 'POST /auth/login')
+}
+
+export async function logoutBackend(): Promise<{ ok: boolean }> {
+  // Stateless tokens — the server endpoint is a no-op, but call it anyway
+  // so the frontend has one consistent place to invalidate the session.
+  return apiPost<{ ok: boolean }>('/auth/logout')
+}
 
 export const googleLoginUrl = (): string => `${BASE_URL}/auth/google/login`
 

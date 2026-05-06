@@ -67,6 +67,14 @@ class Settings(BaseSettings):
         default="dev-session-secret-CHANGE-ME", alias="SESSION_SECRET"
     )
 
+    # --- Admin login + bearer-token auth --------------------------------
+    # Credentials MUST come from the environment. Empty defaults => login is
+    # disabled (every login attempt returns 401) — fail-closed by design.
+    admin_username:       str = Field(default="", alias="ADMIN_USERNAME")
+    admin_password:       str = Field(default="", alias="ADMIN_PASSWORD")
+    auth_token_secret:    str = Field(default="dev-auth-secret-CHANGE-ME", alias="AUTH_TOKEN_SECRET")
+    auth_token_ttl_hours: int = Field(default=24 * 7, alias="AUTH_TOKEN_TTL_HOURS")
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         # Force absolute resolution after pydantic parsing.

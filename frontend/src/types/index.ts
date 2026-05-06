@@ -111,10 +111,28 @@ export interface DisconnectResponse {
 
 export interface AuthMe {
   authenticated: boolean
+  username?: string
   email?: string
   name?: string
   picture?: string
   google_configured?: boolean
+}
+
+export interface LoginRequest {
+  username: string
+  password: string
+}
+
+export interface LoginResponse {
+  token: string
+  username: string
+  expires_at: string
+}
+
+export interface AuthState {
+  token: string | null
+  username: string | null
+  expiresAt: string | null
 }
 
 export interface DriveImportDetail {

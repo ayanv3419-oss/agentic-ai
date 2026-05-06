@@ -1,6 +1,7 @@
 import type { ComponentType } from 'react'
-import { Building2, Upload, LayoutDashboard, Sparkles, MessageSquare } from 'lucide-react'
+import { Building2, Upload, LayoutDashboard, Sparkles, MessageSquare, LogOut } from 'lucide-react'
 import { cn } from '@/lib/cn'
+import { logoutBackend } from '@/lib/api'
 import { useAppStore } from '@/store/useAppStore'
 import type { NavKey } from '@/types'
 
@@ -25,6 +26,17 @@ interface SidebarProps {
 
 export function Sidebar({ active, onSelect }: SidebarProps) {
   const apiKeySet = useAppStore((s) => Boolean(s.shop.groqApiKey))
+  const username = useAppStore((s) => s.auth.username)
+  const clearAuth = useAppStore((s) => s.clearAuth)
+
+  const onSignOut = async () => {
+    try {
+      await logoutBackend()
+    } catch {
+      /* server logout is a no-op for stateless tokens — clear locally either way */
+    }
+    clearAuth()
+  }
 
   return (
     <aside className="w-64 shrink-0 bg-zinc-950 border-r border-zinc-800 flex flex-col">
@@ -65,7 +77,7 @@ export function Sidebar({ active, onSelect }: SidebarProps) {
         })}
       </nav>
 
-      <div className="p-3 border-t border-zinc-800">
+      <div className="p-3 border-t border-zinc-800 space-y-2">
         <div className="px-3 py-2.5 rounded-lg bg-zinc-900/60 border border-zinc-800">
           <div className="flex items-center justify-between">
             <div className="text-[11px] uppercase tracking-wider text-zinc-500">Groq API</div>
@@ -85,6 +97,20 @@ export function Sidebar({ active, onSelect }: SidebarProps) {
             {apiKeySet ? 'Connected' : 'Not configured'}
           </div>
         </div>
+
+        <button
+          type="button"
+          onClick={() => void onSignOut()}
+          className="w-full flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-zinc-900/40 border border-zinc-800 text-zinc-400 hover:text-zinc-100 hover:border-zinc-700 transition-colors"
+          title="Sign out"
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <LogOut className="w-3.5 h-3.5 shrink-0" />
+            <span className="text-xs truncate">
+              {username ? `Sign out (${username})` : 'Sign out'}
+            </span>
+          </div>
+        </button>
       </div>
     </aside>
   )

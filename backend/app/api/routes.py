@@ -12,12 +12,13 @@ import tempfile
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.agents.dashboard_agent import DashboardAgent
 from app.agents.dataclean_agent import DataCleanAgent
+from app.auth_core import require_auth
 from app.cache import cache_size, invalidate_all
 from app.config import settings
 from app.coordinator import run_query_turn
@@ -59,7 +60,7 @@ async def health() -> dict:
 # /upload  (DataCleanAgent)
 # ---------------------------------------------------------------------------
 
-@router.post("/upload")
+@router.post("/upload", dependencies=[Depends(require_auth)])
 async def upload(
     request: Request,
     file: UploadFile = File(...),
@@ -242,7 +243,7 @@ async def upload(
 # /dashboard (DashboardAgent)
 # ---------------------------------------------------------------------------
 
-@router.get("/dashboard")
+@router.get("/dashboard", dependencies=[Depends(require_auth)])
 async def dashboard(month: str | None = None):
     if month is not None and (len(month) != 7 or month[4] != "-"):
         return JSONResponse(status_code=400, content=envelope(
@@ -269,7 +270,7 @@ async def dashboard(month: str | None = None):
 # /uploads  (metadata listing for the dataset pill)
 # ---------------------------------------------------------------------------
 
-@router.get("/uploads")
+@router.get("/uploads", dependencies=[Depends(require_auth)])
 async def uploads():
     return {
         "uploads": await list_uploads_meta(),
@@ -280,7 +281,7 @@ async def uploads():
     }
 
 
-@router.post("/uploads/{batch_id}/disconnect")
+@router.post("/uploads/{batch_id}/disconnect", dependencies=[Depends(require_auth)])
 async def upload_disconnect(batch_id: str):
     """Remove a dataset from active sources.
 
@@ -317,7 +318,7 @@ async def upload_disconnect(batch_id: str):
 # /cache/clear
 # ---------------------------------------------------------------------------
 
-@router.post("/cache/clear")
+@router.post("/cache/clear", dependencies=[Depends(require_auth)])
 async def cache_clear():
     n = invalidate_all()
     return {"cleared": n}
@@ -455,7 +456,7 @@ def _stream_response(
     )
 
 
-@router.post("/query_stream")
+@router.post("/query_stream", dependencies=[Depends(require_auth)])
 async def query_stream(req: QueryRequest, request: Request):
     api_key = _resolve_groq_key(request)
     emitter = EventEmitter()

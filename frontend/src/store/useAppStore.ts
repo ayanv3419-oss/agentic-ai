@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type {
+  AuthState,
   ChatMessage,
   DashboardFilters,
   DatasetMeta,
@@ -15,6 +16,8 @@ interface AppState {
   chatHistory: ChatMessage[]
   isStreaming: boolean
 
+  auth: AuthState
+
   setShop: (info: Partial<ShopInfo>) => void
   setDataset: (d: DatasetMeta | null) => void
   setFilters: (f: Partial<DashboardFilters>) => void
@@ -24,6 +27,9 @@ interface AppState {
   updateMessage: (id: string, patch: Partial<ChatMessage>) => void
   clearChat: () => void
   setStreaming: (b: boolean) => void
+
+  setAuth: (token: string, username: string, expiresAt: string) => void
+  clearAuth: () => void
 }
 
 const emptyShop: ShopInfo = {
@@ -31,6 +37,12 @@ const emptyShop: ShopInfo = {
   businessName: '',
   ownerName: '',
   groqApiKey: '',
+}
+
+const emptyAuth: AuthState = {
+  token: null,
+  username: null,
+  expiresAt: null,
 }
 
 const defaultMonth = (): string => new Date().toISOString().slice(0, 7)
@@ -47,6 +59,8 @@ export const useAppStore = create<AppState>()(
       chatHistory: [],
       isStreaming: false,
 
+      auth: emptyAuth,
+
       setShop: (info) => set((s) => ({ shop: { ...s.shop, ...info } })),
       setDataset: (d) => set({ dataset: d }),
       setFilters: (f) => set((s) => ({ filters: { ...s.filters, ...f } })),
@@ -62,6 +76,10 @@ export const useAppStore = create<AppState>()(
         })),
       clearChat: () => set({ chatHistory: [], isStreaming: false }),
       setStreaming: (b) => set({ isStreaming: b }),
+
+      setAuth: (token, username, expiresAt) =>
+        set({ auth: { token, username, expiresAt } }),
+      clearAuth: () => set({ auth: emptyAuth }),
     }),
     {
       name: 'agentic-ai:v1',
@@ -70,7 +88,17 @@ export const useAppStore = create<AppState>()(
         filters: s.filters,
         dataset: s.dataset,
         chatHistory: s.chatHistory.slice(-MAX_PERSISTED_MESSAGES),
+        auth: s.auth,
       }),
     },
   ),
 )
+
+
+/** Derived selector — true iff a non-expired bearer token is on hand. */
+export function selectIsAuthed(s: AppState): boolean {
+  const a = s.auth
+  if (!a.token || !a.expiresAt) return false
+  const exp = new Date(a.expiresAt).getTime()
+  return Number.isFinite(exp) && exp > Date.now()
+}
