@@ -4,7 +4,7 @@
  *
  * Backend URL resolution (in order of preference):
  *   1. import.meta.env.VITE_BACKEND_URL    — preferred, full https URL of the
- *      Render backend service (e.g. https://agentic-backend.onrender.com).
+ *      Render backend service (e.g. https://agentic-ai-anet.onrender.com).
  *   2. import.meta.env.VITE_API_BASE_URL   — legacy alias kept for backward
  *      compatibility with previously-configured deployments.
  *   3. PRODUCTION_FALLBACK                 — hardcoded production backend so
