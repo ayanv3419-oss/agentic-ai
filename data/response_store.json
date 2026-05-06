@@ -1,0 +1,5022 @@
+{
+  "5ce7add329fd0961df8d85030e6bb977036c56a72a1e6a41278c6f72396d90c8": {
+    "turn_id": "726de88b-3a7b-4d53-9cb6-9fb0d581f363",
+    "cache_key": "5ce7add329fd0961df8d85030e6bb977036c56a72a1e6a41278c6f72396d90c8",
+    "stored_at": "2026-05-05T12:24:02+00:00",
+    "query": "hii there",
+    "sub_agent": "QueryAgent",
+    "route": "UNKNOWN",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": []
+    },
+    "insights": {
+      "summary": "Total sales ₹0.00 across 0 orders.",
+      "trend": "flat",
+      "delta_pct": 0.0,
+      "narrative": "Total sales ₹0.00 across 0 orders."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": []
+    },
+    "final_answer": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored\n\nFINAL ANSWER:\nNo matching rows for your query.\n\nCONCLUSION:\nTotal sales ₹0.00 across 0 orders.",
+    "workflow": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored"
+  },
+  "6fbbdcc5fc88f41ff2778ce770438ca892e7befdd72eed0ed6443e55fd08259e": {
+    "turn_id": "ade1cd3f-2eb1-4d6c-9b03-1908131afcfe",
+    "cache_key": "6fbbdcc5fc88f41ff2778ce770438ca892e7befdd72eed0ed6443e55fd08259e",
+    "stored_at": "2026-05-05T12:24:14+00:00",
+    "query": "Show this month revenue",
+    "sub_agent": "QueryAgent",
+    "route": "SALES_QUERY",
+    "sql": "SELECT strftime('%Y-%m', \"Date\") AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [],
+    "aggregates": {
+      "granularity": "monthly",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": []
+    },
+    "insights": {
+      "summary": "Total sales ₹0.00 across 0 orders.",
+      "trend": "flat",
+      "delta_pct": 0.0,
+      "narrative": "Total sales ₹0.00 across 0 orders."
+    },
+    "chart": {
+      "granularity": "monthly",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": []
+    },
+    "final_answer": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored\n\nFINAL ANSWER:\nNo matching rows for your query.\n\nCONCLUSION:\nTotal sales ₹0.00 across 0 orders.",
+    "workflow": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored"
+  },
+  "0b9a11ae035c536dd0c676ff39482bf7996dc76cda7a31cac89626e71517ab68": {
+    "turn_id": "ac3f91bd-d15a-4ced-bfb3-0cf79924fb1c",
+    "cache_key": "0b9a11ae035c536dd0c676ff39482bf7996dc76cda7a31cac89626e71517ab68",
+    "stored_at": "2026-05-05T12:45:30+00:00",
+    "query": "how are you",
+    "mode": "chat",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "I'm doing great, thanks for asking. How about you?",
+    "router_reason": "matches chat pattern: '^how\\\\s+are\\\\s+(you|u|ya|things)\\\\b'"
+  },
+  "78512064fcc8b0d00b3b34652f2735e0990644de6cedb2bb05d48bde19772b57": {
+    "turn_id": "21f65593-eb31-40c7-a04d-301649abfc73",
+    "cache_key": "78512064fcc8b0d00b3b34652f2735e0990644de6cedb2bb05d48bde19772b57",
+    "stored_at": "2026-05-05T16:57:06+00:00",
+    "query": "what is my last 2 mounth sales",
+    "sub_agent": "QueryAgent",
+    "route": "SALES_QUERY",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": []
+    },
+    "insights": {
+      "summary": "Total sales ₹0.00 across 0 orders.",
+      "trend": "flat",
+      "delta_pct": 0.0,
+      "narrative": "Total sales ₹0.00 across 0 orders."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": []
+    },
+    "final_answer": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored\n\nFINAL ANSWER:\nNo matching rows for your query.\n\nCONCLUSION:\nTotal sales ₹0.00 across 0 orders.",
+    "workflow": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored"
+  },
+  "749ab2c0d06c42ae3b841b79e79875f02b3a042e43c92378cd28bd444c04d284": {
+    "turn_id": "fe540023-eeae-43bb-9586-42424bb10a74",
+    "cache_key": "749ab2c0d06c42ae3b841b79e79875f02b3a042e43c92378cd28bd444c04d284",
+    "stored_at": "2026-05-05T17:08:11+00:00",
+    "query": "what",
+    "mode": "chat",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "It looks like you started to ask something. Could you please complete your question?",
+    "router_reason": "short low-signal question (1 tokens)"
+  },
+  "23dc9bb5e61f808b618343d2ad109867a82d6efbbfa836737f5b520c08c545f5": {
+    "turn_id": "eb7da877-8930-43a1-9202-92fcd000ec10",
+    "cache_key": "23dc9bb5e61f808b618343d2ad109867a82d6efbbfa836737f5b520c08c545f5",
+    "stored_at": "2026-05-05T17:08:32+00:00",
+    "query": "ohk what is the sales overall",
+    "sub_agent": "QueryAgent",
+    "route": "SALES_QUERY",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": [],
+      "empty_reason": {
+        "reason": "filter_excluded_all",
+        "table": "sales",
+        "table_total_rows": 432,
+        "available_min_date": "2025-05-01",
+        "available_max_date": "2025-07-31",
+        "queried_window": {
+          "start_date": "2026-04-05",
+          "end_date": "2026-05-05",
+          "as_of": "2026-05-05"
+        }
+      }
+    },
+    "insights": {
+      "summary": "Total sales ₹0.00 across 0 orders.",
+      "trend": "flat",
+      "delta_pct": 0.0,
+      "narrative": "Total sales ₹0.00 across 0 orders."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": [],
+      "empty_reason": {
+        "reason": "filter_excluded_all",
+        "table": "sales",
+        "table_total_rows": 432,
+        "available_min_date": "2025-05-01",
+        "available_max_date": "2025-07-31",
+        "queried_window": {
+          "start_date": "2026-04-05",
+          "end_date": "2026-05-05",
+          "as_of": "2026-05-05"
+        }
+      }
+    },
+    "final_answer": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored\n\nFINAL ANSWER:\nNo sales rows match the window 2026-04-05 → 2026-05-05.\nYou have 432 sales rows on file, covering 2025-05-01 → 2025-07-31.\nTry a window that overlaps that range (e.g. \"sales from 2025-05 to 2025-07\").\n\nCONCLUSION:\nThe table has data, but it's outside the time window you asked about. Widen the time range or pick a period that overlaps the available data.",
+    "workflow": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored"
+  },
+  "d531997564c145c0a23d04b6bfe13ec4590b9c7a00a95ac7744f1fd121c53d44": {
+    "turn_id": "23418b56-8857-427f-9cbb-4f3f160dd7c1",
+    "cache_key": "d531997564c145c0a23d04b6bfe13ec4590b9c7a00a95ac7744f1fd121c53d44",
+    "stored_at": "2026-05-05T17:10:07+00:00",
+    "query": "ohk show me all the sales that we have of all",
+    "sub_agent": "QueryAgent",
+    "route": "SALES_QUERY",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": [],
+      "empty_reason": {
+        "reason": "filter_excluded_all",
+        "table": "sales",
+        "table_total_rows": 432,
+        "available_min_date": "2025-05-01",
+        "available_max_date": "2025-07-31",
+        "queried_window": {
+          "start_date": "2026-04-05",
+          "end_date": "2026-05-05",
+          "as_of": "2026-05-05"
+        }
+      }
+    },
+    "insights": {
+      "summary": "Total sales ₹0.00 across 0 orders.",
+      "trend": "flat",
+      "delta_pct": 0.0,
+      "narrative": "Total sales ₹0.00 across 0 orders."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": [],
+      "empty_reason": {
+        "reason": "filter_excluded_all",
+        "table": "sales",
+        "table_total_rows": 432,
+        "available_min_date": "2025-05-01",
+        "available_max_date": "2025-07-31",
+        "queried_window": {
+          "start_date": "2026-04-05",
+          "end_date": "2026-05-05",
+          "as_of": "2026-05-05"
+        }
+      }
+    },
+    "final_answer": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored\n\nFINAL ANSWER:\nNo sales rows match the window 2026-04-05 → 2026-05-05.\nYou have 432 sales rows on file, covering 2025-05-01 → 2025-07-31.\nTry a window that overlaps that range (e.g. \"sales from 2025-05 to 2025-07\").\n\nCONCLUSION:\nThe table has data, but it's outside the time window you asked about. Widen the time range or pick a period that overlaps the available data.",
+    "workflow": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored"
+  },
+  "9926e564f585fa8699b82ab1855a2882e353bf33adf4a7a0f1083bfc4ff5d559": {
+    "turn_id": "85089021-a28f-4a70-9f1b-31403c9ee98c",
+    "cache_key": "9926e564f585fa8699b82ab1855a2882e353bf33adf4a7a0f1083bfc4ff5d559",
+    "stored_at": "2026-05-05T17:11:51+00:00",
+    "query": "ohk the backend is connected now",
+    "sub_agent": "QueryAgent",
+    "route": "UNKNOWN",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": [],
+      "empty_reason": {
+        "reason": "filter_excluded_all",
+        "table": "sales",
+        "table_total_rows": 432,
+        "available_min_date": "2025-05-01",
+        "available_max_date": "2025-07-31",
+        "queried_window": {
+          "start_date": "2026-04-05",
+          "end_date": "2026-05-05",
+          "as_of": "2026-05-05"
+        }
+      }
+    },
+    "insights": {
+      "summary": "Total sales ₹0.00 across 0 orders.",
+      "trend": "flat",
+      "delta_pct": 0.0,
+      "narrative": "Total sales ₹0.00 across 0 orders."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": [],
+      "empty_reason": {
+        "reason": "filter_excluded_all",
+        "table": "sales",
+        "table_total_rows": 432,
+        "available_min_date": "2025-05-01",
+        "available_max_date": "2025-07-31",
+        "queried_window": {
+          "start_date": "2026-04-05",
+          "end_date": "2026-05-05",
+          "as_of": "2026-05-05"
+        }
+      }
+    },
+    "final_answer": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored\n\nFINAL ANSWER:\nNo sales rows match the window 2026-04-05 → 2026-05-05.\nYou have 432 sales rows on file, covering 2025-05-01 → 2025-07-31.\nTry a window that overlaps that range (e.g. \"sales from 2025-05 to 2025-07\").\n\nCONCLUSION:\nThe table has data, but it's outside the time window you asked about. Widen the time range or pick a period that overlaps the available data.",
+    "workflow": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored"
+  },
+  "7d6d578c9cc6994184770e65c3cc9f171c5622a4bdc769f684e946536b266833": {
+    "turn_id": "f82dcbb4-3701-457a-9dca-f9edd55e603f",
+    "cache_key": "7d6d578c9cc6994184770e65c3cc9f171c5622a4bdc769f684e946536b266833",
+    "stored_at": "2026-05-05T17:12:18+00:00",
+    "query": "ohk tellme that the backend is there or not",
+    "sub_agent": "QueryAgent",
+    "route": "UNKNOWN",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": [],
+      "empty_reason": {
+        "reason": "filter_excluded_all",
+        "table": "sales",
+        "table_total_rows": 432,
+        "available_min_date": "2025-05-01",
+        "available_max_date": "2025-07-31",
+        "queried_window": {
+          "start_date": "2026-04-05",
+          "end_date": "2026-05-05",
+          "as_of": "2026-05-05"
+        }
+      }
+    },
+    "insights": {
+      "summary": "Total sales ₹0.00 across 0 orders.",
+      "trend": "flat",
+      "delta_pct": 0.0,
+      "narrative": "Total sales ₹0.00 across 0 orders."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": [],
+      "empty_reason": {
+        "reason": "filter_excluded_all",
+        "table": "sales",
+        "table_total_rows": 432,
+        "available_min_date": "2025-05-01",
+        "available_max_date": "2025-07-31",
+        "queried_window": {
+          "start_date": "2026-04-05",
+          "end_date": "2026-05-05",
+          "as_of": "2026-05-05"
+        }
+      }
+    },
+    "final_answer": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored\n\nFINAL ANSWER:\nNo sales rows match the window 2026-04-05 → 2026-05-05.\nYou have 432 sales rows on file, covering 2025-05-01 → 2025-07-31.\nTry a window that overlaps that range (e.g. \"sales from 2025-05 to 2025-07\").\n\nCONCLUSION:\nThe table has data, but it's outside the time window you asked about. Widen the time range or pick a period that overlaps the available data.",
+    "workflow": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored"
+  },
+  "b037d687b2a5a5c1fcbe0398c3d012f473040e82147c02dad9b1fda3d930990b": {
+    "turn_id": "1d58b5bf-dc4c-4672-ad6f-ea07fecc96a3",
+    "cache_key": "b037d687b2a5a5c1fcbe0398c3d012f473040e82147c02dad9b1fda3d930990b",
+    "stored_at": "2026-05-05T17:12:25+00:00",
+    "query": "tme",
+    "mode": "chat",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "It looks like you might have typed that in a hurry. How can I help you today?",
+    "router_reason": "short low-signal question (1 tokens)"
+  },
+  "336074805fc853987abe6f7fe3ad97a6a6f3077a16391fec744f671a015fbd7e": {
+    "turn_id": "31c8a2e5-2609-48be-a7b4-b062c65bea6e",
+    "cache_key": "336074805fc853987abe6f7fe3ad97a6a6f3077a16391fec744f671a015fbd7e",
+    "stored_at": "2026-05-05T17:12:30+00:00",
+    "query": "time",
+    "mode": "chat",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "What's on your mind, or would you like to talk about something specific?",
+    "router_reason": "short low-signal question (1 tokens)"
+  },
+  "9918e91c150b552e5e804e211c8d206c6190064ddfa4a33a21895fdbfc49ddd2": {
+    "turn_id": "3e53f99a-b02c-42db-8e77-886381d1c209",
+    "cache_key": "9918e91c150b552e5e804e211c8d206c6190064ddfa4a33a21895fdbfc49ddd2",
+    "stored_at": "2026-05-05T17:12:44+00:00",
+    "query": "tell me abou the space",
+    "sub_agent": "QueryAgent",
+    "route": "UNKNOWN",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": [],
+      "empty_reason": {
+        "reason": "filter_excluded_all",
+        "table": "sales",
+        "table_total_rows": 432,
+        "available_min_date": "2025-05-01",
+        "available_max_date": "2025-07-31",
+        "queried_window": {
+          "start_date": "2026-04-05",
+          "end_date": "2026-05-05",
+          "as_of": "2026-05-05"
+        }
+      }
+    },
+    "insights": {
+      "summary": "Total sales ₹0.00 across 0 orders.",
+      "trend": "flat",
+      "delta_pct": 0.0,
+      "narrative": "Total sales ₹0.00 across 0 orders."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": [],
+      "empty_reason": {
+        "reason": "filter_excluded_all",
+        "table": "sales",
+        "table_total_rows": 432,
+        "available_min_date": "2025-05-01",
+        "available_max_date": "2025-07-31",
+        "queried_window": {
+          "start_date": "2026-04-05",
+          "end_date": "2026-05-05",
+          "as_of": "2026-05-05"
+        }
+      }
+    },
+    "final_answer": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored\n\nFINAL ANSWER:\nNo sales rows match the window 2026-04-05 → 2026-05-05.\nYou have 432 sales rows on file, covering 2025-05-01 → 2025-07-31.\nTry a window that overlaps that range (e.g. \"sales from 2025-05 to 2025-07\").\n\nCONCLUSION:\nThe table has data, but it's outside the time window you asked about. Widen the time range or pick a period that overlaps the available data.",
+    "workflow": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored"
+  },
+  "a228c3c03463095c2e5eca746eb0f1a1492bbe998de4977c541658d01b2be6d9": {
+    "turn_id": "32dc08f2-4e30-4fdc-a8b9-7a3060b01dd1",
+    "cache_key": "a228c3c03463095c2e5eca746eb0f1a1492bbe998de4977c541658d01b2be6d9",
+    "stored_at": "2026-05-05T17:12:51+00:00",
+    "query": "what is sun",
+    "mode": "chat",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "The sun is the star at the center of our solar system, providing us with light and warmth. It's a pretty amazing celestial body. Would you like to know more about it?",
+    "router_reason": "short low-signal question (3 tokens)"
+  },
+  "351cd3ec5741c5a0d236475cc102156b3a07ed8f5352e00957f7933ff6a7a365": {
+    "turn_id": "3f43c460-f37e-429a-b46b-b8b2146b535a",
+    "cache_key": "351cd3ec5741c5a0d236475cc102156b3a07ed8f5352e00957f7933ff6a7a365",
+    "stored_at": "2026-05-05T17:45:41+00:00",
+    "query": "Why did sales drop?",
+    "sub_agent": "RCAAgent",
+    "route": "RCA",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": [],
+      "empty_reason": {
+        "reason": "filter_excluded_all",
+        "table": "sales",
+        "table_total_rows": 432,
+        "available_min_date": "2025-05-01",
+        "available_max_date": "2025-07-31",
+        "queried_window": {
+          "start_date": "2026-04-05",
+          "end_date": "2026-05-05",
+          "as_of": "2026-05-05"
+        }
+      }
+    },
+    "insights": {
+      "summary": "Total sales ₹0.00 across 0 orders.",
+      "trend": "flat",
+      "delta_pct": 0.0,
+      "narrative": "Sales dropped due to a lack of activity, with total sales of 0.0 across 0 orders. The data indicates no customers made purchases during the queried window. The sales table has a total of 432 rows, but the queried window from 2026-04-05 to 2026-05-05 yielded no results. This suggests that the sales drop may be related to the time period being analyzed."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 0.0,
+        "orders": 0,
+        "customers": 0
+      },
+      "series": [],
+      "empty_reason": {
+        "reason": "filter_excluded_all",
+        "table": "sales",
+        "table_total_rows": 432,
+        "available_min_date": "2025-05-01",
+        "available_max_date": "2025-07-31",
+        "queried_window": {
+          "start_date": "2026-04-05",
+          "end_date": "2026-05-05",
+          "as_of": "2026-05-05"
+        }
+      }
+    },
+    "final_answer": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored\n\nFINAL ANSWER:\nNo sales rows match the window 2026-04-05 → 2026-05-05.\nYou have 432 sales rows on file, covering 2025-05-01 → 2025-07-31.\nTry a window that overlaps that range (e.g. \"sales from 2025-05 to 2025-07\").\n\nCONCLUSION:\nThe table has data, but it's outside the time window you asked about. Widen the time range or pick a period that overlaps the available data.",
+    "workflow": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored"
+  },
+  "853161199df3cfbf33715a2dae176a3e5456871afd9977c544948f025c0cd981": {
+    "turn_id": "bcdc16d6-24dd-4a7d-9533-342b42a044b1",
+    "cache_key": "853161199df3cfbf33715a2dae176a3e5456871afd9977c544948f025c0cd981",
+    "stored_at": "2026-05-05T20:52:50+00:00",
+    "query": "“this month sales”",
+    "sub_agent": "QueryAgent",
+    "route": "SALES_QUERY",
+    "sql": "SELECT strftime('%Y-%m', \"Date\") AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [
+      {
+        "bucket": "2025-07",
+        "sales": 149471.0,
+        "orders": 159
+      }
+    ],
+    "aggregates": {
+      "granularity": "monthly",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07",
+          "sales": 149471.0,
+          "orders": 159
+        }
+      ]
+    },
+    "insights": {
+      "summary": "Total sales ₹149,471.00 across 159 orders.",
+      "trend": "flat",
+      "delta_pct": 0.0,
+      "narrative": "Total sales ₹149,471.00 across 159 orders."
+    },
+    "chart": {
+      "granularity": "monthly",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07",
+          "sales": 149471.0,
+          "orders": 159
+        }
+      ]
+    },
+    "final_answer": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored\n\nFINAL ANSWER:\nTotal Sales: ₹149,471.00\nOrders: 159\nCustomers: 0\n\nCONCLUSION:\nTotal sales ₹149,471.00 across 159 orders.",
+    "workflow": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored"
+  },
+  "ca07b83362f790b368ac18708d48074807715785eb0ff1744859895dbd2d34ff": {
+    "turn_id": "19a9fcaf-ac2c-4a35-bebc-7766eeae848e",
+    "cache_key": "ca07b83362f790b368ac18708d48074807715785eb0ff1744859895dbd2d34ff",
+    "stored_at": "2026-05-05T21:09:36+00:00",
+    "query": "what is my sales",
+    "sub_agent": "QueryAgent",
+    "route": "SALES_QUERY",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [
+      {
+        "bucket": "2025-07-01",
+        "sales": 2950.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-02",
+        "sales": 8250.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-03",
+        "sales": 2850.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-04",
+        "sales": 4949.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-05",
+        "sales": 8060.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-06",
+        "sales": 1549.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-07",
+        "sales": 2900.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-08",
+        "sales": 6149.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-09",
+        "sales": 550.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-10",
+        "sales": 1350.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-11",
+        "sales": 7699.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-12",
+        "sales": 6748.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-13",
+        "sales": 5350.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-14",
+        "sales": 5530.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-15",
+        "sales": 4450.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-16",
+        "sales": 1700.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-17",
+        "sales": 2300.0,
+        "orders": 2
+      },
+      {
+        "bucket": "2025-07-18",
+        "sales": 4648.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-19",
+        "sales": 4500.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-20",
+        "sales": 10440.0,
+        "orders": 9
+      },
+      {
+        "bucket": "2025-07-21",
+        "sales": 13550.0,
+        "orders": 10
+      },
+      {
+        "bucket": "2025-07-22",
+        "sales": 3250.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-23",
+        "sales": 7649.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-24",
+        "sales": 4150.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-25",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-26",
+        "sales": 4800.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-27",
+        "sales": 1700.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-28",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-29",
+        "sales": 5170.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-30",
+        "sales": 7630.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-31",
+        "sales": 2750.0,
+        "orders": 4
+      }
+    ],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "insights": {
+      "summary": "Total sales ₹149,471.00 across 159 orders. Trend across 31 daily buckets: down 6.8%.",
+      "trend": "down",
+      "delta_pct": -6.78,
+      "narrative": "Total sales ₹149,471.00 across 159 orders. Trend across 31 daily buckets: down 6.8%."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "final_answer": "Total sales ₹149,471.00 across 159 orders.",
+    "workflow": null,
+    "response_format": "overview"
+  },
+  "1c902cd85a4587b8c985c3b68eaacea073d874bd4fc22c4af83ec2ad02c485df": {
+    "turn_id": "78a1c96f-565c-4e3e-9436-4c150e63ab3d",
+    "cache_key": "1c902cd85a4587b8c985c3b68eaacea073d874bd4fc22c4af83ec2ad02c485df",
+    "stored_at": "2026-05-05T21:10:01+00:00",
+    "query": "what is my last mounth sales",
+    "sub_agent": "QueryAgent",
+    "route": "SALES_QUERY",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [
+      {
+        "bucket": "2025-07-01",
+        "sales": 2950.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-02",
+        "sales": 8250.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-03",
+        "sales": 2850.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-04",
+        "sales": 4949.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-05",
+        "sales": 8060.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-06",
+        "sales": 1549.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-07",
+        "sales": 2900.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-08",
+        "sales": 6149.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-09",
+        "sales": 550.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-10",
+        "sales": 1350.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-11",
+        "sales": 7699.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-12",
+        "sales": 6748.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-13",
+        "sales": 5350.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-14",
+        "sales": 5530.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-15",
+        "sales": 4450.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-16",
+        "sales": 1700.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-17",
+        "sales": 2300.0,
+        "orders": 2
+      },
+      {
+        "bucket": "2025-07-18",
+        "sales": 4648.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-19",
+        "sales": 4500.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-20",
+        "sales": 10440.0,
+        "orders": 9
+      },
+      {
+        "bucket": "2025-07-21",
+        "sales": 13550.0,
+        "orders": 10
+      },
+      {
+        "bucket": "2025-07-22",
+        "sales": 3250.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-23",
+        "sales": 7649.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-24",
+        "sales": 4150.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-25",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-26",
+        "sales": 4800.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-27",
+        "sales": 1700.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-28",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-29",
+        "sales": 5170.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-30",
+        "sales": 7630.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-31",
+        "sales": 2750.0,
+        "orders": 4
+      }
+    ],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "insights": {
+      "summary": "Total sales ₹149,471.00 across 159 orders. Trend across 31 daily buckets: down 6.8%.",
+      "trend": "down",
+      "delta_pct": -6.78,
+      "narrative": "Total sales ₹149,471.00 across 159 orders. Trend across 31 daily buckets: down 6.8%."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "final_answer": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored\n\nFINAL ANSWER:\nTotal Sales: ₹149,471.00\nOrders: 159\nCustomers: 0\n\nCONCLUSION:\nTotal sales ₹149,471.00 across 159 orders. Trend across 31 daily buckets: down 6.8%.",
+    "workflow": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored",
+    "response_format": "standard"
+  },
+  "dd0ddc2e620461e7279dd634ac42131bd72a83439d7b4b3d444ced6de0c1527d": {
+    "turn_id": "a2fb818a-e1d8-4ae8-a074-d8fc46099028",
+    "cache_key": "dd0ddc2e620461e7279dd634ac42131bd72a83439d7b4b3d444ced6de0c1527d",
+    "stored_at": "2026-05-05T21:15:47+00:00",
+    "query": "tell me about the 2 mounths of sales",
+    "sub_agent": "AnalyticsAgent",
+    "route": "SALES_QUERY",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [
+      {
+        "bucket": "2025-07-01",
+        "sales": 2950.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-02",
+        "sales": 8250.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-03",
+        "sales": 2850.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-04",
+        "sales": 4949.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-05",
+        "sales": 8060.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-06",
+        "sales": 1549.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-07",
+        "sales": 2900.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-08",
+        "sales": 6149.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-09",
+        "sales": 550.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-10",
+        "sales": 1350.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-11",
+        "sales": 7699.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-12",
+        "sales": 6748.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-13",
+        "sales": 5350.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-14",
+        "sales": 5530.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-15",
+        "sales": 4450.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-16",
+        "sales": 1700.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-17",
+        "sales": 2300.0,
+        "orders": 2
+      },
+      {
+        "bucket": "2025-07-18",
+        "sales": 4648.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-19",
+        "sales": 4500.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-20",
+        "sales": 10440.0,
+        "orders": 9
+      },
+      {
+        "bucket": "2025-07-21",
+        "sales": 13550.0,
+        "orders": 10
+      },
+      {
+        "bucket": "2025-07-22",
+        "sales": 3250.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-23",
+        "sales": 7649.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-24",
+        "sales": 4150.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-25",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-26",
+        "sales": 4800.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-27",
+        "sales": 1700.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-28",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-29",
+        "sales": 5170.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-30",
+        "sales": 7630.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-31",
+        "sales": 2750.0,
+        "orders": 4
+      }
+    ],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "insights": {
+      "summary": "Total sales ₹149,471.00 across 159 orders. Trend across 31 daily buckets: down 6.8%.",
+      "trend": "down",
+      "delta_pct": -6.78,
+      "narrative": "Over the course of 31 days, total sales reached $149,471 across 159 orders, with the highest daily sales being $13,550 and the lowest at $550. The number of orders per day varied from 1 to 10, indicating fluctuating demand. Total sales trended downward by 6.8% over the period."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "final_answer": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored\n\nFINAL ANSWER:\nTotal Sales: ₹149,471.00\nOrders: 159\nCustomers: 0\n\nCONCLUSION:\nOver the course of 31 days, total sales reached $149,471 across 159 orders, with the highest daily sales being $13,550 and the lowest at $550. The number of orders per day varied from 1 to 10, indicating fluctuating demand. Total sales trended downward by 6.8% over the period.",
+    "workflow": "USER QUERY\n   ↓\nRouteClass\n   ↓\nTime KPI\n   ↓\nSchema\n   ↓\nSQL Plan\n   ↓\nSQL Writer\n   ↓\nSQL Validator\n   ↓\nSQL Executor\n   ↓\nResult Aggregator\n   ↓\nInsight Engine\n   ↓\nResponse Formatter\n   ↓\nResponse Stored",
+    "response_format": "standard"
+  },
+  "96549be52d47b5f42b759fcd507c127920b0681e8ce13c3b82bb02a3524fd859": {
+    "turn_id": "89910edf-b7b9-46d3-98f9-616b98b27f39",
+    "cache_key": "96549be52d47b5f42b759fcd507c127920b0681e8ce13c3b82bb02a3524fd859",
+    "stored_at": "2026-05-05T21:24:10+00:00",
+    "query": "What are my last 2 days sales?",
+    "sub_agent": "QueryAgent",
+    "route": "SALES_QUERY",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [
+      {
+        "bucket": "2025-07-29",
+        "sales": 5170.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-30",
+        "sales": 7630.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-31",
+        "sales": 2750.0,
+        "orders": 4
+      }
+    ],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 15550.0,
+        "orders": 17,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "insights": {
+      "summary": "Total sales ₹15,550.00 across 17 orders. Trend across 3 daily buckets: down 46.8%.",
+      "trend": "down",
+      "delta_pct": -46.81,
+      "narrative": "Total sales ₹15,550.00 across 17 orders. Trend across 3 daily buckets: down 46.8%."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 15550.0,
+        "orders": 17,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "final_answer": "Total sales are ₹15,550.00 across 17 orders. Sales show a downward trend of 46.8% across the period.",
+    "response_format": "clean"
+  },
+  "c74408ac3de18b1d195b4e16e92d748e7945aaa9443bd1c1336ffa75206c2793": {
+    "turn_id": "0d8687b6-af28-4595-a597-75acab2b9290",
+    "cache_key": "c74408ac3de18b1d195b4e16e92d748e7945aaa9443bd1c1336ffa75206c2793",
+    "stored_at": "2026-05-05T21:36:58+00:00",
+    "query": "what is my overall sales",
+    "sub_agent": "QueryAgent",
+    "route": "SALES_QUERY",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [
+      {
+        "bucket": "2025-07-01",
+        "sales": 2950.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-02",
+        "sales": 8250.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-03",
+        "sales": 2850.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-04",
+        "sales": 4949.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-05",
+        "sales": 8060.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-06",
+        "sales": 1549.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-07",
+        "sales": 2900.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-08",
+        "sales": 6149.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-09",
+        "sales": 550.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-10",
+        "sales": 1350.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-11",
+        "sales": 7699.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-12",
+        "sales": 6748.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-13",
+        "sales": 5350.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-14",
+        "sales": 5530.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-15",
+        "sales": 4450.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-16",
+        "sales": 1700.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-17",
+        "sales": 2300.0,
+        "orders": 2
+      },
+      {
+        "bucket": "2025-07-18",
+        "sales": 4648.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-19",
+        "sales": 4500.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-20",
+        "sales": 10440.0,
+        "orders": 9
+      },
+      {
+        "bucket": "2025-07-21",
+        "sales": 13550.0,
+        "orders": 10
+      },
+      {
+        "bucket": "2025-07-22",
+        "sales": 3250.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-23",
+        "sales": 7649.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-24",
+        "sales": 4150.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-25",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-26",
+        "sales": 4800.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-27",
+        "sales": 1700.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-28",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-29",
+        "sales": 5170.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-30",
+        "sales": 7630.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-31",
+        "sales": 2750.0,
+        "orders": 4
+      }
+    ],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "insights": {
+      "summary": "Total sales ₹149,471.00 across 159 orders. Trend across 31 daily buckets: down 6.8%.",
+      "trend": "down",
+      "delta_pct": -6.78,
+      "narrative": "Total sales ₹149,471.00 across 159 orders. Trend across 31 daily buckets: down 6.8%."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "final_answer": "Total sales are ₹149,471.00 across 159 orders. Sales show a downward trend of 6.8% across the period.",
+    "response_format": "clean"
+  },
+  "2372985f167520adbdd21adf1da61d52d8058ce4ab8a6a72ae332193396d6e60": {
+    "turn_id": "d1635639-0167-444a-99fe-d9acda631deb",
+    "cache_key": "2372985f167520adbdd21adf1da61d52d8058ce4ab8a6a72ae332193396d6e60",
+    "stored_at": "2026-05-05T21:37:33+00:00",
+    "query": "what is my total sales",
+    "sub_agent": "QueryAgent",
+    "route": "SALES_QUERY",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [
+      {
+        "bucket": "2025-07-01",
+        "sales": 2950.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-02",
+        "sales": 8250.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-03",
+        "sales": 2850.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-04",
+        "sales": 4949.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-05",
+        "sales": 8060.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-06",
+        "sales": 1549.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-07",
+        "sales": 2900.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-08",
+        "sales": 6149.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-09",
+        "sales": 550.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-10",
+        "sales": 1350.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-11",
+        "sales": 7699.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-12",
+        "sales": 6748.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-13",
+        "sales": 5350.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-14",
+        "sales": 5530.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-15",
+        "sales": 4450.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-16",
+        "sales": 1700.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-17",
+        "sales": 2300.0,
+        "orders": 2
+      },
+      {
+        "bucket": "2025-07-18",
+        "sales": 4648.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-19",
+        "sales": 4500.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-20",
+        "sales": 10440.0,
+        "orders": 9
+      },
+      {
+        "bucket": "2025-07-21",
+        "sales": 13550.0,
+        "orders": 10
+      },
+      {
+        "bucket": "2025-07-22",
+        "sales": 3250.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-23",
+        "sales": 7649.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-24",
+        "sales": 4150.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-25",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-26",
+        "sales": 4800.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-27",
+        "sales": 1700.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-28",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-29",
+        "sales": 5170.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-30",
+        "sales": 7630.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-31",
+        "sales": 2750.0,
+        "orders": 4
+      }
+    ],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "insights": {
+      "summary": "Total sales ₹149,471.00 across 159 orders. Trend across 31 daily buckets: down 6.8%.",
+      "trend": "down",
+      "delta_pct": -6.78,
+      "narrative": "Total sales ₹149,471.00 across 159 orders. Trend across 31 daily buckets: down 6.8%."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "final_answer": "Total sales are ₹149,471.00 across 159 orders. Sales show a downward trend of 6.8% across the period.",
+    "response_format": "clean"
+  },
+  "3a0698adb8ee2e2cd6863842bcd63a3637da4a6e79629fa63e3b82f5509f2286": {
+    "turn_id": "2ef5fd08-184c-48ea-af22-cd6249a4ff65",
+    "cache_key": "3a0698adb8ee2e2cd6863842bcd63a3637da4a6e79629fa63e3b82f5509f2286",
+    "stored_at": "2026-05-05T21:38:01+00:00",
+    "query": "ohk how to get it better",
+    "sub_agent": "QueryAgent",
+    "route": "UNKNOWN",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [
+      {
+        "bucket": "2025-07-01",
+        "sales": 2950.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-02",
+        "sales": 8250.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-03",
+        "sales": 2850.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-04",
+        "sales": 4949.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-05",
+        "sales": 8060.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-06",
+        "sales": 1549.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-07",
+        "sales": 2900.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-08",
+        "sales": 6149.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-09",
+        "sales": 550.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-10",
+        "sales": 1350.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-11",
+        "sales": 7699.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-12",
+        "sales": 6748.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-13",
+        "sales": 5350.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-14",
+        "sales": 5530.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-15",
+        "sales": 4450.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-16",
+        "sales": 1700.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-17",
+        "sales": 2300.0,
+        "orders": 2
+      },
+      {
+        "bucket": "2025-07-18",
+        "sales": 4648.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-19",
+        "sales": 4500.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-20",
+        "sales": 10440.0,
+        "orders": 9
+      },
+      {
+        "bucket": "2025-07-21",
+        "sales": 13550.0,
+        "orders": 10
+      },
+      {
+        "bucket": "2025-07-22",
+        "sales": 3250.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-23",
+        "sales": 7649.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-24",
+        "sales": 4150.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-25",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-26",
+        "sales": 4800.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-27",
+        "sales": 1700.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-28",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-29",
+        "sales": 5170.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-30",
+        "sales": 7630.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-31",
+        "sales": 2750.0,
+        "orders": 4
+      }
+    ],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "insights": {
+      "summary": "Total sales ₹149,471.00 across 159 orders. Trend across 31 daily buckets: down 6.8%.",
+      "trend": "down",
+      "delta_pct": -6.78,
+      "narrative": "Total sales ₹149,471.00 across 159 orders. Trend across 31 daily buckets: down 6.8%."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "final_answer": "Total sales are ₹149,471.00 across 159 orders. Sales show a downward trend of 6.8% across the period.",
+    "response_format": "clean"
+  },
+  "d5fbf44249e0c18ffdfb67abca61f15762496a76cf37424a97756ed420c06c26": {
+    "turn_id": "aac8d503-3a27-46af-8578-4500790a537f",
+    "cache_key": "d5fbf44249e0c18ffdfb67abca61f15762496a76cf37424a97756ed420c06c26",
+    "stored_at": "2026-05-05T21:38:35+00:00",
+    "query": "i want to increase my sales give me an suggetion",
+    "sub_agent": "ForecastAgent",
+    "route": "SALES_QUERY",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [
+      {
+        "bucket": "2025-07-01",
+        "sales": 2950.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-02",
+        "sales": 8250.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-03",
+        "sales": 2850.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-04",
+        "sales": 4949.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-05",
+        "sales": 8060.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-06",
+        "sales": 1549.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-07",
+        "sales": 2900.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-08",
+        "sales": 6149.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-09",
+        "sales": 550.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-10",
+        "sales": 1350.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-11",
+        "sales": 7699.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-12",
+        "sales": 6748.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-13",
+        "sales": 5350.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-14",
+        "sales": 5530.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-15",
+        "sales": 4450.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-16",
+        "sales": 1700.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-17",
+        "sales": 2300.0,
+        "orders": 2
+      },
+      {
+        "bucket": "2025-07-18",
+        "sales": 4648.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-19",
+        "sales": 4500.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-20",
+        "sales": 10440.0,
+        "orders": 9
+      },
+      {
+        "bucket": "2025-07-21",
+        "sales": 13550.0,
+        "orders": 10
+      },
+      {
+        "bucket": "2025-07-22",
+        "sales": 3250.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-23",
+        "sales": 7649.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-24",
+        "sales": 4150.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-25",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-26",
+        "sales": 4800.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-27",
+        "sales": 1700.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-28",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-29",
+        "sales": 5170.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-30",
+        "sales": 7630.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-31",
+        "sales": 2750.0,
+        "orders": 4
+      }
+    ],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-08-01",
+          "sales": 5080.69,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-02",
+          "sales": 5096.88,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-03",
+          "sales": 5113.07,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-04",
+          "sales": 5129.26,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-05",
+          "sales": 5145.45,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-06",
+          "sales": 5161.64,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-07",
+          "sales": 5177.83,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-08",
+          "sales": 5194.02,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-09",
+          "sales": 5210.21,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-10",
+          "sales": 5226.4,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-11",
+          "sales": 5242.59,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-12",
+          "sales": 5258.78,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-13",
+          "sales": 5274.97,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-14",
+          "sales": 5291.16,
+          "orders": 0,
+          "predicted": true
+        }
+      ],
+      "forecast_horizon_days": 14
+    },
+    "insights": {
+      "summary": "Total sales ₹149,471.00 across 159 orders. Trend across 45 daily buckets: up 79.4%.",
+      "trend": "up",
+      "delta_pct": 79.36,
+      "narrative": "The total sales are £149,471 across 159 orders, with the highest daily sales being £13,550 and the lowest being £550. The data shows a trend of increasing sales, with a 79.4% increase across the 45 daily buckets. To increase sales, it may be beneficial to analyze the days with the highest sales, such as July 21 with £13,550 in sales, and identify factors that contributed to this success. Additionally, the forecast horizon of 14 days may provide insight into future sales trends."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-08-01",
+          "sales": 5080.69,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-02",
+          "sales": 5096.88,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-03",
+          "sales": 5113.07,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-04",
+          "sales": 5129.26,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-05",
+          "sales": 5145.45,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-06",
+          "sales": 5161.64,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-07",
+          "sales": 5177.83,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-08",
+          "sales": 5194.02,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-09",
+          "sales": 5210.21,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-10",
+          "sales": 5226.4,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-11",
+          "sales": 5242.59,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-12",
+          "sales": 5258.78,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-13",
+          "sales": 5274.97,
+          "orders": 0,
+          "predicted": true
+        },
+        {
+          "bucket": "2025-08-14",
+          "sales": 5291.16,
+          "orders": 0,
+          "predicted": true
+        }
+      ],
+      "forecast_horizon_days": 14
+    },
+    "final_answer": "Total sales are ₹149,471.00 across 159 orders. Sales show an upward trend of 79.4% across the period.",
+    "response_format": "clean"
+  },
+  "505f2fb278c3073e0d1a0657e3932b0f1db8964b5503ece628aa0fd70cce8361": {
+    "turn_id": "ff14670f-14d4-4df9-b05e-4f9cb2092bf5",
+    "cache_key": "505f2fb278c3073e0d1a0657e3932b0f1db8964b5503ece628aa0fd70cce8361",
+    "stored_at": "2026-05-05T21:39:19+00:00",
+    "query": "what is my 3 mounth sales",
+    "sub_agent": "QueryAgent",
+    "route": "SALES_QUERY",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [
+      {
+        "bucket": "2025-07-01",
+        "sales": 2950.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-02",
+        "sales": 8250.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-03",
+        "sales": 2850.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-04",
+        "sales": 4949.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-05",
+        "sales": 8060.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-06",
+        "sales": 1549.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-07",
+        "sales": 2900.0,
+        "orders": 4
+      },
+      {
+        "bucket": "2025-07-08",
+        "sales": 6149.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-09",
+        "sales": 550.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-10",
+        "sales": 1350.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-11",
+        "sales": 7699.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-12",
+        "sales": 6748.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-13",
+        "sales": 5350.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-14",
+        "sales": 5530.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-15",
+        "sales": 4450.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-16",
+        "sales": 1700.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-17",
+        "sales": 2300.0,
+        "orders": 2
+      },
+      {
+        "bucket": "2025-07-18",
+        "sales": 4648.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-19",
+        "sales": 4500.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-20",
+        "sales": 10440.0,
+        "orders": 9
+      },
+      {
+        "bucket": "2025-07-21",
+        "sales": 13550.0,
+        "orders": 10
+      },
+      {
+        "bucket": "2025-07-22",
+        "sales": 3250.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-23",
+        "sales": 7649.0,
+        "orders": 8
+      },
+      {
+        "bucket": "2025-07-24",
+        "sales": 4150.0,
+        "orders": 5
+      },
+      {
+        "bucket": "2025-07-25",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-26",
+        "sales": 4800.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-27",
+        "sales": 1700.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-28",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-29",
+        "sales": 5170.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-30",
+        "sales": 7630.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-31",
+        "sales": 2750.0,
+        "orders": 4
+      }
+    ],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "insights": {
+      "summary": "Total sales ₹149,471.00 across 159 orders. Trend across 31 daily buckets: down 6.8%.",
+      "trend": "down",
+      "delta_pct": -6.78,
+      "narrative": "Total sales ₹149,471.00 across 159 orders. Trend across 31 daily buckets: down 6.8%."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 149471.0,
+        "orders": 159,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-01",
+          "sales": 2950.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-02",
+          "sales": 8250.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-03",
+          "sales": 2850.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-04",
+          "sales": 4949.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-05",
+          "sales": 8060.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-06",
+          "sales": 1549.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-07",
+          "sales": 2900.0,
+          "orders": 4
+        },
+        {
+          "bucket": "2025-07-08",
+          "sales": 6149.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-09",
+          "sales": 550.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-10",
+          "sales": 1350.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-11",
+          "sales": 7699.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-12",
+          "sales": 6748.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-13",
+          "sales": 5350.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-14",
+          "sales": 5530.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-15",
+          "sales": 4450.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-16",
+          "sales": 1700.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-17",
+          "sales": 2300.0,
+          "orders": 2
+        },
+        {
+          "bucket": "2025-07-18",
+          "sales": 4648.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-19",
+          "sales": 4500.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-20",
+          "sales": 10440.0,
+          "orders": 9
+        },
+        {
+          "bucket": "2025-07-21",
+          "sales": 13550.0,
+          "orders": 10
+        },
+        {
+          "bucket": "2025-07-22",
+          "sales": 3250.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-23",
+          "sales": 7649.0,
+          "orders": 8
+        },
+        {
+          "bucket": "2025-07-24",
+          "sales": 4150.0,
+          "orders": 5
+        },
+        {
+          "bucket": "2025-07-25",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "final_answer": "Total sales are ₹149,471.00 across 159 orders. Sales show a downward trend of 6.8% across the period.",
+    "response_format": "clean"
+  },
+  "00295356b96ba7e62629aaed62d91e16176b76da201b1d68c810130070d03821": {
+    "turn_id": "0b5b14a1-8277-4b3d-911a-e8e510b92453",
+    "cache_key": "00295356b96ba7e62629aaed62d91e16176b76da201b1d68c810130070d03821",
+    "stored_at": "2026-05-05T21:39:47+00:00",
+    "query": "what is my last 5 days sales",
+    "sub_agent": "QueryAgent",
+    "route": "SALES_QUERY",
+    "sql": "SELECT \"Date\" AS \"bucket\", SUM(\"Total Amount\") AS \"sales\", COUNT(*) AS \"orders\" FROM \"sales\" WHERE \"Date\" >= ? AND \"Date\" <= ? GROUP BY \"bucket\" ORDER BY \"bucket\" ASC LIMIT 1000",
+    "rows": [
+      {
+        "bucket": "2025-07-26",
+        "sales": 4800.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-27",
+        "sales": 1700.0,
+        "orders": 1
+      },
+      {
+        "bucket": "2025-07-28",
+        "sales": 2950.0,
+        "orders": 3
+      },
+      {
+        "bucket": "2025-07-29",
+        "sales": 5170.0,
+        "orders": 6
+      },
+      {
+        "bucket": "2025-07-30",
+        "sales": 7630.0,
+        "orders": 7
+      },
+      {
+        "bucket": "2025-07-31",
+        "sales": 2750.0,
+        "orders": 4
+      }
+    ],
+    "aggregates": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 25000.0,
+        "orders": 27,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "insights": {
+      "summary": "Total sales ₹25,000.00 across 27 orders. Trend across 6 daily buckets: down 42.7%.",
+      "trend": "down",
+      "delta_pct": -42.71,
+      "narrative": "Total sales ₹25,000.00 across 27 orders. Trend across 6 daily buckets: down 42.7%."
+    },
+    "chart": {
+      "granularity": "daily",
+      "totals": {
+        "total_sales": 25000.0,
+        "orders": 27,
+        "customers": 0
+      },
+      "series": [
+        {
+          "bucket": "2025-07-26",
+          "sales": 4800.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-27",
+          "sales": 1700.0,
+          "orders": 1
+        },
+        {
+          "bucket": "2025-07-28",
+          "sales": 2950.0,
+          "orders": 3
+        },
+        {
+          "bucket": "2025-07-29",
+          "sales": 5170.0,
+          "orders": 6
+        },
+        {
+          "bucket": "2025-07-30",
+          "sales": 7630.0,
+          "orders": 7
+        },
+        {
+          "bucket": "2025-07-31",
+          "sales": 2750.0,
+          "orders": 4
+        }
+      ]
+    },
+    "final_answer": "Total sales are ₹25,000.00 across 27 orders. Sales show a downward trend of 42.7% across the period.",
+    "response_format": "clean"
+  }
+}
