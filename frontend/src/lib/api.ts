@@ -1,9 +1,15 @@
 /**
  * API client. Reads the Groq API key from the Zustand store at call time and
- * forwards it as `X-Groq-Api-Key`. Base URL is configurable via VITE_API_BASE_URL.
+ * forwards it as `X-Groq-Api-Key`.
  *
- * Backend wiring: the FastAPI route should read `request.headers.get("X-Groq-Api-Key")`
- * and prefer it over the env-configured key.
+ * Backend URL resolution (in order of preference):
+ *   1. import.meta.env.VITE_BACKEND_URL    — preferred, full https URL of the
+ *      Render backend service (e.g. https://agentic-backend.onrender.com).
+ *   2. import.meta.env.VITE_API_BASE_URL   — legacy alias kept for backward
+ *      compatibility with previously-configured deployments.
+ *   3. PRODUCTION_FALLBACK                 — hardcoded production backend so
+ *      the build never produces requests against the frontend's own origin
+ *      (which would 404 because the backend isn't there).
  */
 import { useAppStore } from '@/store/useAppStore'
 import type {
@@ -16,7 +22,22 @@ import type {
   UploadsListResponse,
 } from '@/types'
 
-const BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '/api'
+/** Hardcoded production backend — last-resort fallback when no env var is set.
+ *  This MUST point to the real deployed Render service. Override per-environment
+ *  with VITE_BACKEND_URL if your service is named differently. */
+const PRODUCTION_FALLBACK = 'https://agentic-ai-anet.onrender.com'
+
+function resolveBackendUrl(): string {
+  const candidate =
+    (import.meta.env.VITE_BACKEND_URL as string | undefined) ??
+    (import.meta.env.VITE_API_BASE_URL as string | undefined) ??
+    PRODUCTION_FALLBACK
+  // Strip trailing slashes so `${BASE_URL}/upload` doesn't produce `//upload`.
+  const trimmed = (candidate || '').trim().replace(/\/+$/, '')
+  return trimmed || PRODUCTION_FALLBACK
+}
+
+const BASE_URL = resolveBackendUrl()
 
 export class ApiError extends Error {
   status: number
