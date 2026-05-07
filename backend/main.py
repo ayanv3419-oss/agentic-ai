@@ -4,6 +4,13 @@ Run from the project root:
     python main.py
 or:
     uvicorn backend.main:app --port 8000 --reload
+
+Architecture (5 modules under app/):
+    database.py  — settings, schema, SQLite + JSON cache + memory
+    tools.py     — TurnState + 14 tools + registry + Groq + SSE + cost guard
+    agents.py    — coordinator + 7 sub-agents
+    api.py       — admin auth + every HTTP route
+    main.py      — FastAPI app, middleware, exception handlers, startup
 """
 from __future__ import annotations
 
@@ -25,10 +32,20 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.api import api_router, auth_router
-from app.config import settings
-from app.errors import envelope
-from app.logging_setup import configure_logging
+from app.database import envelope, settings
 from app.tools import get_registry  # registry bootstrap on import
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    """One-shot logging configuration."""
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    # Quiet noisy upstreams.
+    for noisy in ("httpx", "httpcore", "uvicorn.access"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 configure_logging()
 log = logging.getLogger("agentic_ai")

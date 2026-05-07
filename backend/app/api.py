@@ -1,50 +1,297 @@
-"""HTTP surface — /upload, /dashboard, /query_stream, /uploads, /health, /cache/clear.
+"""HTTP layer — admin auth + every route the frontend talks to.
 
-Contracts are preserved exactly so the existing frontend types
-(UploadResponse, DashboardData, AuthMe, SseEvent) keep working.
+Sections:
+    1.  Auth core      — bearer-token issue / verify + FastAPI dependencies
+    2.  Auth routes    — /auth/login, /auth/me, /auth/logout
+                          + disabled Google / Drive placeholders (503)
+    3.  Business routes — /health, /upload, /dashboard, /uploads,
+                          /uploads/{batch_id}/disconnect, /cache/clear,
+                          /query_stream (SSE)
+
+Cross-module rule: this is the topmost layer below `main.py`. It imports
+from `agents`, `tools`, `database`. Nothing imports back into `api.py`.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import logging
 import os
 import tempfile
-from typing import Any
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.agents.dashboard_agent import DashboardAgent
-from app.agents.dataclean_agent import DataCleanAgent
-from app.auth_core import require_auth
-from app.cache import cache_size, invalidate_all
-from app.config import settings
-from app.coordinator import run_query_turn
+from app.agents import DashboardAgent, DataCleanAgent, run_query_turn
 from app.database import (
     ALLOWED_TABLES,
+    SAFE_MESSAGE,
+    UploadError,
+    cache_size,
     count_rows,
     disconnect_upload,
-    get_upload_meta,
+    envelope,
+    invalidate_all,
     list_uploads_meta,
     record_upload_meta,
+    settings,
 )
-from app.errors import envelope, SAFE_MESSAGE
-from app.llm import GroqClient, set_request_groq, reset_request_groq
-from app.state import TurnState
-from app.streaming import EventEmitter, format_sse
-from app.upload import UploadError
+from app.tools import (
+    EventEmitter,
+    GroqClient,
+    TurnState,
+    format_sse,
+    reset_request_groq,
+    set_request_groq,
+)
+
 
 log = logging.getLogger("agentic_ai.api")
-router = APIRouter()
+
+
+# ===========================================================================
+# 1. AUTH CORE — HMAC-signed bearer tokens
+# ===========================================================================
+
+# Token format: base64url(payload).hex(hmac_sha256(secret, payload))
+# where payload = "<username>:<expiry_unix_ts>"
+#
+# Intentionally minimal (single admin, no DB-backed sessions). The secret
+# comes from `AUTH_TOKEN_SECRET`; the credentials from `ADMIN_USERNAME` and
+# `ADMIN_PASSWORD`. Restarting the server with a new secret invalidates
+# every outstanding token at once.
+
+_auth_log = logging.getLogger("agentic_ai.auth_core")
+
+
+def _b64url_encode(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(s: str) -> bytes:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode((s + pad).encode("ascii"))
+
+
+def _sign(payload: str) -> str:
+    return hmac.new(
+        settings.auth_token_secret.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def create_token(username: str) -> tuple[str, str]:
+    """Return (token, ISO expires_at). TTL comes from settings."""
+    expiry = int(time.time()) + settings.auth_token_ttl_hours * 3600
+    payload = f"{username}:{expiry}"
+    sig = _sign(payload)
+    token = f"{_b64url_encode(payload.encode('utf-8'))}.{sig}"
+    expires_at = datetime.fromtimestamp(expiry, tz=timezone.utc).isoformat(
+        timespec="seconds"
+    )
+    return token, expires_at
+
+
+def verify_token(token: Optional[str]) -> Optional[str]:
+    """Return username on success, None on any failure (invalid format,
+    bad signature, expired, etc.)."""
+    if not token or "." not in token:
+        return None
+    try:
+        payload_b64, sig = token.split(".", 1)
+        payload = _b64url_decode(payload_b64).decode("utf-8")
+        username, expiry_s = payload.split(":")
+        expiry = int(expiry_s)
+    except Exception:
+        return None
+    expected_sig = _sign(payload)
+    if not hmac.compare_digest(sig, expected_sig):
+        return None
+    if time.time() > expiry:
+        return None
+    return username
+
+
+def credentials_match(username: str, password: str) -> bool:
+    """Constant-time compare against the admin credentials.
+    Fails-closed when env vars aren't configured."""
+    expected_u = settings.admin_username or ""
+    expected_p = settings.admin_password or ""
+    if not expected_u or not expected_p:
+        return False
+    u_ok = hmac.compare_digest(
+        (username or "").encode("utf-8"), expected_u.encode("utf-8")
+    )
+    p_ok = hmac.compare_digest(
+        (password or "").encode("utf-8"), expected_p.encode("utf-8")
+    )
+    return u_ok and p_ok
+
+
+def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
+    if not authorization:
+        return None
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    return parts[1].strip() or None
+
+
+async def require_auth(
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+) -> str:
+    """FastAPI dependency. Raises 401 with the standard envelope if the
+    Authorization header is missing / malformed / expired."""
+    token = _extract_bearer(authorization)
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail=envelope(
+                "Authentication required",
+                detail="Send `Authorization: Bearer <token>` after logging in via /auth/login.",
+                kind="auth",
+            ),
+        )
+    username = verify_token(token)
+    if not username:
+        raise HTTPException(
+            status_code=401,
+            detail=envelope(
+                "Invalid or expired token",
+                detail="Log in again to obtain a new token.",
+                kind="auth",
+            ),
+        )
+    return username
+
+
+def try_auth(authorization: Optional[str]) -> Optional[str]:
+    """Non-raising variant for routes that want to know "is the caller
+    authenticated?" without rejecting unauthenticated requests."""
+    return verify_token(_extract_bearer(authorization))
+
+
+# ===========================================================================
+# 2. AUTH ROUTES (/auth/login, /auth/me, /auth/logout + disabled Google/Drive)
+# ===========================================================================
+
+auth_router = APIRouter()
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=200)
+    password: str = Field(..., min_length=1, max_length=200)
+
+
+@auth_router.post("/auth/login")
+async def auth_login(req: LoginRequest):
+    """Validate credentials against ADMIN_USERNAME / ADMIN_PASSWORD env vars
+    and return a signed bearer token on success."""
+    if not credentials_match(req.username, req.password):
+        _auth_log.info("login failed for username=%r", req.username)
+        return JSONResponse(
+            status_code=401,
+            content=envelope(
+                "Invalid credentials",
+                detail="Username or password is incorrect.",
+                kind="auth",
+            ),
+        )
+    token, expires_at = create_token(req.username)
+    _auth_log.info("login ok username=%r expires=%s", req.username, expires_at)
+    return {
+        "token":      token,
+        "username":   req.username,
+        "expires_at": expires_at,
+    }
+
+
+@auth_router.get("/auth/me")
+async def auth_me(authorization: Optional[str] = Header(default=None)):
+    """Inspect the current bearer token. Returns `authenticated=false` if
+    no/invalid/expired token (so the frontend can render its login screen)."""
+    username = try_auth(authorization)
+    if username:
+        return {
+            "authenticated":     True,
+            "username":          username,
+            "google_configured": False,
+        }
+    return {
+        "authenticated":     False,
+        "google_configured": False,
+    }
+
+
+@auth_router.post("/auth/logout")
+async def auth_logout():
+    """Token revocation is client-driven — the client drops the token from
+    storage. (Stateless tokens; restart the server with a new
+    AUTH_TOKEN_SECRET to invalidate every token at once.)"""
+    return {"ok": True}
+
+
+# Google OAuth + Drive placeholders -----------------------------------------
+# The Google Auth + Drive sync flow is intentionally disabled in this build.
+# The frontend has UI for it but the backend returns a structured
+# `auth_disabled` envelope so it doesn't 404.
+
+def _disabled() -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content=envelope(
+            "Google authentication is not enabled in this build.",
+            detail="The Google Auth + Drive sync flow is intentionally disabled.",
+            kind="auth_disabled",
+        ),
+    )
+
+
+@auth_router.get("/auth/google/login")
+async def google_login():
+    return _disabled()
+
+
+@auth_router.get("/auth/google/callback")
+async def google_callback():
+    return _disabled()
+
+
+@auth_router.post("/drive/sync")
+async def drive_sync():
+    return _disabled()
+
+
+@auth_router.get("/drive/status")
+async def drive_status():
+    return {
+        "authenticated": False,
+        "email": None,
+        "imported_files": [],
+    }
+
+
+# ===========================================================================
+# 3. BUSINESS ROUTES
+# ===========================================================================
+
+api_router = APIRouter()
 
 
 # ---------------------------------------------------------------------------
 # /health
 # ---------------------------------------------------------------------------
 
-@router.get("/health")
+@api_router.get("/health")
 async def health() -> dict:
     return {
         "status": "ok",
@@ -60,7 +307,7 @@ async def health() -> dict:
 # /upload  (DataCleanAgent)
 # ---------------------------------------------------------------------------
 
-@router.post("/upload", dependencies=[Depends(require_auth)])
+@api_router.post("/upload", dependencies=[Depends(require_auth)])
 async def upload(
     request: Request,
     file: UploadFile = File(...),
@@ -172,7 +419,6 @@ async def upload(
         upload_log.info("dataclean: starting target=%s batch_id=%s",
                         target_table, batch_id)
         agent = DataCleanAgent()
-        from pathlib import Path
         try:
             result = await agent.run(
                 tmp_path=Path(tmp_path),
@@ -243,7 +489,7 @@ async def upload(
 # /dashboard (DashboardAgent)
 # ---------------------------------------------------------------------------
 
-@router.get("/dashboard", dependencies=[Depends(require_auth)])
+@api_router.get("/dashboard", dependencies=[Depends(require_auth)])
 async def dashboard(month: str | None = None):
     if month is not None and (len(month) != 7 or month[4] != "-"):
         return JSONResponse(status_code=400, content=envelope(
@@ -270,7 +516,7 @@ async def dashboard(month: str | None = None):
 # /uploads  (metadata listing for the dataset pill)
 # ---------------------------------------------------------------------------
 
-@router.get("/uploads", dependencies=[Depends(require_auth)])
+@api_router.get("/uploads", dependencies=[Depends(require_auth)])
 async def uploads():
     return {
         "uploads": await list_uploads_meta(),
@@ -281,7 +527,7 @@ async def uploads():
     }
 
 
-@router.post("/uploads/{batch_id}/disconnect", dependencies=[Depends(require_auth)])
+@api_router.post("/uploads/{batch_id}/disconnect", dependencies=[Depends(require_auth)])
 async def upload_disconnect(batch_id: str):
     """Remove a dataset from active sources.
 
@@ -318,7 +564,7 @@ async def upload_disconnect(batch_id: str):
 # /cache/clear
 # ---------------------------------------------------------------------------
 
-@router.post("/cache/clear", dependencies=[Depends(require_auth)])
+@api_router.post("/cache/clear", dependencies=[Depends(require_auth)])
 async def cache_clear():
     n = invalidate_all()
     return {"cleared": n}
@@ -456,7 +702,7 @@ def _stream_response(
     )
 
 
-@router.post("/query_stream", dependencies=[Depends(require_auth)])
+@api_router.post("/query_stream", dependencies=[Depends(require_auth)])
 async def query_stream(req: QueryRequest, request: Request):
     api_key = _resolve_groq_key(request)
     emitter = EventEmitter()
