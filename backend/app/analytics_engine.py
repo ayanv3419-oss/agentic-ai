@@ -666,6 +666,113 @@ class RouteClassifierTool(Tool):
 # 6.3 IntentAnalyzer
 # ---------------------------------------------------------------------------
 
+# ---- Typo normalization (deterministic — no LLM) -------------------------
+#
+# Two layers:
+#   1. _TYPO_MAP — hand-curated common misspellings of domain words. Cheap,
+#      O(1) lookup, keeps known typos stable across releases.
+#   2. difflib.get_close_matches against _DOMAIN_VOCAB — catches anything
+#      that's within ~1-2 edits of a real domain word AND wasn't in the
+#      explicit map. Cutoff is 0.85 + minimum length 5 to avoid corrupting
+#      legitimate short words ("hi", "ok", numbers).
+#
+# Normalization runs at the top of `classify_intent` and `classify_query_kind`
+# so every downstream layer sees the corrected text. Pure substitution — we
+# do not change capitalization or punctuation, just word tokens.
+
+import difflib as _difflib  # local alias, avoid namespace pollution
+
+_TYPO_MAP: dict[str, str] = {
+    # product / item family
+    "produt": "product", "produkt": "product", "prodcut": "product",
+    "prodct": "product", "produsts": "products", "produts": "products",
+    "iteam": "item", "itam": "item",
+    # selling / sold
+    "sellling": "selling", "selliing": "selling", "sellign": "selling",
+    "selled": "sold", "soldd": "sold",
+    # revenue / sales / profit
+    "reveneu": "revenue", "revneu": "revenue", "revanue": "revenue",
+    "revnue": "revenue", "saless": "sales", "salses": "sales",
+    "profitablee": "profitable", "profittable": "profitable",
+    # ranking superlatives
+    "topest": "top", "topp": "top", "tops": "top",
+    "lowst": "lowest", "loweest": "lowest",
+    "wrost": "worst", "wost": "worst",
+    "higest": "highest", "higheset": "highest", "hihest": "highest",
+    "biggset": "biggest",
+    # time
+    "mounth": "month", "monht": "month", "montgh": "month", "moth": "month",
+    "wek": "week", "weak": "week",
+    "yestrday": "yesterday", "yseterday": "yesterday",
+    "tody": "today", "todya": "today",
+    # entity nouns
+    "custmer": "customer", "custome": "customer", "customrs": "customers",
+    "buyr": "buyer", "buyers": "buyers",
+    "catgory": "category", "categry": "category", "catagory": "category",
+    "brnd": "brand", "brnads": "brands",
+    "vendr": "vendor", "supplie": "supplier",
+    "skus": "sku",
+}
+
+# Anchor vocabulary for the difflib fallback. Keep this tight — only words
+# that DOMAIN matters for. Padding it with generic English would cause
+# false corrections (e.g. "than" → "then" is wrong here).
+_DOMAIN_VOCAB: frozenset[str] = frozenset({
+    # entities
+    "product", "products", "item", "items", "sku",
+    "brand", "brands", "category", "categories",
+    "customer", "customers", "buyer", "buyers", "client", "clients",
+    "vendor", "vendors", "supplier", "suppliers", "party", "parties",
+    "salesperson", "salespeople", "channel", "channels",
+    # metrics
+    "sales", "selling", "sold", "sale", "revenue", "income",
+    "profit", "profits", "profitable", "earnings", "turnover",
+    "orders", "order", "units", "quantity",
+    # ranking superlatives
+    "top", "bottom", "best", "worst", "highest", "lowest",
+    "most", "least", "biggest", "smallest", "leading",
+    # time
+    "today", "yesterday", "month", "months", "week", "weeks",
+    "year", "years", "day", "days", "quarter",
+    # qualifiers
+    "performing", "performance", "performer", "popular",
+})
+
+
+def _normalize_typos(question: str) -> str:
+    """Correct common misspellings of domain terms. Pure-deterministic — no
+    LLM. Tokens that are already correct (in `_DOMAIN_VOCAB`) are left
+    alone; tokens in `_TYPO_MAP` are substituted; otherwise a difflib
+    fuzzy match (cutoff 0.85, min length 5) is consulted.
+
+    Preserves whitespace and punctuation exactly so downstream regex /
+    keyword matching keeps working unchanged."""
+    if not question:
+        return question
+    out: list[str] = []
+    for tok in re.split(r"(\W+)", question):
+        if not tok or not tok.isalpha():
+            out.append(tok)
+            continue
+        low = tok.lower()
+        if low in _DOMAIN_VOCAB:
+            out.append(tok)
+            continue
+        if low in _TYPO_MAP:
+            corrected = _TYPO_MAP[low]
+            # Preserve simple capitalization on the first letter.
+            out.append(corrected.capitalize() if tok[0].isupper() else corrected)
+            continue
+        if len(low) >= 5:
+            close = _difflib.get_close_matches(low, _DOMAIN_VOCAB, n=1, cutoff=0.85)
+            if close:
+                corrected = close[0]
+                out.append(corrected.capitalize() if tok[0].isupper() else corrected)
+                continue
+        out.append(tok)
+    return "".join(out)
+
+
 _METRIC_MAP: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b(?:gmv|gross merchandise|sales|revenue|turnover|earned|earnings)\b", re.I), "total_amount"),
     (re.compile(r"\b(?:order count|orders|transactions|number of (?:sales|orders))\b", re.I), "orders"),
@@ -741,17 +848,28 @@ _INTENT_RULES: tuple[tuple[str, float, tuple[str, ...]], ...] = (
         "most sold", "most popular", "most ordered", "most bought",
         "highest revenue by", "lowest revenue by",
         "highest revenue product", "highest revenue item",
-        "highest revenue brand", "highest selling product",
+        "highest revenue brand", "highest selling",
+        "biggest seller", "biggest sale",
         "best customer", "top customer", "biggest customer",
         "best vendor", "top vendor", "biggest vendor",
         "best buyer", "top buyer", "biggest buyer",
         "best parties", "top parties", "biggest parties",
+        "best performing", "top performing",
+        "worst customer", "worst client", "worst buyer",
+        "lowest customer", "lowest client", "lowest buyer",
         "highest sales by", "lowest sales by",
         "by customer", "by party", "by vendor", "by supplier",
         "by product", "by item", "by brand",
         "which product", "which item", "which brand", "which shoe",
         "what product", "what item", "what brand",
         "top n ", "rank by ",
+        # Bottom / lowest / worst / least — same intent, opposite sort
+        # direction. The `rank_direction` hint flips the ORDER BY.
+        "lowest selling", "lowest sale", "least selling", "least sold",
+        "worst selling", "worst performing", "worst performer",
+        "bottom selling", "bottom seller", "bottom performer",
+        "least popular", "least ordered", "smallest seller",
+        "underperforming", "lowest performing",
     )),
     ("anomaly_detection", 0.85, (
         "anomaly", "anomalies", "outlier", "outliers",
@@ -816,16 +934,41 @@ def _ranking_subject(question: str) -> str:
     return "product"
 
 
+# Bottom-of-ranking signals. When any of these match the (already typo-
+# normalized) question, the ranking plan inverts ORDER BY direction so the
+# WORST sellers come first instead of the best.
+_BOTTOM_RANK_KWS: tuple[str, ...] = (
+    "lowest", "least", "worst", "bottom", "smallest",
+    "underperforming", "under-performing",
+)
+
+
+def _ranking_direction(question: str) -> str:
+    """Return 'asc' if the question asks for the lowest/worst/bottom of a
+    ranking, else 'desc' (the default — top/best/highest)."""
+    q = (question or "").lower()
+    for kw in _BOTTOM_RANK_KWS:
+        if f" {kw} " in f" {q} " or q.startswith(kw + " ") or q.endswith(" " + kw):
+            return "asc"
+    return "desc"
+
+
 def classify_intent(question: str) -> tuple[str, float, dict[str, Any]]:
     """Deterministic intent classifier — returns (type, confidence, hints).
 
     Confidence is a float in [0.0, 0.99]. Treat ≥ 0.7 as high-confidence
     (use deterministic routing); below that, callers may invoke a
     semantic fallback.
+
+    The question is run through `_normalize_typos` first so typo-heavy
+    phrasings ("topest selling produt", "highest reveneu") still hit the
+    keyword vocabulary. Normalization preserves whitespace and punctuation
+    exactly so this is byte-compatible with the original keyword scan.
     """
     if not question or not question.strip():
         return "sales_summary", 0.0, {"matched": None, "reason": "empty"}
 
+    question = _normalize_typos(question)
     q = " " + question.lower().strip() + " "
 
     # Special-case: "top N <ranking-noun>" — the rule loop's keywords list
@@ -849,6 +992,7 @@ def classify_intent(question: str) -> tuple[str, float, dict[str, Any]]:
             "matches":          1,
             "top_n":            max(1, min(n, 50)),
             "ranking_subject":  subject,
+            "rank_direction":   "asc" if m_rank.group(0).lower().lstrip().startswith("bottom") else "desc",
         }
 
     # Use space-padded matching for short tokens to avoid false hits inside
@@ -878,6 +1022,7 @@ def classify_intent(question: str) -> tuple[str, float, dict[str, Any]]:
             }
             if intent_type == "product_performance":
                 hints["ranking_subject"] = _ranking_subject(question)
+                hints["rank_direction"] = _ranking_direction(question)
             return intent_type, conf, hints
 
     # No rule matched — low-confidence default.
@@ -1368,6 +1513,10 @@ class SqlPlannerTool(Tool):
         intent = state.intent or {}
         hints = intent.get("hints") or {}
         subject = (hints.get("ranking_subject") or "product").lower()
+        # rank_direction: "desc" → top performers (default);
+        #                  "asc"  → bottom performers ("lowest selling", "worst").
+        direction = (hints.get("rank_direction") or "desc").lower()
+        sort_dir = "ASC" if direction == "asc" else "DESC"
         top_n = int(intent.get("top_n") or hints.get("top_n") or 10)
         top_n = max(3, min(top_n, 50))
 
@@ -1392,11 +1541,12 @@ class SqlPlannerTool(Tool):
         return {
             "kind":            "ranking",
             "ranking_subject": subject,
+            "rank_direction":  direction,
             "table":           table,
             "select":          select,
             "where":           where,
             "group_by":        [group_col],
-            "order_by":        [{"col": "sales", "dir": "DESC"}],
+            "order_by":        [{"col": "sales", "dir": sort_dir}],
             "limit":           top_n,
         }
 
@@ -2563,6 +2713,11 @@ _MISSING_DIMENSIONS: list[tuple[str, tuple[str, ...], str]] = [
         "by category", "product category", "by size",
         "by colour", "by color", "size breakdown",
         "category sales", "category-wise",
+        # Bare-word matches — any query mentioning category/categories
+        # routes to the missing-data response (schema has Product Name but
+        # no Category column). Keep these space-padded so they match as
+        # whole words inside the padded query.
+        " category ", " categories ",
     ), "product category / size / colour"),
     ("supplier_cost", (
         "supplier cost", "vendor cost", "purchase cost",
@@ -2842,6 +2997,11 @@ def classify_query_kind(
             "knowledge": False, "missing": None, "matched_patterns": [],
             "selected_mode": "chat", "reason": "empty input",
         }
+
+    # Typo-correct domain words BEFORE the scoring scan so phrasings like
+    # "topest selling produt this mounth" still hit DOMAIN_WORDS / METRIC_WORDS.
+    # Pure deterministic — no LLM. See `_normalize_typos`.
+    question = _normalize_typos(question)
 
     lower = question.lower().strip()
     normal = re.sub(r"\s+", " ", lower).strip(" .,!?;:'\"")
@@ -3448,6 +3608,61 @@ AGENT_TO_INTENT: dict[str, str] = {
 DETERMINISTIC_CONFIDENCE = 0.7
 
 
+# Per-intent expected shapes. The diagnostics record below uses these so an
+# operator (or a regression test) can see in ONE place what SQL and chart
+# kind a given intent should produce — without having to read SqlPlanner or
+# ResultAggregator. They MUST stay in sync with `_plan_*` in `SqlPlannerTool`
+# and the chart-kind table in `ResultAggregatorTool`.
+_INTENT_SHAPES: dict[str, dict[str, str]] = {
+    "sales_summary":       {"sql_type": "time_series_summary", "chart": "bar_or_area"},
+    "purchase_analysis":   {"sql_type": "time_series_summary", "chart": "bar_or_area"},
+    "product_performance": {"sql_type": "grouped_ranking",     "chart": "horizontal_bar"},
+    "trend_analysis":      {"sql_type": "time_series_trend",   "chart": "area"},
+    "comparison":          {"sql_type": "two_window_compare",  "chart": "bar_or_area"},
+    "anomaly_detection":   {"sql_type": "time_series_summary", "chart": "bar_or_area"},
+    "root_cause_analysis": {"sql_type": "two_window_compare",  "chart": "bar_or_area"},
+    "forecasting":         {"sql_type": "time_series_summary", "chart": "area"},
+}
+
+
+def _build_intent_diagnostics(
+    question: str, intent_type: str, intent_hints: dict[str, Any],
+) -> dict[str, Any]:
+    """Flatten the salient analytics decisions into a single structured
+    record. The operator gets one line that says exactly which entity /
+    metric / direction / SQL shape / chart kind was chosen.
+
+    Surfaced via the `intent.classified` SSE event so a frontend or log
+    pipeline can attach it directly to the turn without re-parsing hints.
+    """
+    shape = _INTENT_SHAPES.get(intent_type, {})
+    if intent_type == "product_performance":
+        entity = intent_hints.get("ranking_subject") or "product"
+        direction = intent_hints.get("rank_direction") or "desc"
+        # entity-ranking ALWAYS produces grouped SQL + a horizontal bar; we
+        # tag direction so a UI can flip the legend / colour ramp.
+        return {
+            "intent_type": "ranking",
+            "entity":      entity,
+            "metric":      "sales",
+            "direction":   direction,
+            "top_n":       intent_hints.get("top_n"),
+            "chart":       "horizontal_bar",
+            "sql_type":    "grouped_ranking",
+            "matched":     intent_hints.get("matched"),
+        }
+    return {
+        "intent_type": intent_type,
+        "entity":      None,
+        "metric":      None,  # IntentAnalyzer fills this once it runs
+        "direction":   "desc",
+        "top_n":       intent_hints.get("top_n"),
+        "chart":       shape.get("chart"),
+        "sql_type":    shape.get("sql_type"),
+        "matched":     intent_hints.get("matched"),
+    }
+
+
 async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
     """Drive a single /query_stream turn end-to-end.
 
@@ -3572,14 +3787,21 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
 
     # ---- 4. Intent classification + sub-agent selection ------------------
     intent_type, intent_conf, intent_hints = classify_intent(state.question)
+    # Build a single structured diagnostics record covering every layer the
+    # operator wants visible per-turn: detected intent, entity, metric,
+    # ranking direction, expected SQL shape, expected chart kind. This is
+    # the canonical observability surface for analytics requests; SSE
+    # consumers and structured logs both use it.
+    diagnostics = _build_intent_diagnostics(state.question, intent_type, intent_hints)
     _loop_log.info(
-        "intent: type=%s confidence=%.2f hints=%s",
-        intent_type, intent_conf, intent_hints,
+        "intent: type=%s confidence=%.2f hints=%s diagnostics=%s",
+        intent_type, intent_conf, intent_hints, diagnostics,
     )
     await emit.emit("intent.classified", {
-        "type":       intent_type,
-        "confidence": intent_conf,
-        "hints":      intent_hints,
+        "type":        intent_type,
+        "confidence":  intent_conf,
+        "hints":       intent_hints,
+        "diagnostics": diagnostics,
     })
 
     metrics: dict[str, Any] = {"tokens_in": 0, "tokens_out": 0}
