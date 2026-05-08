@@ -1,19 +1,16 @@
 /**
- * App shell — layout chrome and authentication gate.
+ * App shell + entry — Sidebar, TopBar, Login screen, view switcher, bootstrap.
  *
- * This module owns every layout-level concern that is NOT a routable page:
- *   - The Sidebar (navigation + Groq-key indicator + sign-out)
- *   - The TopBar (shop / dataset summary)
- *   - The PageHeader (used by every page; re-exported for consumers in pages.tsx)
- *   - The Login screen (rendered when no valid bearer token is on hand)
- *   - The top-level view switcher (state-driven; matches NavKey)
+ * Consolidates the former App.tsx (Sidebar / TopBar / Login / App component)
+ * and main.tsx (ReactDOM.createRoot bootstrap). PageHeader (used by every
+ * page) lives in ui_system.tsx alongside the pages that consume it.
  *
- * Pages live in `pages.tsx`. Data and state live in `api.ts`. Charts live in
- * `charts.ts`. This module imports from those — never the other way around for
- * the page modules. (PageHeader is the one exception — pages need it, so it's
- * exported from here.)
+ * Pages live in `ui_system.tsx`. Data and state live in `client_core.ts`.
+ * This module imports from those — never the other way around.
  */
-import { useState, type ReactNode } from 'react'
+import React, { useState, type ComponentType } from 'react'
+import ReactDOM from 'react-dom/client'
+import './index.css'
 import {
   Activity,
   AlertTriangle,
@@ -26,7 +23,6 @@ import {
   Sparkles,
   Upload,
 } from 'lucide-react'
-import type { ComponentType } from 'react'
 
 import {
   ApiError,
@@ -35,37 +31,9 @@ import {
   logoutBackend,
   selectIsAuthed,
   useAppStore,
-} from '@/api'
-import type { NavKey } from '@/api'
-import { AiAssistant, Dashboard, ShopInfo, UploadData } from '@/pages'
-
-// ===========================================================================
-// PageHeader — shared between every page
-// ===========================================================================
-
-interface PageHeaderProps {
-  icon: ReactNode
-  title: string
-  subtitle: string
-  trailing?: ReactNode
-}
-
-export function PageHeader({ icon, title, subtitle, trailing }: PageHeaderProps) {
-  return (
-    <div className="flex items-start justify-between gap-4 flex-wrap">
-      <div className="flex items-start gap-3">
-        <div className="w-10 h-10 rounded-lg bg-zinc-900 border border-zinc-800 flex items-center justify-center shrink-0">
-          {icon}
-        </div>
-        <div>
-          <h1 className="text-xl md:text-2xl font-semibold tracking-tight">{title}</h1>
-          <p className="text-sm text-zinc-500 mt-1 max-w-xl">{subtitle}</p>
-        </div>
-      </div>
-      {trailing}
-    </div>
-  )
-}
+} from '@/client_core'
+import type { NavKey } from '@/client_core'
+import { AiAssistant, Dashboard, ShopInfo, UploadData } from '@/ui_system'
 
 // ===========================================================================
 // Sidebar
@@ -342,9 +310,6 @@ function Login() {
 export default function App() {
   const [view, setView] = useState<NavKey>('dashboard')
 
-  // Gate the entire app on the bearer-token auth state. If no valid token
-  // is stored, render the Login page and short-circuit before any other
-  // page can mount (so they never call protected endpoints).
   const isAuthed = useAppStore(selectIsAuthed)
   if (!isAuthed) {
     return <Login />
@@ -370,3 +335,13 @@ export default function App() {
     </div>
   )
 }
+
+// ===========================================================================
+// Bootstrap (was main.tsx) — mounts the App into #root.
+// ===========================================================================
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+)

@@ -1,15 +1,13 @@
-"""HTTP layer — admin auth + every route the frontend talks to.
+"""core_system — FastAPI app, every HTTP route, auth router, middleware,
+exception handlers, startup hook.
 
-Sections:
-    1.  Auth core      — bearer-token issue / verify + FastAPI dependencies
-    2.  Auth routes    — /auth/login, /auth/me, /auth/logout
-                          + disabled Google / Drive placeholders (503)
-    3.  Business routes — /health, /upload, /dashboard, /uploads,
-                          /uploads/{batch_id}/disconnect, /cache/clear,
-                          /query_stream (SSE)
+Consolidates the former app.api (routes + auth) and the former backend/main.py
+(FastAPI app construction, middleware, exception handlers, startup hook).
 
-Cross-module rule: this is the topmost layer below `main.py`. It imports
-from `agents`, `tools`, `database`. Nothing imports back into `api.py`.
+Run from the project root:
+    python backend/main.py
+or:
+    uvicorn backend.app.core_system:app --port 8000 --reload
 """
 from __future__ import annotations
 
@@ -30,8 +28,8 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Reque
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.agents import DashboardAgent, DataCleanAgent, run_query_turn
-from app.database import (
+from app.analytics_engine import DashboardAgent, DataCleanAgent, run_query_turn
+from app.infrastructure import (
     ALLOWED_TABLES,
     SAFE_MESSAGE,
     UploadError,
@@ -44,7 +42,7 @@ from app.database import (
     record_upload_meta,
     settings,
 )
-from app.tools import (
+from app.analytics_engine import (
     EventEmitter,
     GroqClient,
     TurnState,
@@ -715,3 +713,118 @@ async def query_stream(req: QueryRequest, request: Request):
     runner_task = _safe_create_task(_runner(initial, emitter, api_key))
     heartbeat_task = _safe_create_task(_heartbeat(emitter))
     return _stream_response(emitter, runner_task, heartbeat_task)
+
+
+# ===========================================================================
+# FASTAPI APP — middleware, exception handlers, startup (was backend/main.py)
+# ===========================================================================
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.middleware.sessions import SessionMiddleware
+
+from app.analytics_engine import get_registry  # registry bootstrap on import
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    """One-shot logging configuration."""
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    # Quiet noisy upstreams.
+    for noisy in ("httpx", "httpcore", "uvicorn.access"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+configure_logging()
+_app_log = logging.getLogger("agentic_ai")
+
+app = FastAPI(
+    title="Agentic AI",
+    description="LLM-coordinated analytics over user-uploaded financial data.",
+    version="3.0.0",
+)
+
+# Middleware order matters: Starlette applies the LAST `add_middleware`
+# OUTERMOST. CORS must be the outermost middleware so it can short-circuit
+# OPTIONS preflights before the session middleware runs.
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.session_secret,
+    session_cookie="agentic_session",
+    same_site="lax",
+    max_age=60 * 60 * 24 * 7,
+    https_only=False,
+)
+# Use a regex for allow-origin so the response echoes the request origin.
+# The literal `*` is incompatible with `Access-Control-Allow-Credentials: true`
+# and causes every credentialed fetch from the browser to fail with the
+# opaque "Failed to fetch" error. `allow_origin_regex=".*"` matches every
+# origin and lets us safely keep allow_credentials=True.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=".*",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
+app.include_router(api_router)
+app.include_router(auth_router)
+
+
+def _sanitize_validation_errors(errors: list) -> list:
+    safe: list = []
+    for err in errors:
+        e = dict(err) if isinstance(err, dict) else {"msg": str(err)}
+        inp = e.get("input")
+        if isinstance(inp, (bytes, bytearray)):
+            try:
+                e["input"] = inp.decode("utf-8", errors="replace")
+            except Exception:
+                e["input"] = repr(inp)
+        elif inp is not None and not isinstance(inp, (str, int, float, bool, list, dict, type(None))):
+            e["input"] = repr(inp)
+        safe.append(e)
+    return safe
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(_: Request, exc: RequestValidationError):
+    try:
+        detail = _sanitize_validation_errors(exc.errors())
+    except Exception:
+        detail = [{"msg": "Validation failed"}]
+    return JSONResponse(
+        status_code=400,
+        content=envelope("Invalid request body", detail=str(detail), kind="validation",
+                         extra={"validation_errors": detail}),
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    _app_log.exception("Unhandled exception in %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content=envelope(str(exc) or type(exc).__name__,
+                         detail=type(exc).__name__, kind="internal"),
+    )
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    from app.infrastructure import init_database
+    await init_database()
+    # Force the tool registry to bootstrap at boot. Any missing/extra tool
+    # will raise here and fail fast.
+    registry = get_registry()
+    _app_log.info("registry: %d tools registered: %s", len(registry.names), registry.names)
+    _app_log.info("financial DB ready at %s", settings.financial_db_path)
+
+
+# Direct execution is unsupported — use `python backend/main.py` (the entry shim).

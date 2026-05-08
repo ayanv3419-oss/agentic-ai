@@ -1,4 +1,15 @@
 /**
+ * ui_system — every routable page + chart axis helpers + PageHeader.
+ *
+ * Consolidates the former pages.tsx (Dashboard, ShopInfo, UploadData,
+ * AiAssistant + their helpers and inner chart components), charts.ts
+ * (granularity / tick / tooltip helpers), and PageHeader (formerly
+ * exported from App.tsx).
+ *
+ * Pages own their charts; the App shell (Sidebar / TopBar / Login)
+ * lives in app.tsx.
+ */
+/**
  * Page modules — every routable view in the app.
  *
  * Each page is exported as a named React component:
@@ -12,8 +23,9 @@
  * that's shared across pages — chart axis helpers, the API client, the global
  * store — lives in `charts.ts` / `api.ts`.
  */
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
+
   AlertTriangle,
   Building2,
   CheckCircle2,
@@ -56,7 +68,6 @@ import {
   YAxis,
 } from 'recharts'
 
-import { PageHeader } from '@/App'
 import {
   ApiError,
   cn,
@@ -70,14 +81,7 @@ import {
   syncDrive,
   uploadSales,
   useAppStore,
-} from '@/api'
-import {
-  formatBucketTick,
-  formatBucketTooltip,
-  getXAxisTickConfig,
-  inferGranularity,
-  type Granularity,
-} from '@/charts'
+} from '@/client_core'
 import type {
   AuthMe,
   ChartKind,
@@ -91,7 +95,174 @@ import type {
   ToolEvent,
   UploadEntry,
   UploadStatus,
-} from '@/api'
+} from '@/client_core'
+
+
+// ===========================================================================
+// Chart axis helpers (was @/charts)
+// ===========================================================================
+
+export type Granularity = 'daily' | 'weekly' | 'monthly' | 'yearly'
+
+const MONTHS_SHORT = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+]
+
+function parseBucket(bucket: unknown): Date | null {
+  if (typeof bucket !== 'string' || !bucket) return null
+  const m = /^(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?/.exec(bucket)
+  if (!m) return null
+  const y = Number(m[1])
+  const mo = m[2] ? Number(m[2]) - 1 : 0
+  const d = m[3] ? Number(m[3]) : 1
+  const dt = new Date(y, mo, d)
+  return Number.isFinite(dt.getTime()) ? dt : null
+}
+
+interface SeriesPoint {
+  bucket: string
+}
+
+/**
+ * Best-effort granularity detection. Falls back to 'daily' for ambiguous /
+ * empty inputs since that is the densest layout (most label spacing applied).
+ */
+export function inferGranularity(
+  series: ReadonlyArray<SeriesPoint> | null | undefined,
+): Granularity {
+  if (!series || series.length === 0) return 'daily'
+  const first = series[0]?.bucket
+  if (typeof first !== 'string') return 'daily'
+
+  if (/^\d{4}$/.test(first)) return 'yearly'
+  if (/^\d{4}-\d{2}$/.test(first)) return 'monthly'
+
+  if (series.length < 2) return 'daily'
+
+  let total = 0
+  let samples = 0
+  for (let i = 1; i < series.length; i++) {
+    const a = parseBucket(series[i - 1].bucket)
+    const b = parseBucket(series[i].bucket)
+    if (!a || !b) continue
+    total += Math.abs(b.getTime() - a.getTime()) / 86_400_000
+    samples++
+  }
+  const avg = samples > 0 ? total / samples : 1
+  if (avg >= 200) return 'yearly'
+  if (avg >= 25) return 'monthly'
+  if (avg >= 5) return 'weekly'
+  return 'daily'
+}
+
+/** Compact tick label for the X axis — never longer than ~7 chars. */
+export function formatBucketTick(bucket: string, granularity: Granularity): string {
+  const d = parseBucket(bucket)
+  if (!d) return String(bucket ?? '')
+  switch (granularity) {
+    case 'yearly':
+      return String(d.getFullYear())
+    case 'monthly':
+      return `${MONTHS_SHORT[d.getMonth()]} ${String(d.getFullYear()).slice(-2)}`
+    case 'weekly':
+      return `${MONTHS_SHORT[d.getMonth()]} ${d.getDate()}`
+    case 'daily':
+    default:
+      return String(d.getDate())
+  }
+}
+
+/** Verbose label used inside tooltips (full date so users can read it). */
+export function formatBucketTooltip(bucket: string, granularity: Granularity): string {
+  const d = parseBucket(bucket)
+  if (!d) return String(bucket ?? '')
+  switch (granularity) {
+    case 'yearly':
+      return String(d.getFullYear())
+    case 'monthly':
+      return d.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+    case 'weekly':
+      return `Week of ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`
+    case 'daily':
+    default:
+      return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
+  }
+}
+
+export interface XAxisTickConfig {
+  /** Minimum px gap Recharts must keep between two rendered ticks. */
+  minTickGap: number
+  /** Rotation angle in degrees (0 = horizontal). */
+  angle: number
+  /** SVG text-anchor matching the rotation. */
+  textAnchor: 'middle' | 'end'
+  /** Reserved height for the X-axis band so rotated labels don't clip. */
+  height: number
+  /** Recharts interval mode — always preserves first + last ticks. */
+  interval: 'preserveStartEnd'
+}
+
+/**
+ * Density-aware tick configuration. The numbers below are tuned for the
+ * dashboard's ~700–900px chart widths and the chat's ~520px chat-bubble width;
+ * they degrade gracefully on narrower viewports because Recharts will skip
+ * ticks until `minTickGap` is satisfied.
+ */
+export function getXAxisTickConfig(
+  seriesLength: number,
+  granularity: Granularity,
+): XAxisTickConfig {
+  const labelChars =
+    granularity === 'monthly' ? 6 :
+    granularity === 'weekly'  ? 5 :
+    granularity === 'yearly'  ? 4 : 2
+
+  let minTickGap: number
+  switch (granularity) {
+    case 'yearly':  minTickGap = 36; break
+    case 'monthly': minTickGap = 32; break
+    case 'weekly':  minTickGap = 28; break
+    case 'daily':
+    default:        minTickGap = seriesLength > 31 ? 32 : (seriesLength > 14 ? 20 : 12)
+  }
+
+  const longLabels = labelChars >= 5
+  const dense = seriesLength > 12
+  const angle = longLabels && dense ? -32 : 0
+  const textAnchor: 'middle' | 'end' = angle === 0 ? 'middle' : 'end'
+  const height = angle === 0 ? 32 : 56
+
+  return { minTickGap, angle, textAnchor, height, interval: 'preserveStartEnd' }
+}
+
+// ===========================================================================
+// PageHeader — shared between every page (was exported from App.tsx)
+// ===========================================================================
+
+interface PageHeaderProps {
+  icon: ReactNode
+  title: string
+  subtitle: string
+  trailing?: ReactNode
+}
+
+export function PageHeader({ icon, title, subtitle, trailing }: PageHeaderProps) {
+  return (
+    <div className="flex items-start justify-between gap-4 flex-wrap">
+      <div className="flex items-start gap-3">
+        <div className="w-10 h-10 rounded-lg bg-zinc-900 border border-zinc-800 flex items-center justify-center shrink-0">
+          {icon}
+        </div>
+        <div>
+          <h1 className="text-xl md:text-2xl font-semibold tracking-tight">{title}</h1>
+          <p className="text-sm text-zinc-500 mt-1 max-w-xl">{subtitle}</p>
+        </div>
+      </div>
+      {trailing}
+    </div>
+  )
+}
 
 // ===========================================================================
 // Shared chart palette + currency formatting helpers

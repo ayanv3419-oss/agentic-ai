@@ -39,8 +39,8 @@ os.environ["FINANCIAL_DB_PATH"] = str(_TMP_DB)
 
 import aiosqlite  # noqa: E402
 
-from app.agents import DashboardAgent  # noqa: E402
-from app.database import (  # noqa: E402
+from app.analytics_engine import DashboardAgent  # noqa: E402
+from app.infrastructure import (  # noqa: E402
     SCHEMA_COLUMNS,
     init_database,
     quoted,

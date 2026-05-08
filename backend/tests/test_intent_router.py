@@ -31,7 +31,7 @@ os.environ.setdefault("ADMIN_USERNAME", "test")
 os.environ.setdefault("ADMIN_PASSWORD", "test")
 os.environ.setdefault("AUTH_TOKEN_SECRET", "test-secret-1234567890123456")
 
-from app.agents import (  # noqa: E402
+from app.analytics_engine import (  # noqa: E402
     classify_query_kind,
     _reset_last_kind,
 )
