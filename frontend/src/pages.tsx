@@ -46,6 +46,10 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  Cell,
+  Legend,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -414,7 +418,100 @@ export function Dashboard() {
           </ResponsiveContainer>
         </div>
       </section>
+
+      <MonthlySalesPie data={data?.monthly_sales_pie ?? []} />
     </div>
+  )
+}
+
+// ===========================================================================
+// Monthly Sales Distribution — pie chart
+// ===========================================================================
+
+const PIE_PALETTE = [
+  '#10b981', '#34d399', '#6ee7b7', '#22d3ee', '#0ea5e9',
+  '#6366f1', '#8b5cf6', '#a855f7', '#ec4899', '#f43f5e',
+  '#f97316', '#f59e0b', '#eab308', '#84cc16', '#14b8a6',
+]
+
+interface MonthlySalesPieProps {
+  data: Array<{ month: string; sales: number }>
+}
+
+function MonthlySalesPie({ data }: MonthlySalesPieProps) {
+  const total = data.reduce((acc, d) => acc + (d.sales || 0), 0)
+
+  return (
+    <section className="mt-5 card p-7">
+      <SectionHeader
+        title="Monthly Sales Distribution"
+        hint="Share of total sales by month — across the full uploaded history."
+      />
+      {data.length === 0 ? (
+        <div className="mt-6 text-sm text-zinc-500">
+          No monthly sales data available.
+        </div>
+      ) : (
+        <div className="mt-4 grid lg:grid-cols-[1fr_auto] gap-6 items-center">
+          <div style={{ height: 320 }}>
+            <ResponsiveContainer>
+              <PieChart>
+                <Pie
+                  data={data}
+                  dataKey="sales"
+                  nameKey="month"
+                  cx="50%"
+                  cy="50%"
+                  innerRadius={60}
+                  outerRadius={120}
+                  paddingAngle={data.length > 1 ? 2 : 0}
+                  stroke="#0a0a0a"
+                  strokeWidth={2}
+                >
+                  {data.map((entry, idx) => (
+                    <Cell
+                      key={entry.month}
+                      fill={PIE_PALETTE[idx % PIE_PALETTE.length]}
+                    />
+                  ))}
+                </Pie>
+                <Tooltip
+                  contentStyle={{
+                    background: '#0a0a0a',
+                    border: '1px solid #27272a',
+                    borderRadius: 10,
+                    fontSize: 13,
+                    padding: '10px 12px',
+                  }}
+                  formatter={(v: number, _name, ctx) => {
+                    const pct = total > 0 ? ((v / total) * 100).toFixed(1) : '0.0'
+                    const month =
+                      (ctx?.payload as { month?: string } | undefined)?.month ?? ''
+                    return [`${formatCurrency(v)} (${pct}%)`, month]
+                  }}
+                />
+                <Legend
+                  verticalAlign="middle"
+                  align="right"
+                  layout="vertical"
+                  iconType="circle"
+                  wrapperStyle={{ fontSize: 12, color: '#a1a1aa', paddingLeft: 16 }}
+                  formatter={(value: string) => (
+                    <span style={{ color: '#d4d4d8' }}>{value}</span>
+                  )}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="hidden lg:block text-xs text-zinc-500 max-w-[180px]">
+            <div className="text-zinc-400 font-medium mb-1">
+              {data.length} {data.length === 1 ? 'month' : 'months'}
+            </div>
+            <div>Total sales {formatCurrency(total)}</div>
+          </div>
+        </div>
+      )}
+    </section>
   )
 }
 

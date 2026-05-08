@@ -161,9 +161,20 @@ _KNOWLEDGE_VERB_RE = re.compile(
     r"(?:improve|increase|grow|boost|scale|reduce|lower|"
     r"optimi[sz]e|measure|track|compute|calculate|analyz?e|"
     r"interpret|understand|forecast|predict|build|setup|set\s+up)|"
-    r"how\s+(?:does|do)\s+\w+\s+work|"
-    r"what(?:\s+is|\s+are|\s+does|'s)\s+(?:a\s+|an\s+|the\s+)?(?!my\b|our\b)\w+|"
-    r"explain\s+|define\s+|describe\s+|tell\s+me\s+about\s+|"
+    # "how do/does <noun phrase> work" — multi-word allowed
+    r"how\s+(?:does|do)\s+\w+(?:\s+\w+){0,3}\s+work|"
+    # "what is/are/does X" — exclude data-lookup ("my/our") and the chat
+    # pattern "what is your name" (the chat-pattern check below handles it,
+    # but adding `your` here makes the gate explicit).
+    r"what(?:\s+is|\s+are|\s+does|'s)\s+(?:a\s+|an\s+|the\s+)?(?!my\b|our\b|your\b)\w+|"
+    # "explain X", "define X", "describe X", "tell me about X" — all reject
+    # data-lookup phrasings ("my", "our", "last X", "this X", "the X").
+    # That single change fixes the previous bug where "tell me about my sales"
+    # got routed to general_knowledge instead of data_query.
+    r"explain\s+(?!my\b|our\b|last\b|this\b|the\b)|"
+    r"define\s+(?!my\b|our\b|last\b|this\b|the\b)|"
+    r"describe\s+(?!my\b|our\b|last\b|this\b|the\b)|"
+    r"tell\s+me\s+about\s+(?!my\b|our\b|last\b|this\b|the\b|past\b|previous\b|today\b|yesterday\b)|"
     r"tips\s+(?:for|on)\s+|advice\s+(?:for|on)\s+|best\s+practice|"
     r"why\s+is\s+\w+\s+important|"
     r"meaning\s+of\s+|definition\s+of\s+"
@@ -188,46 +199,343 @@ def _check_missing_dimension(question_lower: str) -> dict[str, Any] | None:
     return None
 
 
-def classify_query_kind(question: str) -> tuple[QueryKind, float, dict[str, Any]]:
-    """4-way guard classifier. Decides what kind of question this is BEFORE
-    we run anything analytic. Returns (kind, confidence, hints).
+async def _has_any_uploaded_data() -> bool:
+    """Quick probe: does the user have any sales/purchase rows on file?
+
+    Used by the intent classifier to bias ambiguous business-flavored
+    questions toward agentic mode when data exists. Fails open: any DB
+    error is treated as "data exists" so we never silently downgrade a
+    real analytics question to chat just because the probe failed.
+    """
+    try:
+        row = await fetch_one(
+            f'SELECT '
+            f'(SELECT COUNT(*) FROM {quoted("sales")}) '
+            f'+ (SELECT COUNT(*) FROM {quoted("purchase")}) AS n'
+        )
+    except Exception:
+        return True
+    return bool(row and int(row.get("n") or 0) > 0)
+
+
+# --- Scoring vocab (analytics intent) -------------------------------------
+# Each category contributes additively to `analytics_score`. Domain words
+# alone are usually enough; time + metric + question patterns layer on top.
+DOMAIN_WORDS = frozenset({
+    "sale", "sales", "selling", "sold", "sell",
+    "purchase", "purchases", "purchased", "buying", "bought",
+    "revenue", "income", "earning", "earnings", "turnover", "gmv",
+    "transaction", "transactions",
+    "order", "orders",
+    "customer", "customers", "buyer", "buyers", "client", "clients",
+    "vendor", "vendors", "supplier", "suppliers", "party", "parties",
+    "invoice", "invoices", "bill", "bills",
+    "product", "products", "item", "items", "sku",
+    "report", "reports", "dashboard",
+    "kpi", "kpis", "analytics", "analysis",
+})
+
+METRIC_WORDS = frozenset({
+    "total", "sum", "count", "average", "avg", "mean", "aov",
+    "metric", "metrics", "performance", "summary", "stats", "statistics",
+    "amount", "amt", "value",
+})
+
+TREND_WORDS = frozenset({
+    "trend", "trends", "growth", "decline", "drop", "rise", "rose", "fell",
+    "increase", "increased", "decrease", "decreased", "movement",
+    "compare", "compared", "comparison", "versus",
+    "best", "worst", "top", "bottom", "highest", "lowest",
+    "rca", "forecast", "predict", "prediction", "projection",
+})
+
+TIME_WORDS = frozenset({
+    "today", "yesterday", "tomorrow",
+    "week", "weeks", "weekly",
+    "day", "days", "daily",
+    "month", "months", "monthly",
+    "year", "years", "yearly", "annual", "annually",
+    "quarter", "quarters", "quarterly",
+    "hour", "hours", "hourly",
+    "ytd",
+})
+
+TIME_PHRASES: tuple[str, ...] = (
+    "last week", "last month", "last year", "last quarter",
+    "this week", "this month", "this year", "this quarter",
+    "year to date", "month to date", "week to date",
+    "past week", "past month", "past year",
+    "previous week", "previous month",
+)
+
+QUESTION_PATTERNS: tuple[re.Pattern, ...] = (
+    re.compile(r"\bhow\s+(?:much|many)\b", re.I),
+    re.compile(r"\b(?:show|tell|give|fetch|list|find|get)\s+(?:me|us|the|my|our)\b", re.I),
+    re.compile(r"\bdid\s+(?:i|we)\b", re.I),
+    re.compile(r"\bcan\s+you\s+(?:show|tell|give|fetch|find|list|get)\b", re.I),
+)
+
+NUMBER_TIME_RE = re.compile(
+    r"\b\d+\s*(?:day|days|week|weeks|month|months|year|years|quarter|quarters)\b", re.I
+)
+
+CURRENCY_RE = re.compile(r"\b(?:rs|inr|₹|\$|usd|rupees?)\b", re.I)
+
+POSSESSIVE_TOKENS = frozenset({"my", "our", "mine", "ours"})
+
+ANALYTICS_THRESHOLD = 0.6   # firm cutoff for "definitely a data question"
+ANALYTICS_SOFT       = 0.3   # weaker cutoff used when has_data context favors agentic
+
+
+# --- Scoring helpers ------------------------------------------------------
+
+def _score_analytics(
+    lower: str, normal: str, tokens: set[str]
+) -> tuple[float, list[str]]:
+    """Score the analytics signal in a question. Returns (score, matched_patterns)."""
+    score = 0.0
+    matches: list[str] = []
+
+    domain_hits = tokens & DOMAIN_WORDS
+    if domain_hits:
+        matches.append(f"domain:{sorted(domain_hits)[0]}")
+        score += 1.0
+
+    metric_hits = tokens & METRIC_WORDS
+    if metric_hits:
+        matches.append(f"metric:{sorted(metric_hits)[0]}")
+        score += 0.5
+
+    trend_hits = tokens & TREND_WORDS
+    if trend_hits:
+        matches.append(f"trend:{sorted(trend_hits)[0]}")
+        score += 0.5
+
+    time_hits = tokens & TIME_WORDS
+    if time_hits:
+        matches.append(f"time:{sorted(time_hits)[0]}")
+        score += 0.4
+
+    for phrase in TIME_PHRASES:
+        if phrase in lower:
+            matches.append(f"time_phrase:{phrase}")
+            score += 0.3
+            break
+
+    if NUMBER_TIME_RE.search(lower):
+        matches.append("num_time_pattern")
+        score += 0.4
+
+    if CURRENCY_RE.search(lower):
+        matches.append("currency")
+        score += 0.3
+
+    for pat in QUESTION_PATTERNS:
+        if pat.search(lower):
+            matches.append("question_verb")
+            score += 0.2
+            break
+
+    return score, matches
+
+
+def _score_chat(
+    lower: str, normal: str
+) -> tuple[float, list[str]]:
+    """Score the chat / small-talk signal. Returns (score, matched_patterns)."""
+    if normal in _CHAT_EXACT:
+        return 2.0, [f"chat_exact:{normal}"]
+    matches: list[str] = []
+    score = 0.0
+    for pat in _CHAT_PATTERNS:
+        if pat.search(lower):
+            matches.append(f"chat_pat:{pat.pattern[:32]}")
+            score += 1.5
+            break
+    return score, matches
+
+
+# --- Conversational continuity (single-admin app — module-level state) ----
+
+_LAST_KIND: QueryKind | None = None
+
+
+def _get_last_kind() -> QueryKind | None:
+    return _LAST_KIND
+
+
+def _set_last_kind(kind: QueryKind) -> None:
+    global _LAST_KIND
+    _LAST_KIND = kind
+
+
+def _reset_last_kind() -> None:
+    """Test hook so regression tests can pin a known previous_kind."""
+    global _LAST_KIND
+    _LAST_KIND = None
+
+
+# --- The new classifier ---------------------------------------------------
+
+def classify_query_kind(
+    question: str,
+    *,
+    has_data: bool = True,
+    previous_kind: QueryKind | None = None,
+) -> tuple[QueryKind, float, dict[str, Any]]:
+    """4-way scoring classifier with conversational + has-data context.
+
+    Returns (kind, confidence, hints) where hints contains a structured
+    decision log:
+        {
+          "query":            "<original>",
+          "analytics_score":  0.91,
+          "chat_score":       0.0,
+          "knowledge":        bool,
+          "missing":          dict | None,
+          "matched_patterns": ["domain:sales", "time_phrase:last week", ...],
+          "selected_mode":    "data_query",
+          "reason":           "<short>",
+        }
+
+    Design rules (in order of evaluation):
+      1. Empty input          → chat
+      2. Exact small-talk     → chat
+      3. KNOWLEDGE wins ONLY when k_score≥1 AND analytics_score<ANALYTICS_THRESHOLD
+                                AND no possessive ("my"/"our") in the question.
+      4. MISSING_DATA wins when an explicit out-of-scope dimension is named
+                                AND analytics_score is not strong enough to override.
+      5. Strong analytics signal (≥ ANALYTICS_THRESHOLD) → data_query.
+      6. Has-data + ANY analytics signal (≥ ANALYTICS_SOFT) → data_query.
+      7. Conversational continuity: short follow-up after a data_query → data_query.
+      8. Strong chat patterns → chat.
+      9. Default short → chat. Default longer + has_data → data_query.
+     10. Final fallback → chat.
     """
     if not question or not question.strip():
-        return "chat", 1.0, {"matched": "empty"}
-    q = question.lower().strip()
+        return "chat", 1.0, {
+            "query": question, "analytics_score": 0.0, "chat_score": 0.0,
+            "knowledge": False, "missing": None, "matched_patterns": [],
+            "selected_mode": "chat", "reason": "empty input",
+        }
 
-    # 1. Knowledge / advice / definitions — overrides everything else,
-    #    so "what is profit margin?" gets a definition rather than a
-    #    "we don't track profit" missing-data response.
-    if _KNOWLEDGE_VERB_RE.search(q):
-        return "general_knowledge", 0.92, {"matched": "knowledge_pattern"}
+    lower = question.lower().strip()
+    normal = re.sub(r"\s+", " ", lower).strip(" .,!?;:'\"")
+    tokens = set(normal.split())
 
-    # 2. Out-of-scope dimension reference.
-    missing = _check_missing_dimension(q)
-    if missing is not None:
-        return "missing_data", 0.93, missing
+    # Score each axis.
+    a_score, a_matches = _score_analytics(lower, normal, tokens)
+    c_score, c_matches = _score_chat(lower, normal)
+    has_knowledge = bool(_KNOWLEDGE_VERB_RE.search(lower))
+    missing = _check_missing_dimension(lower)
+    has_possessive = bool(tokens & POSSESSIVE_TOKENS)
 
-    # 3. Data keywords — anything with a clear data signal becomes a
-    #    data_query. Reuses the legacy AGENTIC_KEYWORDS list.
-    for kw in _AGENTIC_KEYWORDS:
-        if kw in q:
-            return "data_query", 0.85, {"matched": kw}
+    # Conversational continuity bias — if the previous turn was a data
+    # query and the current turn already has *some* analytics signal,
+    # boost it so short follow-ups like "what about last week" stay agentic.
+    if previous_kind == "data_query" and a_score > 0:
+        a_score += 0.5
+        a_matches.append("continuity_bias")
 
-    # 4. Small talk.
-    normal = re.sub(r"\s+", " ", q).strip(" .,!?;:'\"")
+    matched_patterns = list(a_matches) + list(c_matches)
+    if has_knowledge:
+        matched_patterns.append("knowledge_verb")
+    if missing:
+        matched_patterns.append(f"missing:{missing.get('missing_label')}")
+
+    base_log: dict[str, Any] = {
+        "query":            question,
+        "analytics_score":  round(a_score, 2),
+        "chat_score":       round(c_score, 2),
+        "knowledge":        has_knowledge,
+        "missing":          missing,
+        "has_data":         has_data,
+        "previous_kind":    previous_kind,
+        "matched_patterns": matched_patterns,
+    }
+
+    def _decide(kind: QueryKind, conf: float, reason: str) -> tuple[
+        QueryKind, float, dict[str, Any]
+    ]:
+        return kind, conf, {**base_log, "selected_mode": kind, "reason": reason}
+
+    # 1. Hard small-talk override (exact-match phrase like "hi", "thanks").
     if normal in _CHAT_EXACT:
-        return "chat", 0.95, {"matched": normal}
+        return _decide("chat", 0.95, f"chat_exact:{normal!r}")
+
+    # 2. Chat regex patterns ("how are you", "what is your name") — checked
+    #    before the knowledge gate so they win over `what is X` matches.
     for pat in _CHAT_PATTERNS:
-        if pat.search(q):
-            return "chat", 0.9, {"matched": pat.pattern}
+        if pat.search(lower):
+            return _decide("chat", 0.9, f"chat_pattern:{pat.pattern[:32]}")
 
-    # 5. Short low-signal → chat. Longer ambiguous → data_query (so the
-    #    intent classifier still gets a shot at it).
-    tokens = normal.split()
+    # 3. KNOWLEDGE wins for genuine definitional / advice queries. The
+    #    regex's own lookaheads already exclude data-lookup phrasings
+    #    ("explain my X", "tell me about my/last/this X"), so any match
+    #    here is a real knowledge intent — even when domain words appear
+    #    ("explain net revenue", "tell me about customer retention").
+    if has_knowledge:
+        return _decide(
+            "general_knowledge", 0.92,
+            "knowledge phrasing (regex match after data-lookup filter)",
+        )
+
+    # 4. MISSING_DATA wins whenever an out-of-scope dimension is explicitly
+    #    named ("sales by city", "ad spend last month", "employee headcount").
+    #    The analytics pipeline can't answer these — better to surface a
+    #    clear "we don't track that" message than run SQL that has no
+    #    matching column.
+    if missing is not None:
+        hints = {**base_log, "selected_mode": "missing_data",
+                 "reason": f"missing dimension {missing.get('missing_label')!r}",
+                 **missing}
+        return "missing_data", 0.93, hints
+
+    # 4. Strong analytics signal → data_query.
+    if a_score >= ANALYTICS_THRESHOLD:
+        return _decide(
+            "data_query",
+            min(0.95, 0.55 + a_score / 6),
+            f"analytics_score {a_score:.2f} ≥ {ANALYTICS_THRESHOLD}",
+        )
+
+    # 5. Has-data context: if there's data on file AND any analytics signal,
+    #    bias strongly toward agentic. This is what catches casual phrasings
+    #    like "last week" / "last 8 days" (time-only, no domain word).
+    if has_data and a_score >= ANALYTICS_SOFT:
+        return _decide(
+            "data_query", 0.7,
+            f"has_data + analytics_score {a_score:.2f} ≥ {ANALYTICS_SOFT}",
+        )
+
+    # 6. Conversational continuity: very short follow-ups after a data turn
+    #    inherit the analytics route ("and last week", "what about may").
+    if previous_kind == "data_query" and len(tokens) <= 6 and a_score == 0 \
+            and c_score == 0 and not has_knowledge:
+        return _decide(
+            "data_query", 0.6,
+            "follow-up to previous data turn",
+        )
+
+    # 7. Strong chat patterns → chat.
+    if c_score >= 1.0:
+        return _decide("chat", 0.9, f"chat_score {c_score:.2f} ≥ 1.0")
+
+    # 8. Default routing — short tail → chat, longer with data → agentic.
     if len(tokens) <= 4 and len(normal) <= 30:
-        return "chat", 0.6, {"matched": "low_signal"}
+        if has_data and a_score >= ANALYTICS_SOFT:
+            return _decide("data_query", 0.55, "short query with weak analytics signal + data")
+        return _decide("chat", 0.5, f"short low-signal ({len(tokens)} tokens)")
 
-    return "data_query", 0.5, {"matched": "default"}
+    if has_data:
+        return _decide(
+            "data_query", 0.55,
+            "longer ambiguous query; data exists → defaulting to agentic",
+        )
+    return _decide(
+        "chat", 0.4,
+        "no signals; no uploaded data; defaulting to chat",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -294,48 +602,23 @@ def _normalize(question: str) -> tuple[str, str]:
     return lower, normalized
 
 
-def classify(question: str) -> tuple[Mode, str]:
-    """Decide CHAT vs AGENTIC. Returns (mode, human-readable reason).
+def classify(
+    question: str,
+    *,
+    has_data: bool = True,
+    previous_kind: QueryKind | None = None,
+) -> tuple[Mode, str]:
+    """Decide CHAT vs AGENTIC. Thin wrapper around `classify_query_kind`.
 
-    Decision precedence (highest first):
-      1. Empty input               → chat (safe default)
-      2. Exact-match small talk    → chat
-      3. Any AGENTIC keyword       → agentic (data words always win)
-      4. Fine-grained intent match → agentic (covers "most sold products",
-                                     "best selling shoes", "leaderboard",
-                                     etc., which legacy keywords miss)
-      5. Chat regex pattern        → chat
-      6. Short low-signal input    → chat
-      7. Fallback                  → agentic
+    Returns (mode, human-readable reason). The 4-way kind from the new
+    classifier collapses as: data_query → agentic; everything else → chat.
+    External callers (regression tests, docs) keep working unchanged.
     """
-    if not question or not question.strip():
-        return "chat", "empty input — handled as chat (safe default)"
-
-    lower, normal = _normalize(question)
-
-    if normal in _CHAT_EXACT:
-        return "chat", f"exact-match small talk: {normal!r}"
-
-    for kw in _AGENTIC_KEYWORDS:
-        if kw in lower:
-            return "agentic", f"agentic keyword present: {kw!r}"
-
-    # Consult the fine-grained intent classifier — anything it matches with
-    # ≥ 0.7 confidence is unambiguously a data question, even when the
-    # phrasing is short ("most sold products", "leaderboard").
-    intent_type, intent_conf, _hints = classify_intent(question)
-    if intent_conf >= 0.7:
-        return "agentic", f"intent classifier matched {intent_type!r} (conf={intent_conf:.2f})"
-
-    for pat in _CHAT_PATTERNS:
-        if pat.search(lower):
-            return "chat", f"matches chat pattern: {pat.pattern!r}"
-
-    tokens = normal.split()
-    if len(tokens) <= 4 and len(normal) <= 30:
-        return "chat", f"short low-signal question ({len(tokens)} tokens)"
-
-    return "agentic", "no chat indicators detected; defaulting to agentic"
+    kind, conf, hints = classify_query_kind(
+        question, has_data=has_data, previous_kind=previous_kind,
+    )
+    mode: Mode = "agentic" if kind == "data_query" else "chat"
+    return mode, f"kind={kind} conf={conf:.2f} reason={hints.get('reason')}"
 
 
 # ---------------------------------------------------------------------------
@@ -794,15 +1077,29 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
         )
 
     # ---- 2. Top-level query-kind guard (deterministic, zero LLM cost) ----
-    # Splits the request 4 ways:
+    # Splits the request 4 ways with conversational + has-data context:
     #   data_query        → continue to intent classifier + sub-agent
     #   missing_data      → graceful "we don't track that" template (no SQL)
     #   general_knowledge → LLM with knowledge prompt (no SQL)
     #   chat              → LLM with greeter prompt (no SQL)
-    kind, kind_conf, kind_hints = classify_query_kind(state.question)
+    has_data = await _has_any_uploaded_data()
+    previous_kind = _get_last_kind()
+    kind, kind_conf, kind_hints = classify_query_kind(
+        state.question,
+        has_data=has_data,
+        previous_kind=previous_kind,
+    )
+    _set_last_kind(kind)
     _loop_log.info(
-        "query.kind: %s (conf=%.2f) hints=%s question=%r",
-        kind, kind_conf, kind_hints, state.question,
+        "query.kind: kind=%s conf=%.2f a_score=%.2f c_score=%.2f "
+        "has_data=%s prev=%s patterns=%s reason=%s question=%r",
+        kind, kind_conf,
+        kind_hints.get("analytics_score", 0.0),
+        kind_hints.get("chat_score", 0.0),
+        has_data, previous_kind,
+        kind_hints.get("matched_patterns"),
+        kind_hints.get("reason"),
+        state.question,
     )
     await emit.emit("query.kind", {
         "kind":       kind,
@@ -1314,6 +1611,14 @@ class DashboardAgent:
             for d, b in sorted(buckets.items(), key=lambda x: x[0])
         ][:366]
 
+        # Step 6 — Monthly Sales Distribution for the pie chart.
+        # Always all-time, regardless of `month` filter — the pie's purpose is
+        # cross-month comparison. SQL does the aggregation; Python only formats
+        # labels and serializes. NULL/non-ISO dates and NULL amounts are
+        # filtered at the SQL layer so a malformed row can never poison a
+        # bucket.
+        monthly_sales_pie = await self._aggregate_monthly_sales_pie(registry, dummy_state)
+
         return {
             "month": month,
             "kpis": {
@@ -1322,7 +1627,64 @@ class DashboardAgent:
                 "customers":   len(customers),
             },
             "series": series,
+            "monthly_sales_pie": monthly_sales_pie,
         }
+
+    @staticmethod
+    async def _aggregate_monthly_sales_pie(
+        registry: Any, dummy_state: TurnState,
+    ) -> list[dict[str, Any]]:
+        """SQL GROUP BY year-month → SUM(Total Amount). Returns chronologically
+        sorted [{"month": "Jan 2025", "sales": 120000.0}, ...]. Empty list when
+        there are no aggregable rows."""
+        pie_sql = (
+            f'SELECT '
+            f'  substr("Date", 1, 7) AS ym, '
+            f'  SUM("Total Amount") AS sales '
+            f'FROM {quoted("sales")} '
+            f'WHERE "Date" IS NOT NULL '
+            f'  AND "Date" GLOB \'????-??-??\' '
+            f'  AND "Total Amount" IS NOT NULL '
+            f'GROUP BY ym '
+            f'ORDER BY ym ASC'
+        )
+        _dashboard_log.info("DashboardAgent monthly_sales_pie aggregation start")
+        pie_result = await registry.execute(
+            "Database",
+            {"op": "select", "pin": READ_PIN, "sql": pie_sql, "params": []},
+            dummy_state,
+        )
+        if not pie_result.ok:
+            _dashboard_log.warning(
+                "DashboardAgent monthly_sales_pie query failed: %s", pie_result.error,
+            )
+            return []
+        pie_rows = list((pie_result.output or {}).get("rows") or [])
+
+        out: list[dict[str, Any]] = []
+        for r in pie_rows:
+            ym = r.get("ym")
+            if not isinstance(ym, str) or len(ym) != 7 or ym[4] != "-":
+                continue
+            try:
+                label = datetime.strptime(ym, "%Y-%m").strftime("%b %Y")
+            except ValueError:
+                continue
+            sales = float(r.get("sales") or 0)
+            if sales <= 0:
+                continue
+            out.append({"month": label, "sales": round(sales, 2)})
+
+        if not out:
+            _dashboard_log.info(
+                "DashboardAgent monthly_sales_pie empty — no aggregable rows"
+            )
+        else:
+            _dashboard_log.info(
+                "DashboardAgent monthly_sales_pie ok rows=%d span=%s..%s",
+                len(out), out[0]["month"], out[-1]["month"],
+            )
+        return out
 
 
 # ---------------------------------------------------------------------------

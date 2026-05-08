@@ -72,10 +72,16 @@ export interface Series {
   orders: number
 }
 
+export interface MonthlySalesSlice {
+  month: string
+  sales: number
+}
+
 export interface DashboardData {
   month: string | null
   kpis: KpiSet
   series: Series[]
+  monthly_sales_pie?: MonthlySalesSlice[]
 }
 
 export interface UploadSummary {
