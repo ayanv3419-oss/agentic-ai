@@ -135,6 +135,19 @@ export interface DisconnectResponse {
   status: 'removed'
 }
 
+export interface UserPrincipal {
+  id: string
+  email: string
+  tenant_id: string
+  workspace_id: string
+  role: 'owner' | 'admin' | 'viewer'
+}
+
+export interface WorkspaceSummary {
+  id: string
+  name: string
+}
+
 export interface AuthMe {
   authenticated: boolean
   username?: string
@@ -142,6 +155,13 @@ export interface AuthMe {
   name?: string
   picture?: string
   google_configured?: boolean
+  // New JWT-aware fields. Optional for back-compat with the legacy
+  // single-admin /auth/me response.
+  user_id?: string
+  tenant_id?: string
+  workspace_id?: string
+  role?: 'owner' | 'admin' | 'viewer'
+  workspace?: WorkspaceSummary | null
 }
 
 export interface LoginRequest {
@@ -153,12 +173,34 @@ export interface LoginResponse {
   token: string
   username: string
   expires_at: string
+  // Present on JWT logins (real users); absent for legacy admin path.
+  user?: UserPrincipal
+}
+
+export interface RegisterRequest {
+  email: string
+  password: string
+  workspace_name?: string
+}
+
+export interface RegisterResponse {
+  token: string
+  expires_at: number    // unix ts (the register endpoint returns int, not ISO)
+  user: UserPrincipal
+  workspace: WorkspaceSummary
 }
 
 export interface AuthState {
   token: string | null
   username: string | null
   expiresAt: string | null
+  // Optional — populated for JWT logins (real users), null for legacy
+  // single-admin sessions. Allows role-aware UI + workspace display.
+  userId: string | null
+  tenantId: string | null
+  workspaceId: string | null
+  workspaceName: string | null
+  role: 'owner' | 'admin' | 'viewer' | null
 }
 
 export interface DriveImportDetail {
@@ -378,7 +420,7 @@ export async function streamQuery(
   onEvent: (e: SseEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const { shop, auth } = useAppStore.getState()
+  const { shop, auth, conversationId } = useAppStore.getState()
   const res = await safeFetch(`${BASE_URL}/query_stream`, {
     method: 'POST',
     headers: {
@@ -387,7 +429,7 @@ export async function streamQuery(
       ...(shop.groqApiKey ? { 'X-Groq-Api-Key': shop.groqApiKey } : {}),
       ...(auth.token ? { Authorization: `Bearer ${auth.token}` } : {}),
     },
-    body: JSON.stringify({ question }),
+    body: JSON.stringify({ question, conversation_id: conversationId }),
     signal,
   })
   if (!res.ok || !res.body) {
@@ -451,7 +493,9 @@ export async function fetchDashboard(month?: string): Promise<DashboardData> {
   return apiGet<DashboardData>(`/dashboard${q}`)
 }
 
-/** Admin login. Throws ApiError on bad credentials / network failure. */
+/** Login. Accepts either email (real users — JWT path) or username
+ *  (legacy single-admin path). The backend routes by '@' presence.
+ *  Throws ApiError on bad credentials / network failure. */
 export async function login(username: string, password: string): Promise<LoginResponse> {
   const res = await safeFetch(`${BASE_URL}/auth/login`, {
     method: 'POST',
@@ -459,6 +503,17 @@ export async function login(username: string, password: string): Promise<LoginRe
     body: JSON.stringify({ username, password }),
   })
   return handle<LoginResponse>(res, 'POST /auth/login')
+}
+
+/** Self-service registration — creates (tenant, workspace, user) trio
+ *  and returns a JWT immediately so the user lands signed-in. */
+export async function register(req: RegisterRequest): Promise<RegisterResponse> {
+  const res = await safeFetch(`${BASE_URL}/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  return handle<RegisterResponse>(res, 'POST /auth/register')
 }
 
 export async function logoutBackend(): Promise<{ ok: boolean }> {
@@ -487,13 +542,72 @@ export async function syncDrive(): Promise<DriveSyncResult> {
 export async function streamAIQuery(
   message: string,
   onEvent: (e: SseEvent) => void,
-  opts?: { apiKey?: string; signal?: AbortSignal },
+  opts?: { apiKey?: string; signal?: AbortSignal; maxRetries?: number },
 ): Promise<void> {
   const apiKey = opts?.apiKey ?? useAppStore.getState().shop.groqApiKey
   if (!apiKey) {
     throw new ApiError('Groq API key not configured. Set it in Shop Info.', 401)
   }
-  return streamQuery(message, onEvent, opts?.signal)
+  return streamQueryWithRetry(message, onEvent, {
+    signal:     opts?.signal,
+    maxRetries: opts?.maxRetries ?? 2,
+  })
+}
+
+/**
+ * Reconnect-aware wrapper around `streamQuery`. Retries on transient
+ * network failures (TypeError from fetch, dropped connection mid-stream)
+ * with exponential backoff: 0.5s, 1s, 2s. Does NOT retry:
+ *
+ *   - 4xx HTTP responses (auth, validation, rate-limit)   — caller's job
+ *   - explicit AbortError                                 — user cancelled
+ *   - ApiError with status set                            — server said no
+ *
+ * Each retry starts a NEW stream from the server (the existing turn is
+ * lost) — that's an acceptable degradation given the alternative is a
+ * blank chat bubble. When the SSE backend learns to resume from a
+ * `turn_id`, this wrapper will get a "resume from event N" path.
+ */
+async function streamQueryWithRetry(
+  message: string,
+  onEvent: (e: SseEvent) => void,
+  opts: { signal?: AbortSignal; maxRetries: number },
+): Promise<void> {
+  let attempt = 0
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      await streamQuery(message, onEvent, opts.signal)
+      return
+    } catch (err) {
+      // Honour explicit aborts immediately.
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err
+      }
+      // Server-side rejections (4xx with parsed envelope) are not
+      // retryable — propagate so the caller can render the error.
+      if (err instanceof ApiError && err.status && err.status < 500) {
+        throw err
+      }
+      attempt += 1
+      if (attempt > opts.maxRetries) {
+        throw err
+      }
+      const delay = Math.min(2000, 500 * 2 ** (attempt - 1))
+      // eslint-disable-next-line no-console
+      console.warn(`[sse] retry ${attempt}/${opts.maxRetries} in ${delay}ms`, err)
+      // Tell the consumer we're reconnecting so the chat bubble can
+      // surface a hint instead of looking frozen.
+      try {
+        onEvent({ event: 'reconnecting', data: { attempt, delay_ms: delay } })
+      } catch { /* never let UI signal block retry */ }
+      await new Promise((r) => setTimeout(r, delay))
+      if (opts.signal?.aborted) {
+        const e = new DOMException('aborted', 'AbortError')
+        throw e
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +621,10 @@ interface AppState {
 
   chatHistory: ChatMessage[]
   isStreaming: boolean
+  // Per-tab conversation identifier — sent with every /query_stream so the
+  // backend's per-(user, conversation) memory store can isolate continuity.
+  // Rotated when the user clears chat (so a fresh chat is a fresh window).
+  conversationId: string
 
   auth: AuthState
 
@@ -519,8 +637,20 @@ interface AppState {
   updateMessage: (id: string, patch: Partial<ChatMessage>) => void
   clearChat: () => void
   setStreaming: (b: boolean) => void
+  rotateConversation: () => void
 
-  setAuth: (token: string, username: string, expiresAt: string) => void
+  setAuth: (
+    token: string,
+    username: string,
+    expiresAt: string,
+    extras?: {
+      userId?: string
+      tenantId?: string
+      workspaceId?: string
+      workspaceName?: string | null
+      role?: 'owner' | 'admin' | 'viewer'
+    },
+  ) => void
   clearAuth: () => void
 }
 
@@ -534,11 +664,25 @@ const emptyAuth: AuthState = {
   token: null,
   username: null,
   expiresAt: null,
+  userId: null,
+  tenantId: null,
+  workspaceId: null,
+  workspaceName: null,
+  role: null,
 }
 
 const defaultMonth = (): string => new Date().toISOString().slice(0, 7)
 
 const MAX_PERSISTED_MESSAGES = 50
+
+// Per-tab conversation id. We use crypto.randomUUID when available, else
+// fall back to a Math.random-based hex string (older browsers / SSR).
+const newConversationId = (): string => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return 'c-' + Math.random().toString(16).slice(2) + Date.now().toString(16)
+}
 
 export const useAppStore = create<AppState>()(
   persist(
@@ -549,6 +693,7 @@ export const useAppStore = create<AppState>()(
 
       chatHistory: [],
       isStreaming: false,
+      conversationId: newConversationId(),
 
       auth: emptyAuth,
 
@@ -565,12 +710,36 @@ export const useAppStore = create<AppState>()(
             m.id === id ? { ...m, ...patch } : m,
           ),
         })),
-      clearChat: () => set({ chatHistory: [], isStreaming: false }),
+      clearChat: () =>
+        set({
+          chatHistory: [],
+          isStreaming: false,
+          // Rotate so the next turn starts a fresh continuity window.
+          conversationId: newConversationId(),
+        }),
       setStreaming: (b) => set({ isStreaming: b }),
+      rotateConversation: () => set({ conversationId: newConversationId() }),
 
-      setAuth: (token, username, expiresAt) =>
-        set({ auth: { token, username, expiresAt } }),
-      clearAuth: () => set({ auth: emptyAuth }),
+      setAuth: (token, username, expiresAt, extras) =>
+        set({
+          auth: {
+            token,
+            username,
+            expiresAt,
+            userId:        extras?.userId ?? null,
+            tenantId:      extras?.tenantId ?? null,
+            workspaceId:   extras?.workspaceId ?? null,
+            workspaceName: extras?.workspaceName ?? null,
+            role:          extras?.role ?? null,
+          },
+        }),
+      clearAuth: () =>
+        set({
+          auth: emptyAuth,
+          // Sign-out also rotates conversation so a different user landing on
+          // the same browser doesn't inherit the previous conversation key.
+          conversationId: newConversationId(),
+        }),
     }),
     {
       name: 'agentic-ai:v1',
@@ -579,6 +748,7 @@ export const useAppStore = create<AppState>()(
         filters: s.filters,
         dataset: s.dataset,
         chatHistory: s.chatHistory.slice(-MAX_PERSISTED_MESSAGES),
+        conversationId: s.conversationId,
         auth: s.auth,
       }),
     },

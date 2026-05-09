@@ -8,3 +8,19 @@ python-multipart>=0.0.9
 aiosqlite>=0.20.0
 openpyxl>=3.1.0
 itsdangerous>=2.2.0
+# --- Analytics acceleration (DuckDB) ---
+duckdb>=1.0.0
+# --- Vector / semantic retrieval (in-process; pgvector/Qdrant adapters
+# are config-only swaps that read the same VectorStore protocol). ---
+numpy>=1.26.0
+# --- Observability (no-op when SENTRY_DSN is not set) ---
+sentry-sdk[fastapi]>=1.40.0
+# --- Auth (multi-user JWT + bcrypt password hashing) ---
+bcrypt>=4.1.0
+pyjwt>=2.8.0
+# --- Production storage adapters: activate when DATABASE_URL / REDIS_URL
+# are set in the environment. Both are optional at runtime — the in-memory
+# / aiosqlite fallbacks keep working when the env vars are unset, so dev
+# + tests continue to run without provisioning real services.
+asyncpg>=0.29.0
+redis>=5.0.0

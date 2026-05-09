@@ -10,7 +10,26 @@
  */
 import React, { useState, type ComponentType } from 'react'
 import ReactDOM from 'react-dom/client'
+import * as Sentry from '@sentry/react'
 import './index.css'
+
+// ----------------------------------------------------------------------------
+// Sentry — no-op when VITE_SENTRY_DSN is unset. Initialised before React
+// renders so any uncaught render error is captured. The browserTracing
+// integration adds automatic span instrumentation for fetch + history nav.
+// ----------------------------------------------------------------------------
+const SENTRY_DSN = import.meta.env.VITE_SENTRY_DSN as string | undefined
+if (SENTRY_DSN) {
+  Sentry.init({
+    dsn: SENTRY_DSN,
+    environment: import.meta.env.VITE_SENTRY_ENVIRONMENT ?? 'development',
+    tracesSampleRate: Number(import.meta.env.VITE_SENTRY_TRACES_SAMPLE_RATE ?? 0.1),
+    integrations: [Sentry.browserTracingIntegration()],
+    // Don't send default PII (no IP, no user agent fingerprint). Toggle
+    // via VITE_SENTRY_SEND_PII=1 if your privacy posture allows.
+    sendDefaultPii: import.meta.env.VITE_SENTRY_SEND_PII === '1',
+  })
+}
 import {
   Activity,
   AlertTriangle,
@@ -29,6 +48,7 @@ import {
   cn,
   login as apiLogin,
   logoutBackend,
+  register as apiRegister,
   selectIsAuthed,
   useAppStore,
 } from '@/client_core'
@@ -157,6 +177,8 @@ function Sidebar({ active, onSelect }: SidebarProps) {
 function TopBar() {
   const shop = useAppStore((s) => s.shop)
   const dataset = useAppStore((s) => s.dataset)
+  const workspaceName = useAppStore((s) => s.auth.workspaceName)
+  const role = useAppStore((s) => s.auth.role)
 
   return (
     <header className="h-16 shrink-0 border-b border-zinc-800 px-8 flex items-center justify-between bg-zinc-950/80 backdrop-blur supports-[backdrop-filter]:bg-zinc-950/60">
@@ -165,10 +187,24 @@ function TopBar() {
           <div className="text-xs text-zinc-500 truncate">{shop.ownerName}</div>
         ) : null}
         <div className="text-sm font-medium text-zinc-100 truncate">
-          {shop.shopName || 'Agentic AI'}
+          {shop.shopName || workspaceName || 'Agentic AI'}
         </div>
       </div>
       <div className="flex items-center gap-4 text-xs text-zinc-500">
+        {workspaceName && (
+          <div className="hidden md:flex items-center gap-2">
+            <span className="text-zinc-600">Workspace</span>
+            <span className="text-zinc-300 font-medium truncate max-w-[180px]">{workspaceName}</span>
+            {role && (
+              <>
+                <span className="text-zinc-600">·</span>
+                <span className="px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300 text-[10px] uppercase tracking-wide">
+                  {role}
+                </span>
+              </>
+            )}
+          </div>
+        )}
         {dataset && (
           <div className="hidden md:flex items-center gap-2">
             <span className="text-zinc-600">Active dataset</span>
@@ -187,34 +223,70 @@ function TopBar() {
 }
 
 // ===========================================================================
-// Login screen
+// Login / Register screen
 // ===========================================================================
+
+type AuthMode = 'login' | 'register'
 
 function Login() {
   const setAuth = useAppStore((s) => s.setAuth)
 
+  const [mode, setMode] = useState<AuthMode>('login')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [workspaceName, setWorkspaceName] = useState('My Workspace')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  const isRegister = mode === 'register'
+  const submitDisabled = busy || !username || !password ||
+    (isRegister && (password.length < 8 || !username.includes('@')))
+
+  const surfaceError = (e: unknown) => {
+    if (e instanceof ApiError) {
+      const detail = (e.detail as { detail?: { detail?: string; error?: string } } | undefined)?.detail
+      setError(detail?.detail ?? detail?.error ?? e.message)
+    } else if (e instanceof Error) {
+      setError(e.message)
+    } else {
+      setError(isRegister ? 'Registration failed.' : 'Login failed.')
+    }
+  }
+
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (busy) return
+    if (submitDisabled) return
     setBusy(true)
     setError(null)
     try {
-      const res = await apiLogin(username.trim(), password)
-      setAuth(res.token, res.username, res.expires_at)
-    } catch (e) {
-      if (e instanceof ApiError) {
-        const detail = (e.detail as { detail?: { detail?: string; error?: string } } | undefined)?.detail
-        setError(detail?.detail ?? detail?.error ?? e.message)
-      } else if (e instanceof Error) {
-        setError(e.message)
+      if (isRegister) {
+        const res = await apiRegister({
+          email:          username.trim().toLowerCase(),
+          password,
+          workspace_name: workspaceName.trim() || 'My Workspace',
+        })
+        // The register endpoint returns expires_at as unix-ts (int).
+        // Coerce to ISO so the existing storage shape stays consistent.
+        const iso = new Date(res.expires_at * 1000).toISOString()
+        setAuth(res.token, res.user.email, iso, {
+          userId:        res.user.id,
+          tenantId:      res.user.tenant_id,
+          workspaceId:   res.user.workspace_id,
+          workspaceName: res.workspace.name,
+          role:          res.user.role,
+        })
       } else {
-        setError('Login failed.')
+        const res = await apiLogin(username.trim(), password)
+        setAuth(res.token, res.username, res.expires_at, {
+          userId:        res.user?.id,
+          tenantId:      res.user?.tenant_id,
+          workspaceId:   res.user?.workspace_id,
+          workspaceName: null,    // /auth/me will fill this in on next mount
+          role:          res.user?.role,
+        })
       }
+    } catch (e) {
+      surfaceError(e)
     } finally {
       setBusy(false)
     }
@@ -232,22 +304,46 @@ function Login() {
           Agentic AI
         </h1>
         <p className="text-center text-sm text-zinc-500 mt-1">
-          Sign in to continue.
+          {isRegister ? 'Create your workspace.' : 'Sign in to continue.'}
         </p>
 
-        <form onSubmit={onSubmit} className="mt-8 card p-6 space-y-4">
+        {/* Mode toggle */}
+        <div className="mt-6 grid grid-cols-2 gap-1 p-1 rounded-lg border border-zinc-800 bg-zinc-900/40">
+          <button
+            type="button"
+            onClick={() => { setMode('login'); setError(null) }}
+            className={cn(
+              'rounded-md py-1.5 text-xs font-medium transition-colors',
+              !isRegister ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-200',
+            )}
+          >
+            Sign in
+          </button>
+          <button
+            type="button"
+            onClick={() => { setMode('register'); setError(null) }}
+            className={cn(
+              'rounded-md py-1.5 text-xs font-medium transition-colors',
+              isRegister ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-200',
+            )}
+          >
+            Sign up
+          </button>
+        </div>
+
+        <form onSubmit={onSubmit} className="mt-4 card p-6 space-y-4">
           <div>
             <label className="label" htmlFor="login-username">
-              Username
+              {isRegister ? 'Email' : 'Email or username'}
             </label>
             <input
               id="login-username"
               className="input"
-              type="text"
+              type={isRegister ? 'email' : 'text'}
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              placeholder="username"
-              autoComplete="username"
+              placeholder={isRegister ? 'you@example.com' : 'username or email'}
+              autoComplete={isRegister ? 'email' : 'username'}
               autoFocus
               required
             />
@@ -256,6 +352,11 @@ function Login() {
           <div>
             <label className="label" htmlFor="login-password">
               Password
+              {isRegister && (
+                <span className="text-[10px] text-zinc-500 ml-2">
+                  (min 8 chars)
+                </span>
+              )}
             </label>
             <input
               id="login-password"
@@ -264,10 +365,28 @@ function Login() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="••••••"
-              autoComplete="current-password"
+              autoComplete={isRegister ? 'new-password' : 'current-password'}
+              minLength={isRegister ? 8 : undefined}
               required
             />
           </div>
+
+          {isRegister && (
+            <div>
+              <label className="label" htmlFor="register-workspace">
+                Workspace name
+              </label>
+              <input
+                id="register-workspace"
+                className="input"
+                type="text"
+                value={workspaceName}
+                onChange={(e) => setWorkspaceName(e.target.value)}
+                placeholder="My Workspace"
+                maxLength={200}
+              />
+            </div>
+          )}
 
           {error && (
             <div className="flex items-start gap-2 text-xs text-red-300 bg-red-950/30 border border-red-900/40 rounded-md px-3 py-2">
@@ -278,29 +397,87 @@ function Login() {
 
           <button
             type="submit"
-            disabled={busy || !username || !password}
+            disabled={submitDisabled}
             className="btn btn-primary w-full"
           >
             {busy ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                Signing in…
+                {isRegister ? 'Creating workspace…' : 'Signing in…'}
               </>
             ) : (
               <>
                 <Lock className="w-4 h-4" />
-                Sign in
+                {isRegister ? 'Create account' : 'Sign in'}
               </>
             )}
           </button>
         </form>
 
         <p className="text-center text-[11px] text-zinc-600 mt-6">
-          Authorized users only. Sessions persist locally until they expire.
+          {isRegister
+            ? 'By creating an account you agree to keep your workspace data tenant-isolated.'
+            : 'Sessions persist locally until they expire.'}
         </p>
       </div>
     </div>
   )
+}
+
+// ===========================================================================
+// Error Boundary — wraps each page so a render crash doesn't kill the shell
+// ===========================================================================
+
+interface ErrorBoundaryState { error: Error | null }
+
+class ErrorBoundary extends React.Component<
+  { children: React.ReactNode; fallbackTitle?: string },
+  ErrorBoundaryState
+> {
+  state: ErrorBoundaryState = { error: null }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error }
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    // eslint-disable-next-line no-console
+    console.error('[ErrorBoundary] page crashed:', error, info)
+    // Forward to Sentry — captureException is a safe no-op when the SDK
+    // wasn't initialised (no DSN).
+    try {
+      Sentry.captureException(error, { extra: { componentStack: info.componentStack } })
+    } catch {
+      /* never let monitoring break recovery */
+    }
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="card p-6 m-6 border-red-900/40 bg-red-950/20 text-sm text-red-200">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <div className="font-semibold text-red-100 mb-1">
+                {this.props.fallbackTitle ?? 'This view crashed.'}
+              </div>
+              <div className="text-xs font-mono break-words text-red-300/90">
+                {this.state.error.message}
+              </div>
+              <button
+                onClick={() => this.setState({ error: null })}
+                className="mt-3 btn btn-secondary text-xs"
+              >
+                Reset view
+              </button>
+            </div>
+          </div>
+        </div>
+      )
+    }
+    return this.props.children as React.ReactElement
+  }
 }
 
 // ===========================================================================
@@ -312,7 +489,11 @@ export default function App() {
 
   const isAuthed = useAppStore(selectIsAuthed)
   if (!isAuthed) {
-    return <Login />
+    return (
+      <ErrorBoundary fallbackTitle="Login screen crashed.">
+        <Login />
+      </ErrorBoundary>
+    )
   }
 
   return (
@@ -320,17 +501,21 @@ export default function App() {
       <Sidebar active={view} onSelect={setView} />
       <main className="flex-1 flex flex-col min-w-0">
         <TopBar />
-        {view === 'ai' ? (
-          <AiAssistant key="ai" />
-        ) : (
-          <div className="flex-1 overflow-y-auto">
-            <div className="max-w-6xl mx-auto px-6 md:px-10 py-10">
-              {view === 'shop' && <ShopInfo key="shop" />}
-              {view === 'upload' && <UploadData key="upload" />}
-              {view === 'dashboard' && <Dashboard key="dashboard" />}
+        {/* Per-page boundary: a crash in Dashboard doesn't take down Sidebar /
+            TopBar / Login. Resetting it remounts the page subtree. */}
+        <ErrorBoundary key={view} fallbackTitle={`${view} view crashed.`}>
+          {view === 'ai' ? (
+            <AiAssistant key="ai" />
+          ) : (
+            <div className="flex-1 overflow-y-auto">
+              <div className="max-w-6xl mx-auto px-6 md:px-10 py-10">
+                {view === 'shop' && <ShopInfo key="shop" />}
+                {view === 'upload' && <UploadData key="upload" />}
+                {view === 'dashboard' && <Dashboard key="dashboard" />}
+              </div>
             </div>
-          </div>
-        )}
+          )}
+        </ErrorBoundary>
       </main>
     </div>
   )

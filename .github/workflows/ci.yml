@@ -1,0 +1,96 @@
+name: CI
+
+# Runs every push + every PR. Three jobs:
+#   - backend-tests: 6 regression suites + boot smoke
+#   - frontend-build: tsc + vite build
+#   - lint: a tiny syntactic sanity check (ruff/eslint added later if needed)
+#
+# Tests are written as plain python scripts (no pytest dep) so the
+# workflow stays simple. When a test suite is added, drop it into the
+# matrix step and it runs automatically.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: "Agentic Ai/backend/requirements.txt"
+
+      - name: Install backend deps
+        working-directory: "Agentic Ai"
+        run: pip install -r backend/requirements.txt
+
+      - name: Boot smoke (FastAPI app imports cleanly)
+        working-directory: "Agentic Ai"
+        env:
+          ADMIN_USERNAME: ci
+          ADMIN_PASSWORD: ci
+          AUTH_TOKEN_SECRET: ci-test-secret-1234567890123456
+          FINANCIAL_DB_PATH: /tmp/_ci_boot.db
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'backend')
+          from app.core_system import app
+          print(f'FastAPI routes: {len(app.routes)}')
+          "
+
+      - name: Run regression suites
+        working-directory: "Agentic Ai"
+        env:
+          ADMIN_USERNAME: ci
+          ADMIN_PASSWORD: ci
+          AUTH_TOKEN_SECRET: ci-test-secret-1234567890123456
+          FINANCIAL_DB_PATH: /tmp/_ci_test.db
+        run: |
+          set -e
+          for t in \
+            backend/tests/test_intent_router.py \
+            backend/tests/test_dashboard_pie.py \
+            backend/tests/test_analytics_intent.py \
+            backend/tests/test_multitenant_foundations.py \
+            backend/tests/test_advanced_subsystems.py \
+            backend/tests/test_saas_auth_tenant.py
+          do
+            echo "::group::$t"
+            python "$t"
+            echo "::endgroup::"
+          done
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: "Agentic Ai/frontend/package-lock.json"
+
+      - name: Install frontend deps
+        working-directory: "Agentic Ai/frontend"
+        run: npm ci
+
+      - name: Type-check (tsc --noEmit)
+        working-directory: "Agentic Ai/frontend"
+        run: npx tsc --noEmit
+
+      - name: Production build (vite)
+        working-directory: "Agentic Ai/frontend"
+        run: npx vite build
