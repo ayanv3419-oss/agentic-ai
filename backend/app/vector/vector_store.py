@@ -1,19 +1,4 @@
-"""Vector storage interface + in-memory cosine-similarity impl.
-
-`VectorStore` is the contract every backend honours. Today's deployment
-ships `InMemoryVectorStore`, which is suitable up to ~10^5 vectors at
-`dim=128` (memory: ~50 MB, query latency: <1 ms). Beyond that, swap to
-pgvector or Qdrant — same protocol.
-
-Records carry:
-  - `id`        — stable string identifier (the canonical entity name)
-  - `text`      — the original text the embedding was made from
-  - `kind`      — namespace tag ("product" / "customer" / "vendor" / ...)
-  - `metadata`  — optional dict for tenant_id, created_at, etc.
-
-Search returns `(record, similarity)` where similarity ∈ [0.0, 1.0]
-because every embedder L2-normalises and cosine = dot of unit vectors.
-"""
+"""Vector storage — in-memory cosine-similarity (single-user MVP)."""
 from __future__ import annotations
 
 import logging
@@ -23,7 +8,6 @@ from typing import Any, Iterable, Protocol
 
 import numpy as np
 
-from app.infrastructure import settings
 from app.vector.embeddings import Embedder, get_default_embedder
 
 
@@ -39,8 +23,6 @@ class VectorRecord:
 
 
 class VectorStore(Protocol):
-    """Subset of the pgvector / Qdrant API we actually use. Keep small."""
-
     def kind_label(self) -> str: ...   # noqa: E704
     def dim(self) -> int: ...   # noqa: E704
     def size(self) -> int: ...   # noqa: E704
@@ -60,17 +42,14 @@ class VectorStore(Protocol):
 
 
 class InMemoryVectorStore:
-    """Numpy-backed cosine-similarity store. Thread-safe via a single lock
-    (writes are rare; reads dominate)."""
+    """Numpy-backed cosine-similarity store. Thread-safe via a single lock."""
 
     def __init__(self, embedder: Embedder | None = None) -> None:
         self._embedder = embedder or get_default_embedder()
         self._dim = self._embedder.dim
-        # Matrix is grown by chunks; we re-pack the slice [:n_records] for
-        # search to avoid allocating per query.
         self._matrix = np.zeros((0, self._dim), dtype=np.float32)
         self._records: list[VectorRecord] = []
-        self._id_to_idx: dict[tuple[str, str], int] = {}  # (kind, id) -> idx
+        self._id_to_idx: dict[tuple[str, str], int] = {}
         self._lock = threading.Lock()
 
     def kind_label(self) -> str:
@@ -92,7 +71,6 @@ class InMemoryVectorStore:
             for r, vec in zip(items, new_vecs):
                 key = (r.kind, r.id)
                 if key in self._id_to_idx:
-                    # Update in place: replace vector + record metadata.
                     idx = self._id_to_idx[key]
                     self._matrix[idx] = vec
                     self._records[idx] = r
@@ -109,18 +87,9 @@ class InMemoryVectorStore:
         query: str,
         *,
         kind: str | None = None,
-        tenant_id: str | None = None,
         limit: int = 5,
         min_score: float = 0.0,
     ) -> list[tuple[VectorRecord, float]]:
-        """Cosine-similarity search.
-
-        `tenant_id` filter — when set, only records whose
-        `metadata["tenant_id"]` equals this value are eligible. Records
-        with no tenant_id (the global vocabulary registered at boot from
-        synonyms.json) are ALSO eligible — they're shared across tenants
-        on purpose. Pass tenant_id=None to disable tenant filtering
-        entirely (legacy single-admin path)."""
         with self._lock:
             if not self._records:
                 return []
@@ -130,25 +99,12 @@ class InMemoryVectorStore:
         q = self._embedder.embed(query)
         if q.shape != (self._dim,):
             return []
-        # Cosine = dot when both unit-normalised.
-        scores = matrix @ q  # shape (n,)
-        # Apply kind filter at score time so we don't scan tracks of
-        # irrelevant vectors when the namespace is small.
+        scores = matrix @ q
         if kind is not None:
             mask = np.array([r.kind == kind for r in records], dtype=bool)
             scores = np.where(mask, scores, -np.inf)
-        # Apply tenant filter — global (no tenant_id) records always
-        # match; tenant-stamped records match only when tenant_id equals.
-        if tenant_id is not None:
-            t_mask = np.array([
-                (r.metadata or {}).get("tenant_id") in (None, "", tenant_id)
-                for r in records
-            ], dtype=bool)
-            scores = np.where(t_mask, scores, -np.inf)
-        # argpartition is O(n) and faster than full sort for small `limit`.
         k = max(1, min(limit, len(records)))
         top_idx = np.argpartition(-scores, kth=k - 1)[:k]
-        # Sort the (small) top-k by descending score.
         top_idx = top_idx[np.argsort(-scores[top_idx])]
         out: list[tuple[VectorRecord, float]] = []
         for idx in top_idx:
@@ -178,38 +134,18 @@ class InMemoryVectorStore:
             return removed
 
 
-# ---- Singleton + swap hooks ----------------------------------------------
-
-def _build_default_store() -> VectorStore:
-    backend = (settings.vector_backend or "in_memory").lower()
-    if backend == "in_memory":
-        return InMemoryVectorStore()
-    # `pgvector` and `qdrant` are future drop-ins. They MUST honour the same
-    # VectorStore protocol; today we fall back to in-memory with a warning so
-    # the system never refuses to boot for a backend that isn't installed.
-    _log.warning(
-        "vector_backend=%r requested but only 'in_memory' is implemented; "
-        "falling back. Install pgvector / qdrant-client adapter to enable.",
-        backend,
-    )
-    return InMemoryVectorStore()
-
-
 _VECTOR_STORE: VectorStore | None = None
 
 
 def get_vector_store() -> VectorStore:
     global _VECTOR_STORE
     if _VECTOR_STORE is None:
-        _VECTOR_STORE = _build_default_store()
-        _log.info("vector store initialized: %s dim=%d",
-                  _VECTOR_STORE.kind_label(), _VECTOR_STORE.dim())
+        _VECTOR_STORE = InMemoryVectorStore()
+        _log.info("vector store initialized: in_memory dim=%d", _VECTOR_STORE.dim())
     return _VECTOR_STORE
 
 
 def set_vector_store(store: VectorStore) -> None:
-    """Swap the active backend. Tests use this to inject a fresh store
-    between cases; production swaps in pgvector / Qdrant adapters."""
     global _VECTOR_STORE
     _VECTOR_STORE = store
     _log.info("vector store swapped: %s dim=%d",

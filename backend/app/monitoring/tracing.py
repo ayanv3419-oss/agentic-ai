@@ -1,20 +1,4 @@
-"""Tracing primitives — context-managed spans + per-request context.
-
-Two pieces:
-  - `span(name, **attrs)` / `span_async` — a thin wrapper over Sentry's
-    `start_span` that's safe to use with no DSN (becomes a no-op timer).
-    Accepts arbitrary keyword tags so call sites can stamp `tool_name`,
-    `agent_name`, `tenant_id`, `query_chars`, etc. without consulting the
-    Sentry API directly.
-
-  - `set_request_context(request_id, user_id, tenant_id, conversation_id)`
-    binds these onto the current Sentry scope so EVERY exception captured
-    after this call is enriched with them. Used by the FastAPI middleware
-    on each request, and by the SSE runner per turn.
-
-Performance: `span()` runs in O(1) when no DSN is configured (Sentry's
-`start_span` short-circuits). Worth using everywhere.
-"""
+"""Tracing primitives — context-managed spans + per-request context."""
 from __future__ import annotations
 
 import contextlib
@@ -27,20 +11,11 @@ import sentry_sdk
 def set_request_context(
     *,
     request_id: str | None = None,
-    user_id: str | None = None,
-    tenant_id: str | None = None,
     conversation_id: str | None = None,
     **extra: Any,
 ) -> None:
-    """Bind salient identifiers onto the current Sentry scope.
-
-    Every captured exception or transaction created AFTER this call carries
-    these fields. Safe to call with all args None (sets nothing)."""
+    """Bind salient identifiers onto the current Sentry scope."""
     scope = sentry_sdk.get_current_scope()
-    if user_id:
-        scope.set_user({"id": user_id})
-    if tenant_id:
-        scope.set_tag("tenant_id", tenant_id)
     if conversation_id:
         scope.set_tag("conversation_id", conversation_id)
     if request_id:

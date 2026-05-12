@@ -2,7 +2,7 @@
 
 `instrument_fastapi(app)` adds:
   - per-request UUID assignment + `X-Request-ID` response header
-  - Sentry scope priming (user/tenant/conversation from auth + request body)
+  - Sentry scope priming (conversation from request body)
   - SSE-friendly: doesn't try to read the request body for streaming routes
 
 `instrument_tool(name)` is a decorator-like context manager you wrap each

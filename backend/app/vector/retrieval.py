@@ -173,7 +173,6 @@ def hybrid_retrieve(
     query: str,
     *,
     kind: str | None = None,
-    tenant_id: str | None = None,
     limit: int = 5,
     semantic_floor: float = _SEMANTIC_FLOOR,
 ) -> list[HybridMatch]:
@@ -183,18 +182,7 @@ def hybrid_retrieve(
       1. exact match against canonical names (score=1.0, source='exact')
       2. alias match (score=0.85, source='alias')
       3. semantic search via vector store (score=cosine, source='semantic')
-
-    Stages 1+2 short-circuit — semantic only runs when both produce no
-    matches. `kind` filters by namespace; pass None to search every
-    registered namespace.
-
-    `tenant_id` is forwarded to the semantic stage (stage 3) so a tenant-
-    stamped vocabulary doesn't leak across tenants. Stages 1+2 are
-    global-only today (the deterministic vocab is shared); when a per-
-    tenant vocabulary is registered later, those stages will need a
-    tenant_id filter too.
-
-    Empty query returns an empty list (no implicit "everything" search)."""
+    """
     if not query or not query.strip():
         return []
     query_norm = query.strip()
@@ -230,8 +218,7 @@ def hybrid_retrieve(
 
     # Stage 3: semantic fallback -------------------------------------------
     sem = semantic_search(
-        query_norm, kind=kind, tenant_id=tenant_id,
-        limit=limit, min_score=semantic_floor,
+        query_norm, kind=kind, limit=limit, min_score=semantic_floor,
     )
     if not sem:
         return []

@@ -1,8 +1,6 @@
-"""core_system — FastAPI app, every HTTP route, auth router, middleware,
-exception handlers, startup hook.
+"""core_system — FastAPI app, every HTTP route, single-user auth, startup hook.
 
-Consolidates the former app.api (routes + auth) and the former backend/main.py
-(FastAPI app construction, middleware, exception handlers, startup hook).
+Single-user MVP — no tenants, no workspaces, no cloud integrations.
 
 Run from the project root:
     python backend/main.py
@@ -13,30 +11,39 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import hashlib
 import hmac
 import logging
 import os
 import tempfile
+import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import (
+    APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile,
+)
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.analytics_engine import DashboardAgent, DataCleanAgent, run_query_turn
-from app.analytics_acceleration import duckdb_status, get_duckdb_engine
-from app.database import AuditLogRepo, engine_kind, engine_status
-from app.monitoring import (
-    init_sentry,
-    instrument_fastapi,
-    sentry_status,
-    set_request_context,
+from app.analytics_engine import (
+    DashboardAgent,
+    DataCleanAgent,
+    EventEmitter,
+    GroqClient,
+    TurnState,
+    format_sse,
+    get_registry,
+    reset_request_groq,
+    run_query_turn,
+    set_request_groq,
 )
+from app.database import engine_kind, engine_status
 from app.infrastructure import (
     ALLOWED_TABLES,
     SAFE_MESSAGE,
@@ -52,13 +59,11 @@ from app.infrastructure import (
     record_upload_meta,
     settings,
 )
-from app.analytics_engine import (
-    EventEmitter,
-    GroqClient,
-    TurnState,
-    format_sse,
-    reset_request_groq,
-    set_request_groq,
+from app.monitoring import (
+    init_sentry,
+    instrument_fastapi,
+    sentry_status,
+    set_request_context,
 )
 
 
@@ -66,18 +71,16 @@ log = logging.getLogger("agentic_ai.api")
 
 
 # ===========================================================================
-# 1. AUTH CORE — HMAC-signed bearer tokens
+# 1. AUTH — single admin from env, HMAC-signed bearer token
 # ===========================================================================
-
+#
 # Token format: base64url(payload).hex(hmac_sha256(secret, payload))
 # where payload = "<username>:<expiry_unix_ts>"
 #
-# Intentionally minimal (single admin, no DB-backed sessions). The secret
-# comes from `AUTH_TOKEN_SECRET`; the credentials from `ADMIN_USERNAME` and
-# `ADMIN_PASSWORD`. Restarting the server with a new secret invalidates
-# every outstanding token at once.
+# Credentials come from ADMIN_USERNAME + ADMIN_PASSWORD env vars. If either
+# is empty the login endpoint returns 401 (fail-closed).
 
-_auth_log = logging.getLogger("agentic_ai.auth_core")
+_auth_log = logging.getLogger("agentic_ai.auth")
 
 
 def _b64url_encode(b: bytes) -> str:
@@ -98,51 +101,40 @@ def _sign(payload: str) -> str:
 
 
 def create_token(username: str) -> tuple[str, str]:
-    """Return (token, ISO expires_at). TTL comes from settings."""
-    expiry = int(time.time()) + settings.auth_token_ttl_hours * 3600
+    expiry = int(time.time() + settings.auth_token_ttl_hours * 3600)
     payload = f"{username}:{expiry}"
     sig = _sign(payload)
-    token = f"{_b64url_encode(payload.encode('utf-8'))}.{sig}"
-    expires_at = datetime.fromtimestamp(expiry, tz=timezone.utc).isoformat(
-        timespec="seconds"
-    )
-    return token, expires_at
+    encoded = _b64url_encode(payload.encode("utf-8"))
+    return f"{encoded}.{sig}", str(expiry)
 
 
 def verify_token(token: Optional[str]) -> Optional[str]:
-    """Return username on success, None on any failure (invalid format,
-    bad signature, expired, etc.)."""
     if not token or "." not in token:
         return None
     try:
-        payload_b64, sig = token.split(".", 1)
-        payload = _b64url_decode(payload_b64).decode("utf-8")
+        b64, sig = token.split(".", 1)
+        payload = _b64url_decode(b64).decode("utf-8")
         username, expiry_s = payload.split(":")
         expiry = int(expiry_s)
+        expected = _sign(payload)
+        if not hmac.compare_digest(sig, expected):
+            return None
+        if time.time() > expiry:
+            return None
+        return username
     except Exception:
         return None
-    expected_sig = _sign(payload)
-    if not hmac.compare_digest(sig, expected_sig):
-        return None
-    if time.time() > expiry:
-        return None
-    return username
 
 
 def credentials_match(username: str, password: str) -> bool:
-    """Constant-time compare against the admin credentials.
-    Fails-closed when env vars aren't configured."""
-    expected_u = settings.admin_username or ""
-    expected_p = settings.admin_password or ""
-    if not expected_u or not expected_p:
+    if not settings.admin_username or not settings.admin_password:
         return False
-    u_ok = hmac.compare_digest(
-        (username or "").encode("utf-8"), expected_u.encode("utf-8")
+    if not username or not password:
+        return False
+    return (
+        hmac.compare_digest(username, settings.admin_username)
+        and hmac.compare_digest(password, settings.admin_password)
     )
-    p_ok = hmac.compare_digest(
-        (password or "").encode("utf-8"), expected_p.encode("utf-8")
-    )
-    return u_ok and p_ok
 
 
 def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
@@ -157,15 +149,10 @@ def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
 async def require_auth(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> str:
-    """FastAPI dependency. Raises 401 with the standard envelope if the
-    Authorization header is missing / malformed / expired.
-
-    Returns the user identifier (email for JWT users, username for legacy
-    HMAC). Routes that need the FULL principal (tenant_id, workspace_id,
-    role) should use `from app.auth import require_principal` instead."""
-    from app.auth import try_principal
+    """Dependency: returns the username, raises 401 on missing/invalid token."""
     token = _extract_bearer(authorization)
-    if not token:
+    user = verify_token(token)
+    if user is None:
         raise HTTPException(
             status_code=401,
             detail=envelope(
@@ -174,37 +161,19 @@ async def require_auth(
                 kind="auth",
             ),
         )
-    # Path 1: JWT principals (multi-user model + legacy-HMAC compat).
-    principal = try_principal(authorization)
-    if principal is not None:
-        return principal.email
-    # Path 2: legacy-HMAC-only (no JWT principal recognised). The
-    # legacy_admin synthesis in try_principal already covers the
-    # standard HMAC path, so this is a true no-credentials case.
-    username = verify_token(token)
-    if not username:
-        raise HTTPException(
-            status_code=401,
-            detail=envelope(
-                "Invalid or expired token",
-                detail="Log in again to obtain a new token.",
-                kind="auth",
-            ),
-        )
-    return username
+    return user
 
 
 def try_auth(authorization: Optional[str]) -> Optional[str]:
-    """Non-raising variant for routes that want to know "is the caller
-    authenticated?" without rejecting unauthenticated requests."""
+    """Non-raising variant for /auth/me."""
     return verify_token(_extract_bearer(authorization))
 
 
 # ===========================================================================
-# 2. AUTH ROUTES (/auth/login, /auth/me, /auth/logout + disabled Google/Drive)
+# 2. AUTH ROUTES
 # ===========================================================================
 
-auth_router = APIRouter()
+auth_router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 class LoginRequest(BaseModel):
@@ -212,335 +181,135 @@ class LoginRequest(BaseModel):
     password: str = Field(..., min_length=1, max_length=200)
 
 
-class RegisterRequest(BaseModel):
-    email: str = Field(..., min_length=3, max_length=320)
-    password: str = Field(..., min_length=8, max_length=200)
-    workspace_name: str = Field(default="My Workspace", min_length=1, max_length=200)
-
-
-@auth_router.post("/auth/register")
-async def auth_register(req: RegisterRequest, request: Request):
-    """Self-service signup: creates a (tenant, workspace, user) trio and
-    returns a JWT immediately so the user lands signed-in. The first user
-    of a workspace is the `owner` role.
-
-    Rate-limited by client IP (10/min) to prevent spam-registration.
-
-    Validation:
-      - email must contain '@' and '.' (light gate; real validation defers
-        to the password reset / email verify flow which doesn't exist yet)
-      - password ≥ 8 chars (Pydantic enforces this)
-
-    Returns 409 if the email is already registered."""
-    client_ip = _client_ip(request)
-    rl = _rate_limit_check(client_ip, bucket_namespace="register", limit_per_minute=10)
-    if rl is not None:
-        return JSONResponse(status_code=429, content=rl)
-    from app.auth import (
-        create_user, create_workspace, encode_token, find_user_by_email,
-        hash_password,
-    )
-    email = req.email.strip().lower()
-    if "@" not in email or "." not in email.split("@", 1)[-1]:
-        return JSONResponse(
-            status_code=400,
-            content=envelope("Invalid email", detail="Email must look like a@b.c.", kind="validation"),
-        )
-    existing = await find_user_by_email(email)
-    if existing is not None:
-        return JSONResponse(
-            status_code=409,
-            content=envelope(
-                "Email already registered",
-                detail="Use /auth/login or pick a different email.",
-                kind="auth",
-            ),
-        )
-    workspace = await create_workspace(req.workspace_name)
-    user = await create_user(
-        email=email,
-        password_hash=hash_password(req.password),
-        tenant_id=workspace.tenant_id,
-        workspace_id=workspace.id,
-        role="owner",
-    )
-    token, expires_at = encode_token(
-        user_id=user.id, email=user.email,
-        tenant_id=user.tenant_id, workspace_id=user.workspace_id,
-        role=user.role,
-    )
-    _auth_log.info(
-        "register ok email=%s tenant=%s workspace=%s role=%s",
-        email, user.tenant_id, user.workspace_id, user.role,
-    )
-    await AuditLogRepo.write(
-        action="auth.register",
-        tenant_id=user.tenant_id,
-        workspace_id=user.workspace_id,
-        user_id=user.id,
-        resource_type="user",
-        resource_id=user.id,
-        metadata={"email": email, "workspace_name": req.workspace_name},
-    )
-    return {
-        "token":         token,
-        "expires_at":    expires_at,
-        "user": {
-            "id":           user.id,
-            "email":        user.email,
-            "tenant_id":    user.tenant_id,
-            "workspace_id": user.workspace_id,
-            "role":         user.role,
-        },
-        "workspace": {
-            "id":   workspace.id,
-            "name": workspace.name,
-        },
-    }
-
-
-@auth_router.post("/auth/login")
+@auth_router.post("/login")
 async def auth_login(req: LoginRequest, request: Request):
-    """Validate credentials and return a JWT.
-
-    Two paths supported in priority order:
-      1. **Real users** (registered via /auth/register) — looked up by email
-         against the `users` table; bcrypt-verified. Returns a JWT with
-         user_id / tenant_id / workspace_id / role claims.
-      2. **Legacy admin** — falls back to the env-var ADMIN_USERNAME /
-         ADMIN_PASSWORD pair, issuing the OLD HMAC bearer for backward
-         compatibility with any deployment that hasn't migrated yet.
-
-    Treats `username` field as either email (path 1) or username (path 2);
-    the underscore lets old clients keep working without a payload schema
-    change.
-
-    Rate-limited by client IP (20/min) — defends against credential-stuffing
-    attacks. The limit is per-IP, not per-username, so attackers can't
-    bypass by rotating usernames."""
-    client_ip = _client_ip(request)
-    rl = _rate_limit_check(client_ip, bucket_namespace="login", limit_per_minute=20)
+    """Single-admin login. Rate-limited by IP."""
+    rl = _rate_limit_check(_client_ip(request), bucket_namespace="auth", limit_per_minute=10)
     if rl is not None:
         return JSONResponse(status_code=429, content=rl)
-    from app.auth import (
-        encode_token, find_user_by_email, update_last_login, verify_password,
-    )
-    raw = (req.username or "").strip()
-    # Path 1: real users table (lookup by email).
-    if "@" in raw:
-        result = await find_user_by_email(raw.lower())
-        if result is None or not verify_password(req.password, result[1]):
-            _auth_log.info("login failed (jwt path) for email=%r", raw)
-            # Audit-log the failure (no user_id since the lookup failed
-            # OR the password was wrong — we don't reveal which).
-            await AuditLogRepo.write(
-                action="auth.login_failed",
-                resource_type="user",
-                metadata={"email": raw},
-            )
-            return JSONResponse(
-                status_code=401,
-                content=envelope(
-                    "Invalid credentials",
-                    detail="Email or password is incorrect.",
-                    kind="auth",
-                ),
-            )
-        user, _hash = result
-        token, expires_at = encode_token(
-            user_id=user.id, email=user.email,
-            tenant_id=user.tenant_id, workspace_id=user.workspace_id,
-            role=user.role,
-        )
-        await update_last_login(user.id)
-        _auth_log.info("login ok email=%s tenant=%s role=%s",
-                       user.email, user.tenant_id, user.role)
-        await AuditLogRepo.write(
-            action="auth.login",
-            tenant_id=user.tenant_id,
-            workspace_id=user.workspace_id,
-            user_id=user.id,
-            resource_type="user",
-            resource_id=user.id,
-            metadata={"email": user.email, "role": user.role},
-        )
-        return {
-            "token":      token,
-            "username":   user.email,                     # legacy alias
-            "expires_at": _expiry_iso(expires_at),
-            "user": {
-                "id":           user.id,
-                "email":        user.email,
-                "tenant_id":    user.tenant_id,
-                "workspace_id": user.workspace_id,
-                "role":         user.role,
-            },
-        }
 
-    # Path 2: legacy env-var admin (back-compat for existing deployments).
     if not credentials_match(req.username, req.password):
-        _auth_log.info("login failed (legacy path) for username=%r", req.username)
+        _auth_log.warning("login failed for username=%r", req.username)
         return JSONResponse(
             status_code=401,
-            content=envelope(
-                "Invalid credentials",
-                detail="Username or password is incorrect.",
-                kind="auth",
-            ),
+            content=envelope("Invalid credentials", kind="auth"),
         )
-    token, expires_at_iso = create_token(req.username)
-    _auth_log.info("login ok (legacy) username=%r expires=%s",
-                   req.username, expires_at_iso)
+
+    token, expiry = create_token(req.username)
+    _auth_log.info("login ok username=%s", req.username)
     return {
-        "token":      token,
-        "username":   req.username,
-        "expires_at": expires_at_iso,
+        "token": token,
+        "expires_at": expiry,
+        "user": {"username": req.username},
     }
 
 
-def _expiry_iso(expiry_unix: int) -> str:
-    """Format unix expiry as ISO so the frontend's existing parser keeps
-    working (the legacy HMAC path returned ISO; we match that here)."""
-    from datetime import datetime, timezone
-    return datetime.fromtimestamp(expiry_unix, tz=timezone.utc).isoformat(timespec="seconds")
-
-
-@auth_router.get("/auth/me")
+@auth_router.get("/me")
 async def auth_me(authorization: Optional[str] = Header(default=None)):
-    """Inspect the current bearer token. Returns `authenticated=false` if
-    no/invalid/expired token (so the frontend can render its login screen).
-
-    NEW: when authenticated via JWT, surfaces the full principal —
-    user_id / tenant_id / workspace_id / role — so the frontend can route
-    based on role and display the workspace name."""
-    from app.auth import try_principal, get_workspace_by_id
-    principal = try_principal(authorization)
-    if principal is not None:
-        # JWT path — multi-user model.
-        workspace = None
-        if principal.workspace_id and principal.workspace_id != "legacy_admin":
-            ws = await get_workspace_by_id(principal.workspace_id)
-            if ws:
-                workspace = {"id": ws.id, "name": ws.name}
-        return {
-            "authenticated":     True,
-            "username":          principal.email,
-            "user_id":           principal.user_id,
-            "tenant_id":         principal.tenant_id,
-            "workspace_id":      principal.workspace_id,
-            "role":              principal.role,
-            "workspace":         workspace,
-            "google_configured": False,
-        }
-    # Legacy path (HMAC username) preserved for already-deployed sessions.
-    legacy_username = try_auth(authorization)
-    if legacy_username:
-        return {
-            "authenticated":     True,
-            "username":          legacy_username,
-            "google_configured": False,
-        }
+    """Return current user info, or {authenticated: false}."""
+    user = try_auth(authorization)
+    if user is None:
+        return {"authenticated": False}
     return {
-        "authenticated":     False,
-        "google_configured": False,
+        "authenticated": True,
+        "user": {"username": user},
     }
 
 
-@auth_router.post("/auth/logout")
+@auth_router.post("/logout")
 async def auth_logout():
-    """Token revocation is client-driven — the client drops the token from
-    storage. (Stateless tokens; restart the server with a new
-    AUTH_TOKEN_SECRET to invalidate every token at once.)"""
+    """Client should drop the token. Server is stateless."""
     return {"ok": True}
 
 
-# Google OAuth + Drive placeholders -----------------------------------------
-# The Google Auth + Drive sync flow is intentionally disabled in this build.
-# The frontend has UI for it but the backend returns a structured
-# `auth_disabled` envelope so it doesn't 404.
-
+# Stubs for disabled OAuth/Drive endpoints — return 501 so the frontend can
+# render "feature disabled" without breaking.
 def _disabled() -> JSONResponse:
     return JSONResponse(
-        status_code=503,
-        content=envelope(
-            "Google authentication is not enabled in this build.",
-            detail="The Google Auth + Drive sync flow is intentionally disabled.",
-            kind="auth_disabled",
-        ),
+        status_code=501,
+        content=envelope("Feature disabled in MVP", kind="not_implemented"),
     )
 
 
-@auth_router.get("/auth/google/login")
-async def google_login():
-    return _disabled()
+@auth_router.get("/google/login")
+async def google_login(): return _disabled()
 
 
-@auth_router.get("/auth/google/callback")
-async def google_callback():
-    return _disabled()
-
-
-@auth_router.post("/drive/sync")
-async def drive_sync():
-    return _disabled()
-
-
-@auth_router.get("/drive/status")
-async def drive_status():
-    return {
-        "authenticated": False,
-        "email": None,
-        "imported_files": [],
-    }
+@auth_router.get("/google/callback")
+async def google_callback(): return _disabled()
 
 
 # ===========================================================================
-# 3. BUSINESS ROUTES
+# 3. RATE LIMITER — in-memory token bucket
+# ===========================================================================
+
+_RATE_LOCK = threading.Lock()
+_RATE_BUCKETS: dict[str, collections.deque] = {}
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip() or "unknown"
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def _rate_limit_check(
+    user_key: str,
+    *,
+    bucket_namespace: str = "query",
+    limit_per_minute: int | None = None,
+) -> dict[str, Any] | None:
+    now = time.time()
+    window = 60.0
+    limit = max(1, int(limit_per_minute or settings.rate_limit_per_minute))
+    composite_key = f"{bucket_namespace}:{user_key}"
+    with _RATE_LOCK:
+        bucket = _RATE_BUCKETS.get(composite_key)
+        if bucket is None:
+            bucket = collections.deque(maxlen=limit + 1)
+            _RATE_BUCKETS[composite_key] = bucket
+        while bucket and (now - bucket[0]) > window:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            retry_in = max(1, int(window - (now - bucket[0])))
+            return envelope(
+                f"Rate limit hit ({limit}/min)",
+                detail=f"Too many {bucket_namespace} requests. Retry in ~{retry_in}s.",
+                kind="rate_limit",
+                extra={
+                    "retry_after_seconds": retry_in,
+                    "limit_per_minute":    limit,
+                    "namespace":           bucket_namespace,
+                },
+            )
+        bucket.append(now)
+    return None
+
+
+# ===========================================================================
+# 4. API ROUTES
 # ===========================================================================
 
 api_router = APIRouter()
 
 
-# ---------------------------------------------------------------------------
-# /health
-# ---------------------------------------------------------------------------
-
 @api_router.get("/health")
 async def health() -> dict:
-    from app.cache import redis_status, upstash_status
-    from app.database.pg_adapter import pg_status
-    from app.infrastructure import (
-        get_blob_store, get_cache_store, get_conversation_store, settings as _s,
-    )
-    from app.integrations import supabase_status
-    from app.vector import get_vector_store
-    from app.workers import get_job_queue
     return {
         "status": "ok",
-        "model": settings.groq_model,
-        "financial_db": settings.financial_db_path,
+        "version": "3.0.0-mvp",
         "data_version": get_data_version(),
-        "cache_entries": cache_size(),
-        "cache_backend": get_cache_store().kind(),
-        "conversation_backend": get_conversation_store().kind(),
-        "blob_backend": get_blob_store().kind(),
-        "rate_limit_per_minute": settings.rate_limit_per_minute,
+        "cache": {
+            "kind": "json_file",
+            "size": cache_size(),
+        },
+        "database": engine_status(),
         "sales_rows": await count_rows("sales"),
         "purchase_rows": await count_rows("purchase"),
-        # New subsystem statuses — `/health` is the single source of truth
-        # for "is monitoring wired", "is DuckDB wired", etc.
-        "duckdb": duckdb_status(),
         "sentry": sentry_status(),
-        "vector_backend": get_vector_store().kind_label(),
-        "vector_dim": get_vector_store().dim(),
-        "vector_size": get_vector_store().size(),
-        "worker_backend": get_job_queue().backend_kind,
-        "engine": engine_status(),
-        "redis": redis_status(),
-        "upstash": upstash_status(),    # masked: token never echoed
-        "postgres": pg_status(),
-        "postgres_primary": bool(_s.postgres_primary),
-        "supabase": supabase_status(),  # masked: key never echoed
     }
 
 
@@ -555,28 +324,13 @@ async def upload(
     target: str = Form("sales"),
     auth_user: str = Depends(require_auth),
 ):
-    """Upload route — every stage logs to `agentic_ai.api.upload` so a tail of
-    the backend log shows the exact stage a request reached. EVERY return
-    path produces a JSON body so the browser never sees an empty response.
-
-    Rate-limited per authenticated user (5/min) so a runaway tab can't
-    DoS the ingestion pipeline."""
     upload_log = logging.getLogger("agentic_ai.api.upload")
     rl = _rate_limit_check(auth_user, bucket_namespace="upload", limit_per_minute=5)
     if rl is not None:
         return JSONResponse(status_code=429, content=rl)
-    client_origin = request.headers.get("origin") or "(no-origin)"
-    upload_log.info(
-        "REQ /upload origin=%s ct=%s filename=%s target=%s",
-        client_origin,
-        request.headers.get("content-type", ""),
-        file.filename, target,
-    )
 
     target_table = (target or "sales").strip().lower()
     filename = file.filename or "upload"
-    # Generate batch_id up-front so EVERY upload attempt — including failures —
-    # creates a registry entry the UI can display.
     batch_id = str(uuid4())
 
     async def _record_error(reason: str, target_for_record: str) -> None:
@@ -595,7 +349,6 @@ async def upload(
             upload_log.warning("failed to record error meta for batch=%s", batch_id, exc_info=True)
 
     if target_table not in ALLOWED_TABLES:
-        upload_log.warning("RESP 400 invalid target=%r", target_table)
         await _record_error(f"invalid target: {target_table!r}", "sales")
         return JSONResponse(status_code=400, content=envelope(
             "Invalid target",
@@ -609,7 +362,6 @@ async def upload(
     elif lower.endswith(".xlsx"):
         suffix = ".xlsx"
     else:
-        upload_log.warning("RESP 400 unsupported type=%r", filename)
         await _record_error(f"unsupported file type: {filename!r}", target_table)
         return JSONResponse(status_code=400, content=envelope(
             "Unsupported file type",
@@ -620,8 +372,6 @@ async def upload(
     fd, tmp_path = tempfile.mkstemp(prefix="agentic_upload_", suffix=suffix)
     bytes_written = 0
     try:
-        # ---- 1. spool ---------------------------------------------------
-        upload_log.info("spool: start tmp=%s", tmp_path)
         try:
             with os.fdopen(fd, "wb") as out:
                 while True:
@@ -630,10 +380,6 @@ async def upload(
                         break
                     bytes_written += len(chunk)
                     if bytes_written > settings.max_upload_bytes:
-                        upload_log.warning(
-                            "RESP 413 file too large bytes=%d cap=%d",
-                            bytes_written, settings.max_upload_bytes,
-                        )
                         await _record_error(
                             f"file too large ({bytes_written} > {settings.max_upload_bytes})",
                             target_table,
@@ -652,29 +398,13 @@ async def upload(
                 detail=f"{type(e).__name__}: {e}",
                 kind="upload",
             ))
-        upload_log.info("spool: done bytes=%d", bytes_written)
 
         if bytes_written == 0:
-            upload_log.warning("RESP 400 empty file")
             await _record_error("empty file", target_table)
             return JSONResponse(status_code=400, content=envelope(
-                "Empty file",
-                kind="upload",
+                "Empty file", kind="upload",
             ))
 
-        # ---- 2. DataCleanAgent -----------------------------------------
-        # Resolve principal so every inserted row carries tenant/workspace/
-        # user attribution. Legacy HMAC users get the synthetic
-        # "legacy_admin" tenant.
-        from app.auth import try_principal
-        principal = try_principal(request.headers.get("Authorization"))
-        upload_tenant    = principal.tenant_id    if principal else None
-        upload_workspace = principal.workspace_id if principal else None
-        upload_user      = principal.user_id      if principal else None
-        upload_log.info(
-            "dataclean: starting target=%s batch_id=%s tenant=%s",
-            target_table, batch_id, upload_tenant or "<none>",
-        )
         agent = DataCleanAgent()
         try:
             result = await agent.run(
@@ -682,17 +412,11 @@ async def upload(
                 filename=filename,
                 target=target_table,
                 batch_id=batch_id,
-                tenant_id=upload_tenant,
-                workspace_id=upload_workspace,
-                user_id=upload_user,
             )
         except UploadError as e:
-            upload_log.warning("RESP 400 bad upload: %s", e)
             await _record_error(f"bad upload: {e}", target_table)
             return JSONResponse(status_code=400, content=envelope(
-                "Bad upload",
-                detail=str(e),
-                kind="upload",
+                "Bad upload", detail=str(e), kind="upload",
             ))
         except Exception as e:
             upload_log.exception("dataclean: crashed")
@@ -702,39 +426,15 @@ async def upload(
                 detail=f"{type(e).__name__}: {e}",
                 kind="internal",
             ))
-        upload_log.info(
-            "dataclean: ok rows_inserted=%d rows_failed=%d sheet=%r",
-            result["rows_inserted"], result["rows_failed"], result.get("sheet_name"),
-        )
 
-        # ---- 3. cache invalidation -------------------------------------
-        # Bump the data_version counter — every cached response keyed against
-        # the OLD version is now unreachable (cache_key_for embeds the
-        # version). Belt + braces: also call invalidate_all() so the JSON
-        # file shrinks back to empty rather than growing unbounded.
         new_version = bump_data_version()
         invalidate_all()
-        upload_log.info("data_version bumped to %d after upload", new_version)
-        # Audit log: record the successful upload so ops can correlate
-        # data-version bumps with users + batches.
-        await AuditLogRepo.write(
-            action="upload.success",
-            tenant_id=upload_tenant,
-            workspace_id=upload_workspace,
-            user_id=upload_user,
-            resource_type="upload",
-            resource_id=batch_id,
-            metadata={
-                "filename":      filename,
-                "target":        target_table,
-                "rows_inserted": result["rows_inserted"],
-                "rows_failed":   result["rows_failed"],
-                "data_version":  new_version,
-            },
+        upload_log.info(
+            "upload ok rows=%d batch=%s data_version=%d",
+            result["rows_inserted"], batch_id, new_version,
         )
 
-        # ---- 4. response ------------------------------------------------
-        body = {
+        return {
             "batch_id":          result["batch_id"],
             "filename":          result["filename"],
             "target":            result["target"],
@@ -749,10 +449,7 @@ async def upload(
             "bytes_received":    bytes_written,
             "table_total":       await count_rows(target_table),
         }
-        upload_log.info("RESP 200 batch_id=%s", body["batch_id"])
-        return body
     except Exception as e:
-        # Last-resort handler: NOTHING leaves /upload without a JSON body.
         upload_log.exception("upload: unhandled crash")
         return JSONResponse(status_code=500, content=envelope(
             "Upload failed",
@@ -769,27 +466,19 @@ async def upload(
 
 
 # ---------------------------------------------------------------------------
-# /dashboard (DashboardAgent)
+# /dashboard
 # ---------------------------------------------------------------------------
 
 @api_router.get("/dashboard", dependencies=[Depends(require_auth)])
-async def dashboard(
-    request: Request,
-    month: str | None = None,
-):
-    from app.auth import try_principal
+async def dashboard(month: str | None = None):
     if month is not None and (len(month) != 7 or month[4] != "-"):
         return JSONResponse(status_code=400, content=envelope(
             "Invalid month",
             detail="Expected format YYYY-MM",
             kind="validation",
         ))
-    # Tenant-scope the dashboard. Legacy HMAC users get a synthetic
-    # "legacy_admin" tenant — they only see rows uploaded by that tenant.
-    principal = try_principal(request.headers.get("Authorization"))
-    tenant_id = principal.tenant_id if principal else None
     try:
-        return await DashboardAgent().run(month=month, tenant_id=tenant_id)
+        return await DashboardAgent().run(month=month)
     except ValueError as e:
         return JSONResponse(status_code=400, content=envelope(
             "Invalid dashboard query", detail=str(e), kind="validation",
@@ -804,7 +493,7 @@ async def dashboard(
 
 
 # ---------------------------------------------------------------------------
-# /uploads  (metadata listing for the dataset pill)
+# /uploads — metadata listing + dataset removal
 # ---------------------------------------------------------------------------
 
 @api_router.get("/uploads", dependencies=[Depends(require_auth)])
@@ -820,15 +509,6 @@ async def uploads():
 
 @api_router.post("/uploads/{batch_id}/disconnect", dependencies=[Depends(require_auth)])
 async def upload_disconnect(batch_id: str):
-    """Remove a dataset from active sources.
-
-    Deletes every row in the target table tagged with this batch_id and
-    flips the registry's status to 'removed'. Idempotent — if the dataset
-    is already removed, returns 200 with `already_removed: true`.
-
-    Side-effect: invalidates the answer cache (since the data the cached
-    answers were grounded in just changed).
-    """
     if not batch_id or len(batch_id) > 64:
         return JSONResponse(status_code=400, content=envelope(
             "Invalid batch_id", detail="batch_id is empty or too long.",
@@ -857,104 +537,22 @@ async def upload_disconnect(batch_id: str):
 # ---------------------------------------------------------------------------
 
 @api_router.post("/cache/clear", dependencies=[Depends(require_auth)])
-async def cache_clear(request: Request):
-    from app.auth import try_principal
-    principal = try_principal(request.headers.get("Authorization"))
+async def cache_clear():
     n = invalidate_all()
     new_version = bump_data_version()
-    await AuditLogRepo.write(
-        action="cache.cleared",
-        tenant_id=principal.tenant_id if principal else None,
-        workspace_id=principal.workspace_id if principal else None,
-        user_id=principal.user_id if principal else None,
-        resource_type="cache",
-        metadata={"entries_removed": n, "new_data_version": new_version},
-    )
     return {"cleared": n, "data_version": new_version}
 
 
 # ---------------------------------------------------------------------------
-# /query_stream  (Coordinator → analytic sub-agent)
+# /query_stream (SSE)
 # ---------------------------------------------------------------------------
 
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=4000)
-    # Optional conversation identifier — frontend generates a UUID per
-    # chat session and persists it in localStorage. Lets the coordinator
-    # isolate continuity context per (user, conversation) so two
-    # logged-in users (or two browser tabs) can't bleed state.
     conversation_id: str | None = Field(default=None, max_length=128)
 
 
 HEARTBEAT_SECONDS = 15.0
-
-
-# ---------------------------------------------------------------------------
-# Rate limiter — in-memory token bucket per user. Defends `/query_stream`
-# + auth + upload against runaway tabs / accidental loops / token-burning
-# bots / signup spam. The shape is Redis-compatible: when REDIS_URL is set
-# later, swap `_RATE_BUCKETS` for a Redis-backed sliding-window counter
-# behind the same `_rate_limit_check` signature. No call-site changes.
-#
-# `_client_ip` extracts a rate-limit key for unauthenticated endpoints
-# (login + register). Honours `X-Forwarded-For` since deployments behind
-# Render / Cloudflare / nginx all set it; falls back to `request.client`.
-# ---------------------------------------------------------------------------
-
-
-def _client_ip(request: Request) -> str:
-    """Best-effort client identifier for rate limiting unauth routes."""
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        # First entry is the client; the rest are proxy hops.
-        return fwd.split(",")[0].strip() or "unknown"
-    if request.client and request.client.host:
-        return request.client.host
-    return "unknown"
-
-import collections
-import threading
-
-_RATE_LOCK = threading.Lock()
-_RATE_BUCKETS: dict[str, collections.deque] = {}
-
-
-def _rate_limit_check(
-    user_key: str,
-    *,
-    bucket_namespace: str = "query",
-    limit_per_minute: int | None = None,
-) -> dict[str, Any] | None:
-    """Token-bucket rate limiter. Per-(user_key, namespace) so different
-    endpoints get separate buckets.
-
-    Returns None on success, an envelope dict on rate-limit hit."""
-    now = time.time()
-    window = 60.0
-    limit = max(1, int(limit_per_minute or settings.rate_limit_per_minute))
-    composite_key = f"{bucket_namespace}:{user_key}"
-    with _RATE_LOCK:
-        bucket = _RATE_BUCKETS.get(composite_key)
-        if bucket is None:
-            bucket = collections.deque(maxlen=limit + 1)
-            _RATE_BUCKETS[composite_key] = bucket
-        # Drop entries older than the window.
-        while bucket and (now - bucket[0]) > window:
-            bucket.popleft()
-        if len(bucket) >= limit:
-            retry_in = max(1, int(window - (now - bucket[0])))
-            return envelope(
-                f"Rate limit hit ({limit}/min)",
-                detail=f"Too many {bucket_namespace} requests. Retry in ~{retry_in}s.",
-                kind="rate_limit",
-                extra={
-                    "retry_after_seconds": retry_in,
-                    "limit_per_minute":    limit,
-                    "namespace":           bucket_namespace,
-                },
-            )
-        bucket.append(now)
-    return None
 
 
 def _resolve_groq_key(request: Request) -> str:
@@ -1084,7 +682,6 @@ async def query_stream(
     request: Request,
     auth_user: str = Depends(require_auth),
 ):
-    from app.auth import try_principal
     api_key = _resolve_groq_key(request)
     emitter = EventEmitter()
     pre_error = _validate_pre_stream(req, api_key)
@@ -1092,33 +689,18 @@ async def query_stream(
         _safe_create_task(_emit_pre_stream_error(emitter, pre_error))
         return _stream_response(emitter)
 
-    # Rate limit per user (in-memory token bucket, swappable to Redis).
     rate_error = _rate_limit_check(auth_user)
     if rate_error is not None:
         _safe_create_task(_emit_pre_stream_error(emitter, rate_error))
         return _stream_response(emitter)
 
-    # Resolve the principal so we can stamp tenant_id / workspace_id / role
-    # into TurnState. For legacy HMAC tokens this synthesises a
-    # `legacy_admin` tenant (single-tenant slice).
-    principal = try_principal(request.headers.get("Authorization"))
-    user_id = principal.user_id if principal else auth_user
-    tenant_id = principal.tenant_id if principal else "legacy_admin"
-
-    # Bind salient identifiers onto the Sentry scope so any exception
-    # captured downstream (a tool crash, a Groq timeout) is enriched with
-    # who/what/where context. No-op when SENTRY_DSN is unset.
     set_request_context(
-        user_id=user_id,
-        tenant_id=tenant_id,
         conversation_id=req.conversation_id,
         question_chars=len(req.question),
     )
 
     initial = TurnState(
         question=req.question,
-        user_id=user_id,
-        tenant_id=tenant_id,
         conversation_id=req.conversation_id,
     )
     runner_task = _safe_create_task(_runner(initial, emitter, api_key))
@@ -1127,25 +709,14 @@ async def query_stream(
 
 
 # ===========================================================================
-# FASTAPI APP — middleware, exception handlers, startup (was backend/main.py)
+# 5. FASTAPI APP — middleware, exception handlers, startup
 # ===========================================================================
 
-from fastapi import FastAPI, Request
-from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from starlette.middleware.sessions import SessionMiddleware
-
-from app.analytics_engine import get_registry  # registry bootstrap on import
-
-
 def configure_logging(level: int = logging.INFO) -> None:
-    """One-shot logging configuration."""
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    # Quiet noisy upstreams.
     for noisy in ("httpx", "httpcore", "uvicorn.access"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -1153,32 +724,14 @@ def configure_logging(level: int = logging.INFO) -> None:
 configure_logging()
 _app_log = logging.getLogger("agentic_ai")
 
-# Initialize Sentry BEFORE FastAPI() so the SDK's FastAPI integration sees
-# every route as it's registered. No-op when SENTRY_DSN is unset.
 init_sentry()
 
 app = FastAPI(
     title="Agentic AI",
-    description="LLM-coordinated analytics over user-uploaded financial data.",
-    version="3.0.0",
+    description="Local-first single-user analytics over uploaded financial data.",
+    version="3.0.0-mvp",
 )
 
-# Middleware order matters: Starlette applies the LAST `add_middleware`
-# OUTERMOST. CORS must be the outermost middleware so it can short-circuit
-# OPTIONS preflights before the session middleware runs.
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=settings.session_secret,
-    session_cookie="agentic_session",
-    same_site="lax",
-    max_age=60 * 60 * 24 * 7,
-    https_only=False,
-)
-# Use a regex for allow-origin so the response echoes the request origin.
-# The literal `*` is incompatible with `Access-Control-Allow-Credentials: true`
-# and causes every credentialed fetch from the browser to fail with the
-# opaque "Failed to fetch" error. `allow_origin_regex=".*"` matches every
-# origin and lets us safely keep allow_credentials=True.
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=".*",
@@ -1191,8 +744,6 @@ app.add_middleware(
 app.include_router(api_router)
 app.include_router(auth_router)
 
-# Per-request UUID + Sentry scope priming. Adds the X-Request-ID response
-# header so a client can quote it when reporting issues.
 instrument_fastapi(app)
 
 
@@ -1237,128 +788,30 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.on_event("startup")
 async def _startup() -> None:
-    from app.cache import wire_redis_if_configured
     from app.infrastructure import init_database, load_synonyms
     from app.vector import register_vocabulary
-    from app.workers import get_job_queue, register_default_tasks
-    await init_database()
-    # Background workers — registers the @task decorators + builds the
-    # inline (or future arq-backed) queue singleton. Pure registration:
-    # no Redis call, no network.
-    register_default_tasks()
-    _app_log.info("workers: backend=%s", get_job_queue().backend_kind)
 
-    # Try to swap in Redis-backed cache + conversation stores. No-op
-    # when REDIS_URL is unset; on failure we log + stay on in-memory.
-    redis_state = await wire_redis_if_configured()
-    _app_log.info("redis bootstrap: %s", redis_state)
+    await init_database()
     _app_log.info("database engine: %s", engine_kind())
 
-    # Eager Supabase probe — when SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY
-    # are both set, list buckets ONCE at startup so a bad URL / revoked
-    # key surfaces immediately. NEVER raises (broken Supabase falls back
-    # to local-fs blob store + JSON cache, system continues serving).
-    # The service-role key is masked in every log line.
-    from app.integrations import (
-        SupabaseUnavailableError, get_supabase, supabase_status,
-    )
-    sb_cfg = supabase_status()
-    if sb_cfg["configured"]:
-        try:
-            sb = await get_supabase()
-            ping = await sb.ping()
-            _app_log.info(
-                "supabase probe OK url=%s buckets=%d (key fp=%s)",
-                sb_cfg["url"], ping["buckets"], sb_cfg["key_fingerprint"],
-            )
-        except SupabaseUnavailableError as e:
-            _app_log.warning(
-                "supabase probe FAILED — system continues without Supabase: %s", e,
-            )
-        except Exception as e:
-            _app_log.warning(
-                "supabase probe FAILED — unexpected: %s: %s",
-                type(e).__name__, e,
-            )
-    else:
-        _app_log.info("supabase: unconfigured (SUPABASE_URL/SERVICE_ROLE_KEY unset)")
-
-    # Eager Postgres probe — when DATABASE_URL is set, attempt the pool
-    # connection ONCE at startup so an invalid DSN / wrong password fails
-    # loud + visible in the boot log instead of failing at first query
-    # later. NEVER raises out of this hook (broken Postgres must not
-    # block the app from booting against the SQLite fallback).
-    if engine_kind() == "postgres":
-        from app.database.pg_adapter import (
-            PostgresUnavailableError, pg_pool, pg_status,
-        )
-        try:
-            pool = await pg_pool()
-            # Cheap roundtrip — proves auth + network reachability.
-            async with pool.acquire() as conn:
-                version = await conn.fetchval("SELECT version()")
-            _app_log.info(
-                "postgres probe OK — pool ready, server reports: %s",
-                str(version)[:80],
-            )
-        except PostgresUnavailableError as e:
-            _app_log.warning(
-                "postgres probe FAILED — DATABASE_URL set but unreachable; "
-                "system continues on SQLite fallback: %s", e,
-            )
-        except Exception as e:
-            _app_log.warning(
-                "postgres probe FAILED — unexpected error; system continues "
-                "on SQLite fallback: %s: %s", type(e).__name__, e,
-            )
-        _app_log.info("postgres status after probe: %s", pg_status())
-    # Force the tool registry to bootstrap at boot. Any missing/extra tool
-    # will raise here and fail fast.
     registry = get_registry()
     _app_log.info("registry: %d tools registered: %s", len(registry.names), registry.names)
     _app_log.info("financial DB ready at %s", settings.financial_db_path)
 
-    # Bootstrap the vector vocabulary from the deterministic synonyms file.
-    # Today this is the main source of canonical entity names; later,
-    # uploads can extend the vocabulary with newly-seen Product/Party
-    # names. Wrapped in try/except so a vector-layer failure can never
-    # block FastAPI startup.
     try:
         syns = load_synonyms()
         if syns:
             n = register_vocabulary("entity", syns)
             _app_log.info(
-                "vector vocabulary bootstrapped: %d canonicals from synonyms.json",
-                n,
+                "vector vocabulary bootstrapped: %d canonicals from synonyms.json", n,
             )
     except Exception:
         _app_log.exception("vector vocabulary bootstrap failed (continuing without)")
 
-    # Surface DuckDB + Sentry status in the boot log so ops sees them
-    # without needing /health.
-    _app_log.info("duckdb: %s", duckdb_status())
     _app_log.info("sentry: %s", sentry_status())
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    """Release pooled clients (Supabase httpx, Postgres asyncpg, Redis).
-    Keep this cheap + best-effort — never raise out of shutdown, the
-    process is going down regardless."""
-    from app.cache import upstash_close
-    from app.cache.redis_client import redis_close
-    from app.database.pg_adapter import pg_close
-    from app.integrations import supabase_close
-    for label, fn in (
-        ("supabase", supabase_close),
-        ("upstash",  upstash_close),
-        ("postgres", pg_close),
-        ("redis",    redis_close),
-    ):
-        try:
-            await fn()
-        except Exception:
-            _app_log.exception("%s shutdown failed", label)
-
-
-# Direct execution is unsupported — use `python backend/main.py` (the entry shim).
+    """Single-user MVP — nothing to release."""
+    return

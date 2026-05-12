@@ -64,12 +64,7 @@ class TurnState(BaseModel):
     turn_id: str = Field(default_factory=lambda: str(uuid4()))
     question: str
     cache_key: str | None = None
-    # Per-conversation isolation. Threaded into the cache key, the
-    # conversation store, and (eventually) row-level tenant filters.
-    # All optional today — auth resolves user_id when present, frontend
-    # generates conversation_id per chat session.
-    user_id: str | None = None
-    tenant_id: str | None = None
+    # Single-user MVP — only conversation_id matters for follow-up continuity.
     conversation_id: str | None = None
 
     # Dispatch
@@ -563,11 +558,6 @@ class DatabaseArgs(BaseModel):
     batch_id: str | None = None
     source: str = "upload"
     file_name: str | None = None
-    # Multi-tenant attribution stamped onto inserted rows. Optional to
-    # preserve back-compat with legacy single-admin uploads (NULL is fine).
-    tenant_id: str | None = None
-    workspace_id: str | None = None
-    user_id: str | None = None
     sql: str | None = None
     params: list[Any] = Field(default_factory=list)
 
@@ -597,9 +587,6 @@ class DatabaseTool(Tool):
                 batch_id=args.batch_id,
                 source=args.source or "upload",
                 file_name=args.file_name,
-                tenant_id=args.tenant_id,
-                workspace_id=args.workspace_id,
-                user_id=args.user_id,
             )
             return ToolResult(
                 ok=True,
@@ -1355,9 +1342,7 @@ class EntityResolverTool(Tool):
         if not entities:
             from app.vector import hybrid_retrieve  # local import (cycle-safe)
             try:
-                matches = hybrid_retrieve(
-                    state.question, tenant_id=state.tenant_id, limit=3,
-                )
+                matches = hybrid_retrieve(state.question, limit=3)
             except Exception:
                 # Vector retrieval must NEVER break the analytics pipeline —
                 # log + continue with empty entities.
@@ -1515,15 +1500,6 @@ class SqlPlannerTool(Tool):
         return out
 
     @staticmethod
-    def _tenant_filter(state: TurnState) -> list[dict]:
-        """Return a tenant-scoping WHERE filter when state.tenant_id is set.
-        Empty list when not (legacy single-admin / unauth flows). New rows
-        and queries land in the same tenant slice; never see other tenants."""
-        if not state.tenant_id:
-            return []
-        return [{"col": "tenant_id", "op": "=", "value": state.tenant_id}]
-
-    @staticmethod
     def _date_window_filters(state: TurnState) -> list[dict]:
         time_window = state.time_window or {}
         return [
@@ -1567,8 +1543,7 @@ class SqlPlannerTool(Tool):
             select.append({"expr": 'SUM("Loyalty Redeemed")', "alias": "refunds"})
 
         where = (
-            self._tenant_filter(state)
-            + self._date_window_filters(state)
+            self._date_window_filters(state)
             + self._entity_filters(state)
         )
 
@@ -1620,8 +1595,7 @@ class SqlPlannerTool(Tool):
         # comparison evaluates to NULL (not TRUE) — no separate IS NOT
         # NULL clause needed.
         where = (
-            self._tenant_filter(state)
-            + self._date_window_filters(state)
+            self._date_window_filters(state)
             + self._entity_filters(state)
             + [{"col": group_col, "op": "!=", "value": ""}]
         )
@@ -2655,8 +2629,6 @@ class ToolRegistry:
         with instrument_tool(
             name,
             turn_id=state.turn_id,
-            user_id=state.user_id,
-            tenant_id=state.tenant_id,
             conversation_id=state.conversation_id,
         ):
             return await tool.execute(state, args)
@@ -2878,7 +2850,7 @@ def _check_missing_dimension(question_lower: str) -> dict[str, Any] | None:
     return None
 
 
-async def _has_any_uploaded_data(tenant_id: str | None = None) -> bool:
+async def _has_any_uploaded_data() -> bool:
     """Quick probe: does the user have any sales/purchase rows on file?
 
     Used by the intent classifier to bias ambiguous business-flavored
@@ -2886,25 +2858,12 @@ async def _has_any_uploaded_data(tenant_id: str | None = None) -> bool:
     error is treated as "data exists" so we never silently downgrade a
     real analytics question to chat just because the probe failed.
     """
-    # Tenant-scoped: when tenant_id is provided, only count rows belonging
-    # to that tenant. NULL tenant rows (legacy single-admin uploads) match
-    # the synthetic "legacy_admin" tenant id, so existing behaviour for
-    # the legacy path is preserved. With no tenant_id (legacy unauth flow),
-    # we count globally — that's the historical behaviour.
     try:
-        if tenant_id:
-            row = await fetch_one(
-                f'SELECT '
-                f'(SELECT COUNT(*) FROM {quoted("sales")} WHERE tenant_id = ?) '
-                f'+ (SELECT COUNT(*) FROM {quoted("purchase")} WHERE tenant_id = ?) AS n',
-                (tenant_id, tenant_id),
-            )
-        else:
-            row = await fetch_one(
-                f'SELECT '
-                f'(SELECT COUNT(*) FROM {quoted("sales")}) '
-                f'+ (SELECT COUNT(*) FROM {quoted("purchase")}) AS n'
-            )
+        row = await fetch_one(
+            f'SELECT '
+            f'(SELECT COUNT(*) FROM {quoted("sales")}) '
+            f'+ (SELECT COUNT(*) FROM {quoted("purchase")}) AS n'
+        )
     except Exception:
         return True
     return bool(row and int(row.get("n") or 0) > 0)
@@ -3047,48 +3006,36 @@ def _score_chat(
     return score, matches
 
 
-# --- Conversational continuity (per-(user, conversation_id) store) -------
-#
-# Previously this was a single module-level global `_LAST_KIND` — that was
-# a multi-user data-leak waiting to happen (two simultaneous logged-in users
-# would see each other's continuity context). Now we delegate to a
-# `ConversationStore` (in-memory by default; Redis-replaceable) keyed by
-# `make_conversation_key(user_id, conversation_id)`.
+# --- Conversational continuity (per-conversation_id, in-memory) -----------
+# Single-user MVP — one process, no concurrent users — so a module-level
+# dict keyed by conversation_id is safe.
 
-from app.infrastructure import (  # noqa: E402  re-export bridge
-    get_conversation_store,
-    make_conversation_key,
-)
+_LAST_KIND_BY_CONVO: dict[str, "QueryKind"] = {}
+_LAST_KIND_MAX = 1024
 
 
-def _get_last_kind(
-    user_id: str | None = None,
-    conversation_id: str | None = None,
-) -> QueryKind | None:
-    key = make_conversation_key(user_id, conversation_id)
-    return get_conversation_store().get_last_kind(key)  # type: ignore[return-value]
+def _convo_key(conversation_id: str | None) -> str:
+    return (conversation_id or "default").strip()
 
 
-def _set_last_kind(
-    kind: QueryKind,
-    user_id: str | None = None,
-    conversation_id: str | None = None,
-) -> None:
-    key = make_conversation_key(user_id, conversation_id)
-    get_conversation_store().set_last_kind(key, kind)
+def _get_last_kind(conversation_id: str | None = None) -> "QueryKind | None":
+    return _LAST_KIND_BY_CONVO.get(_convo_key(conversation_id))
 
 
-def _reset_last_kind(
-    user_id: str | None = None,
-    conversation_id: str | None = None,
-) -> None:
-    """Test hook + per-conversation reset. Without args clears EVERY
-    entry — the tests rely on this to start each case from a clean slate."""
-    if user_id is None and conversation_id is None:
-        get_conversation_store().reset()
+def _set_last_kind(kind: "QueryKind", conversation_id: str | None = None) -> None:
+    key = _convo_key(conversation_id)
+    if len(_LAST_KIND_BY_CONVO) >= _LAST_KIND_MAX and key not in _LAST_KIND_BY_CONVO:
+        # FIFO eviction.
+        first = next(iter(_LAST_KIND_BY_CONVO))
+        _LAST_KIND_BY_CONVO.pop(first, None)
+    _LAST_KIND_BY_CONVO[key] = kind
+
+
+def _reset_last_kind(conversation_id: str | None = None) -> None:
+    if conversation_id is None:
+        _LAST_KIND_BY_CONVO.clear()
     else:
-        key = make_conversation_key(user_id, conversation_id)
-        get_conversation_store().reset(key)
+        _LAST_KIND_BY_CONVO.pop(_convo_key(conversation_id), None)
 
 
 # --- The new classifier ---------------------------------------------------
@@ -3820,13 +3767,9 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
         "question": state.question,
     })
 
-    # Cache key now embeds (tenant_id, data_version, conversation_id, question)
-    # — see infrastructure.cache_key_for for the rationale. The legacy single-
-    # arg call site is preserved for back-compat (tests calling with no
-    # tenant); production paths thread the IDs.
+    # Cache key embeds (data_version, conversation_id, question).
     cache_key = cache_key_for(
         state.question,
-        tenant_id=state.tenant_id,
         conversation_id=state.conversation_id,
     )
     state = state.apply(cache_key=cache_key)
@@ -3866,17 +3809,17 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
     #   missing_data      → graceful "we don't track that" template (no SQL)
     #   general_knowledge → LLM with knowledge prompt (no SQL)
     #   chat              → LLM with greeter prompt (no SQL)
-    has_data = await _has_any_uploaded_data(tenant_id=state.tenant_id)
+    has_data = await _has_any_uploaded_data()
     # Conversation continuity is now per-(user, conversation_id), not global —
     # a second user's "and october" follow-up never inherits the first user's
     # context.
-    previous_kind = _get_last_kind(state.user_id, state.conversation_id)
+    previous_kind = _get_last_kind(state.conversation_id)
     kind, kind_conf, kind_hints = classify_query_kind(
         state.question,
         has_data=has_data,
         previous_kind=previous_kind,
     )
-    _set_last_kind(kind, state.user_id, state.conversation_id)
+    _set_last_kind(kind, state.conversation_id)
     _loop_log.info(
         "query.kind: kind=%s conf=%.2f a_score=%.2f c_score=%.2f "
         "has_data=%s prev=%s patterns=%s reason=%s question=%r",
@@ -4352,21 +4295,10 @@ class DashboardAgent:
         self,
         *,
         month: str | None = None,
-        tenant_id: str | None = None,
     ) -> dict[str, Any]:
-        """Build the dashboard payload. When `tenant_id` is provided, every
-        query is scoped to that tenant (multi-user safety). When None,
-        falls back to no-scope behaviour for legacy single-admin
-        deployments."""
-        # Step 1 — DatabaseReader (read-only via Database tool).
-        # Build a tenant-aware WHERE — three combinations of (month, tenant)
-        # need to be handled cleanly. SQL-fragment building is verbose but
-        # keeps the parameter binding explicit.
+        """Build the dashboard payload."""
         where_parts: list[str] = []
         params: list[Any] = []
-        if tenant_id:
-            where_parts.append("tenant_id = ?")
-            params.append(tenant_id)
         if month is not None:
             if not (len(month) == 7 and month[4] == "-"):
                 raise ValueError(f"invalid month format: {month!r}")
@@ -4436,7 +4368,7 @@ class DashboardAgent:
         # filtered at the SQL layer so a malformed row can never poison a
         # bucket.
         monthly_sales_pie = await self._aggregate_monthly_sales_pie(
-            registry, dummy_state, tenant_id=tenant_id,
+            registry, dummy_state,
         )
 
         return {
@@ -4452,47 +4384,10 @@ class DashboardAgent:
 
     @staticmethod
     async def _aggregate_monthly_sales_pie(
-        registry: Any, dummy_state: TurnState, *, tenant_id: str | None = None,
+        registry: Any, dummy_state: TurnState,
     ) -> list[dict[str, Any]]:
         """SQL GROUP BY year-month → SUM(Total Amount). Returns chronologically
-        sorted [{"month": "Jan 2025", "sales": 120000.0}, ...]. Empty list when
-        there are no aggregable rows.
-
-        Performance: when DUCKDB_ENABLED is true (the default), we route this
-        aggregation through DuckDB which scans the SQLite source via the
-        `sqlite_scanner` extension and produces vectorised GROUP BY orders
-        of magnitude faster than SQLite's nested-loop aggregation on large
-        datasets. On any DuckDB error the SQLite fallback runs, so an
-        attached-catalog failure is never user-visible. Identical output
-        shape — verified against SQLite via test_acceleration_*.py."""
-        from app.infrastructure import settings as _settings
-        if _settings.duckdb_enabled:
-            try:
-                from app.analytics_acceleration import (
-                    get_duckdb_engine, monthly_sales_distribution,
-                )
-                engine = get_duckdb_engine()
-                fast = await monthly_sales_distribution(
-                    engine, table="sales", tenant_id=tenant_id,
-                )
-                _dashboard_log.info(
-                    "DashboardAgent monthly_sales_pie via DuckDB rows=%d tenant=%s",
-                    len(fast), tenant_id or "<none>",
-                )
-                return fast
-            except Exception:
-                _dashboard_log.warning(
-                    "DuckDB pie aggregation failed; falling back to SQLite",
-                    exc_info=True,
-                )
-        # Tenant scoping: when tenant_id is provided, only that tenant's
-        # rows participate in the aggregation. Empty tenant = legacy
-        # single-admin behaviour (count everything).
-        tenant_clause = ""
-        pie_params: list[Any] = []
-        if tenant_id:
-            tenant_clause = "  AND tenant_id = ? "
-            pie_params.append(tenant_id)
+        sorted [{"month": "Jan 2025", "sales": 120000.0}, ...]."""
         pie_sql = (
             f'SELECT '
             f'  substr("Date", 1, 7) AS ym, '
@@ -4501,14 +4396,13 @@ class DashboardAgent:
             f'WHERE "Date" IS NOT NULL '
             f'  AND "Date" GLOB \'????-??-??\' '
             f'  AND "Total Amount" IS NOT NULL '
-            f'{tenant_clause}'
             f'GROUP BY ym '
             f'ORDER BY ym ASC'
         )
         _dashboard_log.info("DashboardAgent monthly_sales_pie aggregation start")
         pie_result = await registry.execute(
             "Database",
-            {"op": "select", "pin": READ_PIN, "sql": pie_sql, "params": pie_params},
+            {"op": "select", "pin": READ_PIN, "sql": pie_sql, "params": []},
             dummy_state,
         )
         if not pie_result.ok:
@@ -4717,9 +4611,6 @@ class DataCleanAgent:
         filename: str,
         target: str,
         batch_id: str | None = None,
-        tenant_id: str | None = None,
-        workspace_id: str | None = None,
-        user_id: str | None = None,
     ) -> dict[str, Any]:
         if target not in ALLOWED_TABLES:
             raise UploadError(f"target must be one of {ALLOWED_TABLES!r}")
@@ -4790,9 +4681,6 @@ class DataCleanAgent:
                 "batch_id":     batch_id,
                 "source":       "upload",
                 "file_name":    filename,
-                "tenant_id":    tenant_id,
-                "workspace_id": workspace_id,
-                "user_id":      user_id,
             },
             dummy_state,
         )
