@@ -124,6 +124,57 @@ def _rate_limit_check(
 api_router = APIRouter()
 
 
+# ---------------------------------------------------------------------------
+# Google upload / Drive integration stubs
+#
+# The app itself has no startup login. These routes ONLY exist for the
+# "Connect Google Drive" card on the Upload page. They return clean JSON
+# stubs so the frontend's status check (`/auth/me`) and OAuth/sync calls
+# never 404. Wire real Google OAuth + Drive API logic into these when you
+# implement the integration.
+# ---------------------------------------------------------------------------
+
+@api_router.get("/auth/me")
+async def auth_me() -> dict:
+    """Google upload auth status. Single-user MVP — always 'not connected'
+    until real OAuth is wired in."""
+    return {"authenticated": False, "google_configured": False}
+
+
+@api_router.post("/auth/logout")
+async def auth_logout() -> dict:
+    """Clear any Drive OAuth tokens. No-op until OAuth is implemented."""
+    return {"ok": True}
+
+
+def _drive_not_implemented() -> JSONResponse:
+    return JSONResponse(
+        status_code=501,
+        content=envelope(
+            "Google Drive integration not yet implemented",
+            detail="Connect-with-Google + Drive sync are UI scaffolding. "
+                   "Wire OAuth + Drive API in core_system.py to enable.",
+            kind="not_implemented",
+        ),
+    )
+
+
+@api_router.get("/auth/google/login")
+async def google_login(): return _drive_not_implemented()
+
+
+@api_router.get("/auth/google/callback")
+async def google_callback(): return _drive_not_implemented()
+
+
+@api_router.post("/drive/sync")
+async def drive_sync(): return _drive_not_implemented()
+
+
+@api_router.get("/drive/status")
+async def drive_status(): return _drive_not_implemented()
+
+
 @api_router.get("/health")
 async def health() -> dict:
     return {

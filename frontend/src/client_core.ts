@@ -187,6 +187,40 @@ export interface SseEvent {
   data: unknown
 }
 
+// Google upload/Drive integration types (separate from app login — used
+// only by the "Connect Google Drive" UI on the Upload page).
+export interface AuthMe {
+  authenticated: boolean
+  username?: string
+  email?: string
+  name?: string
+  picture?: string
+  google_configured?: boolean
+}
+
+export interface DriveImportDetail {
+  file: string
+  status: string
+  rows?: number
+  batch_id?: string
+  file_id?: string
+  mime_type?: string
+  error?: string
+}
+
+export interface DriveSyncResult {
+  ok: boolean
+  discovered: number
+  imported: number
+  rows_inserted: number
+  skipped_already: number
+  skipped_too_large: number
+  failed: number
+  details: DriveImportDetail[]
+  error?: string
+  kind?: string
+}
+
 // ---------------------------------------------------------------------------
 // 2. Class-name helper
 // ---------------------------------------------------------------------------
@@ -368,6 +402,22 @@ export async function disconnectUpload(batchId: string): Promise<DisconnectRespo
 export async function fetchDashboard(month?: string): Promise<DashboardData> {
   const q = month ? `?month=${encodeURIComponent(month)}` : ''
   return apiGet<DashboardData>(`/dashboard${q}`)
+}
+
+// Google upload/Drive helpers — only used by the Upload page's "Connect
+// Google Drive" card. These are independent of any app-startup login.
+export const googleLoginUrl = (): string => `${BASE_URL}/auth/google/login`
+
+export async function fetchAuthMe(): Promise<AuthMe> {
+  return apiGet<AuthMe>('/auth/me')
+}
+
+export async function logout(): Promise<{ ok: boolean }> {
+  return apiPost<{ ok: boolean }>('/auth/logout')
+}
+
+export async function syncDrive(): Promise<DriveSyncResult> {
+  return apiPost<DriveSyncResult>('/drive/sync')
 }
 
 export async function streamAIQuery(
