@@ -1,6 +1,6 @@
-"""core_system — FastAPI app, every HTTP route, single-user auth, startup hook.
+"""core_system — FastAPI app, every HTTP route, startup hook.
 
-Single-user MVP — no tenants, no workspaces, no cloud integrations.
+Single-user local-first MVP — NO AUTHENTICATION. The app opens directly.
 
 Run from the project root:
     python backend/main.py
@@ -10,21 +10,18 @@ or:
 from __future__ import annotations
 
 import asyncio
-import base64
 import collections
-import hashlib
-import hmac
 import logging
 import os
 import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from uuid import uuid4
 
 from fastapi import (
-    APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile,
+    APIRouter, FastAPI, File, Form, Request, UploadFile,
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -71,176 +68,7 @@ log = logging.getLogger("agentic_ai.api")
 
 
 # ===========================================================================
-# 1. AUTH — single admin from env, HMAC-signed bearer token
-# ===========================================================================
-#
-# Token format: base64url(payload).hex(hmac_sha256(secret, payload))
-# where payload = "<username>:<expiry_unix_ts>"
-#
-# Credentials come from ADMIN_USERNAME + ADMIN_PASSWORD env vars. If either
-# is empty the login endpoint returns 401 (fail-closed).
-
-_auth_log = logging.getLogger("agentic_ai.auth")
-
-
-def _b64url_encode(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
-
-
-def _b64url_decode(s: str) -> bytes:
-    pad = "=" * (-len(s) % 4)
-    return base64.urlsafe_b64decode((s + pad).encode("ascii"))
-
-
-def _sign(payload: str) -> str:
-    return hmac.new(
-        settings.auth_token_secret.encode("utf-8"),
-        payload.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-
-def create_token(username: str) -> tuple[str, str]:
-    expiry = int(time.time() + settings.auth_token_ttl_hours * 3600)
-    payload = f"{username}:{expiry}"
-    sig = _sign(payload)
-    encoded = _b64url_encode(payload.encode("utf-8"))
-    return f"{encoded}.{sig}", str(expiry)
-
-
-def verify_token(token: Optional[str]) -> Optional[str]:
-    if not token or "." not in token:
-        return None
-    try:
-        b64, sig = token.split(".", 1)
-        payload = _b64url_decode(b64).decode("utf-8")
-        username, expiry_s = payload.split(":")
-        expiry = int(expiry_s)
-        expected = _sign(payload)
-        if not hmac.compare_digest(sig, expected):
-            return None
-        if time.time() > expiry:
-            return None
-        return username
-    except Exception:
-        return None
-
-
-def credentials_match(username: str, password: str) -> bool:
-    if not settings.admin_username or not settings.admin_password:
-        return False
-    if not username or not password:
-        return False
-    return (
-        hmac.compare_digest(username, settings.admin_username)
-        and hmac.compare_digest(password, settings.admin_password)
-    )
-
-
-def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
-    if not authorization:
-        return None
-    parts = authorization.split(" ", 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        return None
-    return parts[1].strip() or None
-
-
-async def require_auth(
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
-) -> str:
-    """Dependency: returns the username, raises 401 on missing/invalid token."""
-    token = _extract_bearer(authorization)
-    user = verify_token(token)
-    if user is None:
-        raise HTTPException(
-            status_code=401,
-            detail=envelope(
-                "Authentication required",
-                detail="Send `Authorization: Bearer <token>` after logging in via /auth/login.",
-                kind="auth",
-            ),
-        )
-    return user
-
-
-def try_auth(authorization: Optional[str]) -> Optional[str]:
-    """Non-raising variant for /auth/me."""
-    return verify_token(_extract_bearer(authorization))
-
-
-# ===========================================================================
-# 2. AUTH ROUTES
-# ===========================================================================
-
-auth_router = APIRouter(prefix="/auth", tags=["auth"])
-
-
-class LoginRequest(BaseModel):
-    username: str = Field(..., min_length=1, max_length=200)
-    password: str = Field(..., min_length=1, max_length=200)
-
-
-@auth_router.post("/login")
-async def auth_login(req: LoginRequest, request: Request):
-    """Single-admin login. Rate-limited by IP."""
-    rl = _rate_limit_check(_client_ip(request), bucket_namespace="auth", limit_per_minute=10)
-    if rl is not None:
-        return JSONResponse(status_code=429, content=rl)
-
-    if not credentials_match(req.username, req.password):
-        _auth_log.warning("login failed for username=%r", req.username)
-        return JSONResponse(
-            status_code=401,
-            content=envelope("Invalid credentials", kind="auth"),
-        )
-
-    token, expiry = create_token(req.username)
-    _auth_log.info("login ok username=%s", req.username)
-    return {
-        "token": token,
-        "expires_at": expiry,
-        "user": {"username": req.username},
-    }
-
-
-@auth_router.get("/me")
-async def auth_me(authorization: Optional[str] = Header(default=None)):
-    """Return current user info, or {authenticated: false}."""
-    user = try_auth(authorization)
-    if user is None:
-        return {"authenticated": False}
-    return {
-        "authenticated": True,
-        "user": {"username": user},
-    }
-
-
-@auth_router.post("/logout")
-async def auth_logout():
-    """Client should drop the token. Server is stateless."""
-    return {"ok": True}
-
-
-# Stubs for disabled OAuth/Drive endpoints — return 501 so the frontend can
-# render "feature disabled" without breaking.
-def _disabled() -> JSONResponse:
-    return JSONResponse(
-        status_code=501,
-        content=envelope("Feature disabled in MVP", kind="not_implemented"),
-    )
-
-
-@auth_router.get("/google/login")
-async def google_login(): return _disabled()
-
-
-@auth_router.get("/google/callback")
-async def google_callback(): return _disabled()
-
-
-# ===========================================================================
-# 3. RATE LIMITER — in-memory token bucket
+# 1. RATE LIMITER — in-memory token bucket (keyed by client IP)
 # ===========================================================================
 
 _RATE_LOCK = threading.Lock()
@@ -290,7 +118,7 @@ def _rate_limit_check(
 
 
 # ===========================================================================
-# 4. API ROUTES
+# 2. API ROUTES — all public, no auth
 # ===========================================================================
 
 api_router = APIRouter()
@@ -300,7 +128,7 @@ api_router = APIRouter()
 async def health() -> dict:
     return {
         "status": "ok",
-        "version": "3.0.0-mvp",
+        "version": "3.1.0-no-auth",
         "data_version": get_data_version(),
         "cache": {
             "kind": "json_file",
@@ -317,15 +145,14 @@ async def health() -> dict:
 # /upload  (DataCleanAgent)
 # ---------------------------------------------------------------------------
 
-@api_router.post("/upload", dependencies=[Depends(require_auth)])
+@api_router.post("/upload")
 async def upload(
     request: Request,
     file: UploadFile = File(...),
     target: str = Form("sales"),
-    auth_user: str = Depends(require_auth),
 ):
     upload_log = logging.getLogger("agentic_ai.api.upload")
-    rl = _rate_limit_check(auth_user, bucket_namespace="upload", limit_per_minute=5)
+    rl = _rate_limit_check(_client_ip(request), bucket_namespace="upload", limit_per_minute=5)
     if rl is not None:
         return JSONResponse(status_code=429, content=rl)
 
@@ -469,7 +296,7 @@ async def upload(
 # /dashboard
 # ---------------------------------------------------------------------------
 
-@api_router.get("/dashboard", dependencies=[Depends(require_auth)])
+@api_router.get("/dashboard")
 async def dashboard(month: str | None = None):
     if month is not None and (len(month) != 7 or month[4] != "-"):
         return JSONResponse(status_code=400, content=envelope(
@@ -496,7 +323,7 @@ async def dashboard(month: str | None = None):
 # /uploads — metadata listing + dataset removal
 # ---------------------------------------------------------------------------
 
-@api_router.get("/uploads", dependencies=[Depends(require_auth)])
+@api_router.get("/uploads")
 async def uploads():
     return {
         "uploads": await list_uploads_meta(),
@@ -507,7 +334,7 @@ async def uploads():
     }
 
 
-@api_router.post("/uploads/{batch_id}/disconnect", dependencies=[Depends(require_auth)])
+@api_router.post("/uploads/{batch_id}/disconnect")
 async def upload_disconnect(batch_id: str):
     if not batch_id or len(batch_id) > 64:
         return JSONResponse(status_code=400, content=envelope(
@@ -536,7 +363,7 @@ async def upload_disconnect(batch_id: str):
 # /cache/clear
 # ---------------------------------------------------------------------------
 
-@api_router.post("/cache/clear", dependencies=[Depends(require_auth)])
+@api_router.post("/cache/clear")
 async def cache_clear():
     n = invalidate_all()
     new_version = bump_data_version()
@@ -564,7 +391,7 @@ def _validate_pre_stream(req: QueryRequest, api_key: str) -> dict[str, Any] | No
     if not api_key:
         return envelope(
             "Missing Groq API key",
-            detail="Send `X-Groq-Api-Key` header or set `GROQ_API_KEY`.",
+            detail="Set `GROQ_API_KEY` in backend/.env or send `X-Groq-Api-Key` header.",
             kind="auth",
         )
     if any(c.isspace() for c in api_key):
@@ -676,12 +503,8 @@ def _stream_response(
     )
 
 
-@api_router.post("/query_stream", dependencies=[Depends(require_auth)])
-async def query_stream(
-    req: QueryRequest,
-    request: Request,
-    auth_user: str = Depends(require_auth),
-):
+@api_router.post("/query_stream")
+async def query_stream(req: QueryRequest, request: Request):
     api_key = _resolve_groq_key(request)
     emitter = EventEmitter()
     pre_error = _validate_pre_stream(req, api_key)
@@ -689,7 +512,7 @@ async def query_stream(
         _safe_create_task(_emit_pre_stream_error(emitter, pre_error))
         return _stream_response(emitter)
 
-    rate_error = _rate_limit_check(auth_user)
+    rate_error = _rate_limit_check(_client_ip(request))
     if rate_error is not None:
         _safe_create_task(_emit_pre_stream_error(emitter, rate_error))
         return _stream_response(emitter)
@@ -709,7 +532,7 @@ async def query_stream(
 
 
 # ===========================================================================
-# 5. FASTAPI APP — middleware, exception handlers, startup
+# 3. FASTAPI APP — middleware, exception handlers, startup
 # ===========================================================================
 
 def configure_logging(level: int = logging.INFO) -> None:
@@ -728,8 +551,8 @@ init_sentry()
 
 app = FastAPI(
     title="Agentic AI",
-    description="Local-first single-user analytics over uploaded financial data.",
-    version="3.0.0-mvp",
+    description="Local-first single-user analytics — no authentication.",
+    version="3.1.0-no-auth",
 )
 
 app.add_middleware(
@@ -742,7 +565,6 @@ app.add_middleware(
 )
 
 app.include_router(api_router)
-app.include_router(auth_router)
 
 instrument_fastapi(app)
 
@@ -809,9 +631,9 @@ async def _startup() -> None:
         _app_log.exception("vector vocabulary bootstrap failed (continuing without)")
 
     _app_log.info("sentry: %s", sentry_status())
+    _app_log.info("auth: DISABLED — all routes public")
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    """Single-user MVP — nothing to release."""
     return

@@ -31,7 +31,6 @@ import {
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
-  Cloud,
   Eye,
   EyeOff,
   FileSpreadsheet,
@@ -72,18 +71,13 @@ import {
   ApiError,
   cn,
   disconnectUpload,
-  fetchAuthMe,
   fetchDashboard,
   fetchUploadsList,
-  googleLoginUrl,
-  logout,
   streamAIQuery,
-  syncDrive,
   uploadSales,
   useAppStore,
 } from '@/client_core'
 import type {
-  AuthMe,
   ChartKind,
   ChatMessage,
   DashboardData,
@@ -1470,91 +1464,8 @@ export function UploadData() {
   const [error, setError] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
-  const [auth, setAuth] = useState<AuthMe | null>(null)
-  const [driveSyncing, setDriveSyncing] = useState(false)
   const [uploadsRefreshKey, setUploadsRefreshKey] = useState(0)
   const refreshUploadsList = () => setUploadsRefreshKey((k) => k + 1)
-  const [driveNote, setDriveNote] = useState<string | null>(null)
-  const [driveError, setDriveError] = useState<string | null>(null)
-  const autoSyncRanRef = useRef(false)
-
-  // Load auth status on mount.
-  useEffect(() => {
-    void (async () => {
-      try {
-        setAuth(await fetchAuthMe())
-      } catch {
-        setAuth({ authenticated: false })
-      }
-    })()
-  }, [])
-
-  // Pick up the OAuth-callback signal and auto-sync once.
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search)
-    const status = params.get('drive')
-    const err = params.get('drive_error')
-    if (err) setDriveError(`Google sign-in failed: ${err}`)
-    if (status === 'connected' && !autoSyncRanRef.current) {
-      autoSyncRanRef.current = true
-      void doSync()
-    }
-    if (err || status) {
-      params.delete('drive')
-      params.delete('drive_error')
-      params.delete('detail')
-      const clean = window.location.pathname + (params.toString() ? `?${params}` : '')
-      window.history.replaceState({}, '', clean)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  const doSync = async () => {
-    setDriveSyncing(true)
-    setDriveError(null)
-    setDriveNote(null)
-    try {
-      const result = await syncDrive()
-      setDriveNote(
-        `Imported ${result.imported} file${result.imported === 1 ? '' : 's'} (${result.rows_inserted.toLocaleString('en-IN')} rows).` +
-          (result.skipped_already ? ` ${result.skipped_already} already in DB.` : '') +
-          (result.failed ? ` ${result.failed} failed.` : ''),
-      )
-      const lastImported = result.details.find((d) => d.status === 'imported')
-      if (lastImported && typeof lastImported.rows === 'number') {
-        setDataset({
-          name: lastImported.file,
-          rows: lastImported.rows,
-          uploadedAt: new Date().toISOString(),
-          source: 'drive',
-        })
-      }
-      setAuth(await fetchAuthMe())
-      refreshUploadsList()
-    } catch (e) {
-      if (e instanceof ApiError) {
-        const body = e.detail as { detail?: string; error?: string } | undefined
-        setDriveError(body?.detail ?? body?.error ?? e.message)
-      } else if (e instanceof Error) {
-        setDriveError(e.message)
-      } else {
-        setDriveError('Drive sync failed.')
-      }
-    } finally {
-      setDriveSyncing(false)
-    }
-  }
-
-  const doLogout = async () => {
-    if (!confirm('Sign out of Google? Stored Drive tokens will be removed.')) return
-    try {
-      await logout()
-      setAuth({ authenticated: false })
-      setDriveNote(null)
-    } catch {
-      /* noop */
-    }
-  }
 
   const onPick = (f: File) => {
     setError(null)
@@ -1605,12 +1516,11 @@ export function UploadData() {
       <PageHeader
         icon={<Upload className="w-5 h-5 text-emerald-400" />}
         title="Upload Data"
-        subtitle="Bring in your transactions. CSV/Excel from disk, or connect a Google Drive folder for continuous sync."
+        subtitle="Bring in your transactions. CSV or Excel from your device."
       />
 
-      <div className="mt-8 grid md:grid-cols-2 gap-5">
-        {/* Option A: file from device */}
-        <section className="card p-6">
+      <div className="mt-8">
+        <section className="card p-6 max-w-2xl">
           <div className="flex items-center gap-2 mb-1">
             <FileSpreadsheet className="w-4 h-4 text-zinc-400" />
             <h2 className="font-medium text-sm">From device</h2>
@@ -1665,62 +1575,6 @@ export function UploadData() {
             {busy ? 'Uploading…' : 'Upload'}
           </button>
         </section>
-
-        {/* Option B: Google Drive */}
-        <section className="card p-6">
-          <div className="flex items-center gap-2 mb-1">
-            <Cloud className="w-4 h-4 text-zinc-400" />
-            <h2 className="font-medium text-sm">Connect Google Drive</h2>
-          </div>
-          <p className="text-xs text-zinc-500 mb-5">
-            Pick a folder; new files in it will be synced automatically.
-          </p>
-
-          {!auth?.authenticated ? (
-            <a
-              href={googleLoginUrl()}
-              className="w-full flex items-center justify-center gap-3 bg-white text-zinc-900 hover:bg-zinc-100 font-medium rounded-lg px-4 py-2.5 text-sm transition-colors"
-            >
-              <GoogleGlyph className="w-4 h-4" />
-              <span>Continue with Google</span>
-            </a>
-          ) : (
-            <button
-              type="button"
-              onClick={doSync}
-              disabled={driveSyncing}
-              className="btn btn-primary w-full"
-            >
-              <RefreshCw className={driveSyncing ? 'w-4 h-4 animate-spin' : 'w-4 h-4'} />
-              {driveSyncing ? 'Syncing…' : 'Sync Drive now'}
-            </button>
-          )}
-
-          {driveNote && (
-            <p className="text-[11px] text-zinc-500 mt-4 leading-relaxed">{driveNote}</p>
-          )}
-          {driveError && (
-            <p className="text-[11px] text-red-400 mt-4 leading-relaxed">{driveError}</p>
-          )}
-          {!driveNote && !driveError && (
-            <p className="text-[11px] text-zinc-500 mt-4 leading-relaxed">
-              {auth?.authenticated ? (
-                <>
-                  Signed in as {auth.email}.{' '}
-                  <button
-                    type="button"
-                    onClick={doLogout}
-                    className="text-zinc-400 hover:text-zinc-200 underline underline-offset-2"
-                  >
-                    Sign out
-                  </button>
-                </>
-              ) : (
-                'Read-only access to drive.readonly. Already-imported files are skipped.'
-              )}
-            </p>
-          )}
-        </section>
       </div>
 
       {!apiKeySet && (
@@ -1754,29 +1608,6 @@ export function UploadData() {
         />
       </div>
     </div>
-  )
-}
-
-function GoogleGlyph({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 24 24" className={className} aria-hidden>
-      <path
-        fill="#4285F4"
-        d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.75h3.57c2.08-1.92 3.28-4.74 3.28-8.07z"
-      />
-      <path
-        fill="#34A853"
-        d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.75c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
-      />
-      <path
-        fill="#FBBC05"
-        d="M5.84 14.12c-.22-.66-.35-1.36-.35-2.12s.13-1.46.35-2.12V7.04H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.96l3.66-2.84z"
-      />
-      <path
-        fill="#EA4335"
-        d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.04l3.66 2.84C6.71 7.31 9.14 5.38 12 5.38z"
-      />
-    </svg>
   )
 }
 

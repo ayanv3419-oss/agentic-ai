@@ -100,13 +100,6 @@ class Settings(BaseSettings):
     sentry_profiles_sample_rate:   float = Field(default=0.0, alias="SENTRY_PROFILES_SAMPLE_RATE")
     sentry_send_default_pii:       bool = Field(default=False, alias="SENTRY_SEND_DEFAULT_PII")
 
-    # --- Single-user login ----------------------------------------------
-    # Empty defaults = login disabled (fail-closed). Set in .env to enable.
-    admin_username:       str = Field(default="", alias="ADMIN_USERNAME")
-    admin_password:       str = Field(default="", alias="ADMIN_PASSWORD")
-    auth_token_secret:    str = Field(default="dev-auth-secret-CHANGE-ME", alias="AUTH_TOKEN_SECRET")
-    auth_token_ttl_hours: int = Field(default=24 * 7, alias="AUTH_TOKEN_TTL_HOURS")
-
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.financial_db_path = _abs(self.financial_db_path)
