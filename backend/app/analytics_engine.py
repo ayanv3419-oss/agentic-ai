@@ -558,6 +558,7 @@ class DatabaseArgs(BaseModel):
     batch_id: str | None = None
     source: str = "upload"
     file_name: str | None = None
+    row_hashes: list[str] | None = None
     sql: str | None = None
     params: list[Any] = Field(default_factory=list)
 
@@ -587,6 +588,7 @@ class DatabaseTool(Tool):
                 batch_id=args.batch_id,
                 source=args.source or "upload",
                 file_name=args.file_name,
+                row_hashes=args.row_hashes,
             )
             return ToolResult(
                 ok=True,
@@ -3357,40 +3359,206 @@ async def select_sub_agent(question: str) -> tuple[str, str, dict]:
 
 _chat_log = logging.getLogger("agentic_ai.coordinator.chat")
 
-_CHAT_SYSTEM_PROMPT = """You are Agentic AI — a friendly assistant for a small-business analytics product.
+_CHAT_SYSTEM_PROMPT = """You are Agentic AI — a STRICTLY business-only analytics assistant.
 
-Reply briefly and warmly to greetings, small talk, and general questions.
+Rules (non-negotiable):
+  • This is NOT a general-purpose chatbot.
+  • Reply with 1 short sentence to greetings ("hi", "hello", "thanks", "ok").
+  • For ANY other question — including general knowledge, science, history,
+    geography, programming, entertainment, politics, personal advice,
+    tutoring, or random conversation — refuse with EXACTLY this message,
+    verbatim, no additions, no suggestions, no educational explanation:
 
-If the user asks about their sales, purchases, dashboard, customers, orders,
-or any other business data, gently say "Ask me a specific data question and
-I'll run it through the analytics pipeline." Do NOT invent numbers or
-fabricate any business data.
+    "This question is not related to your business data or platform
+    operations. Please ask questions related to sales, inventory, KPIs,
+    reports, analytics, forecasting, or other business modules only."
 
-Keep responses to 1–3 short sentences unless explicitly asked for more.
+  • Never explain topics outside the platform's business analytics scope.
+  • Never connect the topic back to business — just refuse.
+  • Never invent numbers, dates, or any business data.
+  • Never apologize at length or hedge. Two-sentence refusal, period.
 """
 
 
-# Used when the user asks a general business / definitions / how-to
-# question that isn't a data lookup. The LLM is allowed to answer
-# substantively with its general knowledge — but is NEVER allowed to
-# invent numbers about the user's specific business.
-_GENERAL_KNOWLEDGE_PROMPT = """You are Agentic AI — an analytics assistant
-for a small-business owner. The user has asked a general business
-question (definition, advice, or how-to) that is NOT a data lookup.
+# Single canonical refusal message used by the deterministic restriction
+# handler. Surfaced verbatim on every general_knowledge / off-topic query.
+# NEVER adds educational explanation, suggestions, conversational filler,
+# or attempts to connect the topic back to business. Two sentences, period.
+RESTRICTION_REFUSAL = (
+    "This question is not related to your business data or platform "
+    "operations. Please ask questions related to sales, inventory, KPIs, "
+    "reports, analytics, forecasting, or other business modules only."
+)
 
-Answer concisely (3–5 sentences) using your general knowledge. Be
-practical and grounded. Use plain language; assume the reader is a
-busy shopkeeper, not an MBA student.
+# Tight whitelist of pure-greeting tokens. Any chat-classified question
+# NOT in this set is treated as off-topic and refused deterministically.
+# This is the security floor — even if the chat LLM is jailbroken at the
+# prompt layer, anything beyond a literal greeting word never reaches it.
+_GREETING_TOKENS = frozenset({
+    "hi", "hii", "hiii", "hello", "helloo", "hey", "heya",
+    "yo", "sup", "hola", "namaste",
+    "thanks", "thx", "ty", "thankyou", "thank",
+    "ok", "okay", "okk", "okayy", "k",
+    "bye", "goodbye", "cya",
+    "gm", "gn", "good", "morning", "evening", "night", "afternoon",
+})
 
-CRITICAL RULES:
-  • Do NOT invent or estimate any numbers about the user's specific
-    business. You do not have access to their data here.
-  • Do NOT pretend to compute results for them.
-  • If the answer would benefit from looking at their actual data,
-    end with one short suggestion such as: "If you'd like, I can also
-    analyse your sales for X."
-  • Stay focused on the question asked — no marketing pitch.
-"""
+# Short canned greeting reply — keeps the response deterministic + free.
+_GREETING_REPLY = (
+    "Hi! I'm your business analytics assistant. Ask me about your sales, "
+    "purchases, KPIs, top customers/products, trends, or any other "
+    "question about your uploaded data."
+)
+
+
+def _format_currency(v: float | int) -> str:
+    """Indian-style currency formatting; falls back to plain numeric."""
+    try:
+        return f"₹{float(v):,.2f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _format_value_for_user(v: Any, output_type: str) -> str:
+    if v is None:
+        return "no data"
+    try:
+        if output_type == "currency":
+            return _format_currency(v)
+        if output_type == "percent":
+            return f"{float(v):.2f}%"
+        if output_type == "count":
+            return f"{int(v):,}"
+        if output_type == "ratio":
+            return f"{float(v):.2f}"
+    except (TypeError, ValueError):
+        pass
+    return str(v)
+
+
+def _narrate_kpi(kpi_result) -> str:
+    """Executive-style one-to-two-sentence narrative for a KPI result.
+
+    Pure template — no LLM. Sanitizes labels by stripping internal
+    parenthetical suffixes (e.g. "(v2)", "(latest dataset day)").
+
+    NEVER mentions formulas, SQL, internal column names, or implementation
+    details. Output is what an executive expects to read in a chat bubble.
+    """
+    from app.kpi.engine import _strip_internal_suffix
+
+    label = _strip_internal_suffix(kpi_result.label or "this metric")
+    category = (kpi_result.category or "").lower()
+    output_type = (kpi_result.output_type or "").lower()
+    v = kpi_result.value
+    rows = kpi_result.rows or []
+
+    if kpi_result.error:
+        return (
+            "I couldn't compute that metric — please make sure your data is "
+            "uploaded and try again."
+        )
+
+    # --- list output: top-N or distribution ---
+    if output_type == "list":
+        if not rows:
+            # Graceful fallback: surface what IS known from the data instead
+            # of a flat "no data" message. The categorization gives the user
+            # a clear next step without exposing internals.
+            if category == "inventory":
+                return (
+                    f"No items currently flagged here. Inventory looks healthy "
+                    f"for the moment based on recent sales velocity."
+                )
+            if category == "forecast":
+                return (
+                    f"No projection available — this becomes accurate after "
+                    f"more sales history accumulates."
+                )
+            if category == "hierarchy_v2":
+                return (
+                    f"No products in this segment have generated sales yet. "
+                    f"Try a different segment or upload broader data."
+                )
+            return (
+                f"No products show activity for this view yet — try a wider "
+                f"window or category."
+            )
+        # Top-N style (label + value rows)
+        if "label" in rows[0] and "value" in rows[0]:
+            # Filter out entirely-empty rows (zero value).
+            non_zero = [r for r in rows if (r.get("value") or 0) != 0]
+            if not non_zero:
+                return (
+                    f"No products show activity for this view yet. "
+                    f"Try a wider time range or different segment."
+                )
+            top = non_zero[0]
+            top_label = top["label"] or "(unnamed)"
+            top_val_fmt = _format_currency(top["value"])
+            if len(non_zero) == 1:
+                return f"{label}: {top_label}, contributing {top_val_fmt}."
+            second = non_zero[1] if len(non_zero) > 1 else None
+            if second:
+                return (
+                    f"{label}: {top_label} leads with {top_val_fmt}, "
+                    f"followed by {second['label']}."
+                )
+            return f"{label}: {top_label} leads with {top_val_fmt}."
+        # Multi-column distribution (e.g. payment methods)
+        # Find the column with the largest single value
+        best_key = best_val = None
+        first = rows[0]
+        for k, vv in first.items():
+            try:
+                fv = float(vv)
+                if best_val is None or fv > best_val:
+                    best_val = fv
+                    best_key = k
+            except (TypeError, ValueError):
+                continue
+        if best_key is not None:
+            return (
+                f"{label} is led by {best_key} at {_format_currency(best_val)}."
+            )
+        return f"{label} is available."
+
+    # --- scalar output ---
+    formatted = _format_value_for_user(v, output_type)
+    if v is None or formatted == "no data":
+        return f"No data available for {label} yet."
+
+    # Category-aware framing for the scalar
+    if category in ("sales", "orders"):
+        return f"{label} stands at {formatted}."
+    if category == "customers":
+        return f"{label} currently sits at {formatted}."
+    if category == "profit":
+        if output_type == "percent":
+            return f"{label} is currently {formatted}."
+        return f"{label} works out to {formatted}."
+    if category == "payments":
+        return f"{label} is {formatted}."
+    if category == "loyalty":
+        return f"{label} is {formatted}."
+    if category in ("business_health", "time"):
+        return f"{label}: {formatted}."
+
+    # Default
+    return f"{label}: {formatted}."
+
+
+def _is_pure_greeting(question: str) -> bool:
+    """True when every word in the question is in the greeting whitelist
+    (and there are at most 4 words). Anything longer or with off-topic
+    tokens fails the check and gets routed to the refusal handler."""
+    if not question:
+        return False
+    import re as _re
+    tokens = _re.findall(r"[a-z]+", question.lower())
+    if not tokens or len(tokens) > 4:
+        return False
+    return all(t in _GREETING_TOKENS for t in tokens)
 
 
 # Deterministic safety net when the Groq client is unreachable / unconfigured.
@@ -3603,6 +3771,102 @@ _MISSING_FALLBACK = (
 _missing_log = logging.getLogger("agentic_ai.coordinator.missing")
 
 
+async def _respond_greeting(
+    state: TurnState,
+    emit: EventEmitter,
+) -> TurnState:
+    """Deterministic, LLM-free greeting reply. Fired only when the question
+    consists entirely of whitelisted greeting tokens."""
+    answer = _GREETING_REPLY
+    record = {
+        "turn_id":      state.turn_id,
+        "cache_key":    state.cache_key,
+        "stored_at":    datetime.now().astimezone().isoformat(timespec="seconds"),
+        "query":        state.question,
+        "mode":         "greeting",
+        "final_answer": answer,
+    }
+    if state.cache_key:
+        try:
+            put_cached(state.cache_key, record)
+        except Exception:
+            _chat_log.warning("greeting: cache write failed", exc_info=True)
+
+    await emit.emit("final", {
+        "answer":     answer,
+        "chart":      None,
+        "from_cache": False,
+        "mode":       "greeting",
+    })
+    await emit.emit("turn.end", {
+        "turn_id":      state.turn_id,
+        "errors":       [],
+        "final_answer": answer,
+        "mode":         "greeting",
+    })
+    return state.apply(final_answer=answer, response_record=record)
+
+
+async def _respond_restricted(
+    state: TurnState,
+    emit: EventEmitter,
+    hints: dict[str, Any],
+) -> TurnState:
+    """Deterministic refusal for off-topic / general-knowledge questions.
+
+    No LLM call. Returns the canonical restriction message verbatim. Cached
+    just like every other answer so a repeat of the same off-topic question
+    is instant. This is the security floor of the domain-isolation system —
+    even if the LLM is bypassed somehow, this handler always wins for
+    queries the kind-classifier flagged as general_knowledge.
+    """
+    answer = RESTRICTION_REFUSAL
+    _missing_log.info(
+        "restricted: refusing off-topic question=%r matched=%r",
+        state.question, hints.get("matched"),
+    )
+
+    record = {
+        "turn_id":       state.turn_id,
+        "cache_key":     state.cache_key,
+        "stored_at":     datetime.now().astimezone().isoformat(timespec="seconds"),
+        "query":         state.question,
+        "mode":          "restricted",
+        "sub_agent":     None,
+        "route":         None,
+        "sql":           None,
+        "rows":          None,
+        "aggregates":    None,
+        "insights":      None,
+        "chart":         None,
+        "final_answer":  answer,
+        "matched_term":  hints.get("matched"),
+    }
+    if state.cache_key:
+        try:
+            put_cached(state.cache_key, record)
+        except Exception:
+            _missing_log.warning("restricted: cache write failed", exc_info=True)
+
+    await emit.emit("restricted", {
+        "reason":  "off_topic",
+        "matched": hints.get("matched"),
+    })
+    await emit.emit("final", {
+        "answer":     answer,
+        "chart":      None,
+        "from_cache": False,
+        "mode":       "restricted",
+    })
+    await emit.emit("turn.end", {
+        "turn_id":      state.turn_id,
+        "errors":       [],
+        "final_answer": answer,
+        "mode":         "restricted",
+    })
+    return state.apply(final_answer=answer, response_record=record)
+
+
 async def _respond_missing_data(
     state: TurnState,
     emit: EventEmitter,
@@ -3779,16 +4043,23 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
     if cached:
         cached_mode = cached.get("mode", "agentic")
         await emit.emit("cache.hit", {
-            "cache_key": cache_key,
             "stored_at": cached.get("stored_at"),
             "mode":      cached_mode,
         })
-        await emit.emit("final", {
+        # Cache-hit `final` event. Surface the same user-safe `metric`
+        # payload that a fresh KPI fast-path would emit, so the frontend
+        # contract is identical whether the answer is cached or recomputed.
+        final_payload: dict[str, Any] = {
             "answer":     cached.get("final_answer", ""),
-            "chart":      cached.get("chart") or cached.get("aggregates"),
+            "chart":      cached.get("chart"),
             "from_cache": True,
             "mode":       cached_mode,
-        })
+        }
+        # `aggregates` carries the to_user_dict() shape (no formula/SQL).
+        cached_agg = cached.get("aggregates")
+        if isinstance(cached_agg, dict) and "format" in cached_agg:
+            final_payload["metric"] = cached_agg
+        await emit.emit("final", final_payload)
         await emit.emit("turn.end", {
             "turn_id":      state.turn_id,
             "from_cache":   True,
@@ -3801,6 +4072,88 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
             final_answer=cached.get("final_answer"),
             chart_data=cached.get("chart") or cached.get("aggregates"),
             response_record=cached,
+        )
+
+    # ---- 1.4. Clarification check (ambiguous branch/store question) ------
+    # Fires only when the user has 2+ branches configured. Single-branch
+    # deployments (the default) never trigger this.
+    try:
+        from app.hierarchy import detect_ambiguity
+        clar = await detect_ambiguity(state.question)
+    except Exception:
+        clar = None
+    if clar is not None:
+        await emit.emit("clarification.needed", clar.to_dict())
+        await emit.emit("final", {
+            "answer":     clar.prompt,
+            "chart":      None,
+            "from_cache": False,
+            "mode":       "clarification",
+            "clarification": clar.to_dict(),
+        })
+        await emit.emit("turn.end", {
+            "turn_id":      state.turn_id,
+            "from_cache":   False,
+            "errors":       [],
+            "final_answer": clar.prompt,
+            "mode":         "clarification",
+        })
+        return state.apply(
+            sub_agent="ClarificationAgent",
+            final_answer=clar.prompt,
+            response_record=clar.to_dict(),
+        )
+
+    # ---- 1.5. KPI fast-path (deterministic, zero LLM cost) ---------------
+    # If the question matches a registered KPI alias at high confidence we
+    # short-circuit the whole pipeline and return the exact pre-defined
+    # formula result. Falls through silently on no match or low confidence.
+    try:
+        from app.kpi import match_kpi, execute_kpi
+        kpi_match = await match_kpi(state.question)
+    except Exception:
+        kpi_match = None
+    if kpi_match is not None and kpi_match.confidence >= 0.85:
+        kpi_result = await execute_kpi(kpi_match.kpi)
+        # Emit ONLY a generic "analyzing" event — never leak internal kpi_id
+        # or matched_alias to the user-facing stream.
+        await emit.emit("analyzing", {"stage": "computing your metric"})
+
+        # Executive-style narrative + user-safe payload.
+        answer = _narrate_kpi(kpi_result)
+
+        await emit.emit("final", {
+            "answer":     answer,
+            "chart":      None,
+            "from_cache": False,
+            "mode":       "kpi",
+            "metric":     kpi_result.to_user_dict(),   # USER-SAFE — no formula/SQL
+        })
+        await emit.emit("turn.end", {
+            "turn_id":      state.turn_id,
+            "from_cache":   False,
+            "errors":       [] if not kpi_result.error else ["Could not compute the requested metric."],
+            "final_answer": answer,
+            "mode":         "kpi",
+        })
+        # Cache the deterministic answer so a repeat question is instant.
+        # The cache record keeps the FULL developer dict in `_internal`
+        # but only the user-safe one is ever re-streamed to a client.
+        try:
+            put_cached(cache_key, {
+                "mode":         "kpi",
+                "sub_agent":    "KPIEngine",
+                "final_answer": answer,
+                "chart":        None,
+                "aggregates":   kpi_result.to_user_dict(),
+                "_internal":    kpi_result.to_dict(),    # developer-only, not streamed
+            })
+        except Exception:
+            pass
+        return state.apply(
+            sub_agent="KPIEngine",
+            final_answer=answer,
+            response_record=kpi_result.to_dict(),       # state record is server-side
         )
 
     # ---- 2. Top-level query-kind guard (deterministic, zero LLM cost) ----
@@ -3848,20 +4201,20 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
         return await _respond_missing_data(state, emit, kind_hints)
 
     if kind == "general_knowledge":
-        return await respond_chat(
-            state, emit,
-            f"general_knowledge: {kind_hints.get('matched')}",
-            system_prompt=_GENERAL_KNOWLEDGE_PROMPT,
-            mode="general_knowledge",
-        )
+        # Domain-isolation enforcement: refuse deterministically with the
+        # canonical restriction message. No LLM call — saves cost and
+        # guarantees the refusal can never be jailbroken at the prompt layer.
+        return await _respond_restricted(state, emit, kind_hints)
 
     if kind == "chat":
-        return await respond_chat(
-            state, emit,
-            f"chat: {kind_hints.get('matched')}",
-            system_prompt=_CHAT_SYSTEM_PROMPT,
-            mode="chat",
-        )
+        # Deterministic greeting filter: only literal greeting tokens are
+        # answered conversationally. Anything else classified as chat by
+        # the kind classifier (e.g. "tell me a joke", "who invented AI")
+        # is treated as off-topic and refused with the canonical message.
+        # This makes refusal independent of the LLM being reachable.
+        if _is_pure_greeting(state.question):
+            return await _respond_greeting(state, emit)
+        return await _respond_restricted(state, emit, kind_hints)
 
     # data_query — fall through to the existing agentic flow.
 
@@ -4611,9 +4964,28 @@ class DataCleanAgent:
         filename: str,
         target: str,
         batch_id: str | None = None,
+        dedup_mode: str = "block",
+        preview_only: bool = False,
     ) -> dict[str, Any]:
+        """Parse + validate + (optionally) insert.
+
+        Parameters
+        ----------
+        dedup_mode : 'block' | 'skip' | 'replace' | 'append'
+            How to handle rows whose row_hash already exists in the target.
+        preview_only : bool
+            When True, runs the full pipeline up to classification and
+            returns the breakdown WITHOUT inserting. Used by /upload/preview.
+        """
+        from app.dedup import (
+            DEDUP_MODES, classify_batch, delete_rows_with_hashes,
+        )
         if target not in ALLOWED_TABLES:
             raise UploadError(f"target must be one of {ALLOWED_TABLES!r}")
+        if dedup_mode not in DEDUP_MODES:
+            raise UploadError(
+                f"dedup_mode must be one of {DEDUP_MODES!r}, got {dedup_mode!r}"
+            )
         suffix = tmp_path.suffix.lower()
 
         # 1. FileParser — auto header detection.
@@ -4666,9 +5038,120 @@ class DataCleanAgent:
                 f"{errors[0]['reason'] if errors else '(no rows in file)'}"
             )
 
-        # 5. Database (restricted).
+        # 5. Deduplication classification.
+        classification = await classify_batch(target, valid_rows, mode=dedup_mode)
+        dedup_summary = classification.summary()
+        _dataclean_log.info("dedup classification: %s", dedup_summary)
+
+        # 5a. Apply policy: block / skip / replace / append.
+        if dedup_mode == "block" and (
+            classification.duplicate_count > 0
+            or classification.intra_batch_dupe_count > 0
+        ):
+            # Sample of which incoming rows collided, for the user message.
+            sample = []
+            for r in valid_rows[:5]:
+                if r in classification.new_rows:
+                    continue
+                sample.append({
+                    "date": r.get("Date"),
+                    "order_no": r.get("Order No"),
+                    "party": r.get("Party Name"),
+                    "amount": r.get("Total Amount"),
+                })
+            raise UploadError(
+                "duplicate data detected: "
+                f"{classification.duplicate_count} rows already exist in {target!r} "
+                f"and {classification.intra_batch_dupe_count} rows are repeated in the "
+                f"file itself (intra-batch). "
+                f"Re-upload with dedup_mode=skip / replace / append to override. "
+                f"Sample of conflicting rows: {sample}"
+            )
+
+        # 5b. Preview-only? Return the classification without inserting.
+        if preview_only:
+            return {
+                "preview":          True,
+                "filename":         filename,
+                "target":           target,
+                "dedup_mode":       dedup_mode,
+                "errors":           errors,
+                "rows_failed":      len(errors),
+                "header_row_used":  header,
+                "unmatched_headers": unmatched_extras,
+                "sheet_name":       sheet_name,
+                "dedup":            dedup_summary,
+            }
+
+        # 5c. Replace mode: delete the colliding rows first.
+        rows_replaced = 0
+        if dedup_mode == "replace" and classification.duplicate_hashes:
+            rows_replaced = await delete_rows_with_hashes(
+                target, classification.duplicate_hashes,
+            )
+
+        # 5d. Pick the rows we'll actually insert based on policy.
+        if dedup_mode == "skip":
+            rows_to_insert = classification.new_rows
+            hashes_to_insert = classification.new_row_hashes
+        elif dedup_mode == "replace":
+            # After delete, we re-insert ALL parsed rows (post-intra-batch-dedup)
+            # so the user's authoritative version wins.
+            from app.dedup import compute_row_hash
+            seen: set[str] = set()
+            rows_to_insert = []
+            hashes_to_insert = []
+            for r in valid_rows:
+                h = compute_row_hash(target, r)
+                if h in seen:
+                    continue
+                seen.add(h)
+                rows_to_insert.append(r)
+                hashes_to_insert.append(h)
+        elif dedup_mode == "append":
+            from app.dedup import compute_row_hash
+            rows_to_insert = valid_rows
+            hashes_to_insert = [compute_row_hash(target, r) for r in valid_rows]
+        else:
+            # block — but only reaches here when there were no duplicates
+            rows_to_insert = classification.new_rows
+            hashes_to_insert = classification.new_row_hashes
+
+        # 6. Database (restricted).
         if batch_id is None:
             batch_id = str(uuid4())
+
+        if not rows_to_insert:
+            # All rows were duplicates and policy was skip — still record the
+            # upload audit row, just with zero inserts.
+            await record_upload_meta(
+                batch_id=batch_id, filename=filename, target=target,
+                rows_inserted=0, rows_failed=len(errors), source="upload",
+                status="active",
+                dedup_mode=dedup_mode,
+                rows_skipped_duplicate=classification.duplicate_count
+                                     + classification.intra_batch_dupe_count,
+                rows_replaced=rows_replaced,
+            )
+            return {
+                "batch_id":         batch_id,
+                "filename":         filename,
+                "target":           target,
+                "rows_inserted":    0,
+                "rows_failed":      len(errors),
+                "rows_skipped_duplicate": classification.duplicate_count
+                                       + classification.intra_batch_dupe_count,
+                "rows_replaced":    rows_replaced,
+                "dedup_mode":       dedup_mode,
+                "errors":           errors,
+                "summary":          {"total_sales": 0.0, "min_date": "", "max_date": ""},
+                "unmatched_headers": unmatched_extras,
+                "sheet_name":       sheet_name,
+                "header_row_used":  header,
+                "validation":       None,
+                "dedup":            dedup_summary,
+            }
+
         registry = get_registry()
         dummy_state = TurnState(question="<dataclean>")
         result = await registry.execute(
@@ -4677,10 +5160,11 @@ class DataCleanAgent:
                 "op":           "insert",
                 "pin":          INGESTION_PIN,
                 "table":        target,
-                "rows":         valid_rows,
+                "rows":         rows_to_insert,
                 "batch_id":     batch_id,
                 "source":       "upload",
                 "file_name":    filename,
+                "row_hashes":   hashes_to_insert,
             },
             dummy_state,
         )
@@ -4688,7 +5172,7 @@ class DataCleanAgent:
             raise UploadError(f"database insert failed: {result.error}")
         rows_inserted = int((result.output or {}).get("rows_inserted") or 0)
 
-        # 6. PostValidator — fails loud if dashboard would break.
+        # 7. PostValidator — fails loud if dashboard would break.
         try:
             validation = await _validate_post_insert(target, batch_id)
         except UploadError:
@@ -4714,11 +5198,15 @@ class DataCleanAgent:
             status="active",
             min_date=validation.get("min_date"),
             max_date=validation.get("max_date"),
+            dedup_mode=dedup_mode,
+            rows_skipped_duplicate=classification.duplicate_count
+                                 + classification.intra_batch_dupe_count,
+            rows_replaced=rows_replaced,
         )
 
         summary = {
             "total_sales": round(
-                sum(float(r.get("Total Amount") or 0) for r in valid_rows), 2
+                sum(float(r.get("Total Amount") or 0) for r in rows_to_insert), 2
             ),
             "min_date": validation["min_date"],
             "max_date": validation["max_date"],
@@ -4730,12 +5218,17 @@ class DataCleanAgent:
             "target":           target,
             "rows_inserted":    rows_inserted,
             "rows_failed":      rows_failed,
+            "rows_skipped_duplicate": classification.duplicate_count
+                                   + classification.intra_batch_dupe_count,
+            "rows_replaced":    rows_replaced,
+            "dedup_mode":       dedup_mode,
             "errors":           errors,
             "summary":          summary,
             "unmatched_headers": unmatched_extras,
             "sheet_name":       sheet_name,
             "header_row_used":  header,
             "validation":       validation,
+            "dedup":            dedup_summary,
         }
 
 

@@ -122,5 +122,717 @@
     },
     "final_answer": "Boot B leads with ₹3,000.00 across 1 orders (57.7% of the top 3 products). Next: Sneaker A (₹2,000), Sandal C (₹200).",
     "response_format": "clean"
+  },
+  "2793ebc0d0d0b2cdd31cc6ef7aab1daeffcdb647ddbad1dc41af4e993557ee51": {
+    "turn_id": "facbe992-84cd-4bb5-8f82-318398f0c46a",
+    "cache_key": "2793ebc0d0d0b2cdd31cc6ef7aab1daeffcdb647ddbad1dc41af4e993557ee51",
+    "stored_at": "2026-05-12T22:11:51+05:30",
+    "query": "what is the sun",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This AI assistant is restricted to business intelligence, analytics, KPIs, reports, and platform-related operations only. Please ask questions related to your uploaded business data or platform modules.",
+    "matched_term": null
+  },
+  "9a148ba41414202d355a45c2186cc250cc0e6a6d7dc28b6bdd13508561cdb001": {
+    "turn_id": "d0202a91-3943-49b1-bc28-97c74d818f9b",
+    "cache_key": "9a148ba41414202d355a45c2186cc250cc0e6a6d7dc28b6bdd13508561cdb001",
+    "stored_at": "2026-05-12T22:11:51+05:30",
+    "query": "what is world history",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This AI assistant is restricted to business intelligence, analytics, KPIs, reports, and platform-related operations only. Please ask questions related to your uploaded business data or platform modules.",
+    "matched_term": null
+  },
+  "0305517b3b9b31d4f53d8b5cac3e8fd47ba1a3951a103f812a3ed66e52374b75": {
+    "mode": "kpi",
+    "sub_agent": "KPIEngine",
+    "final_answer": "Profit Margin: 100.00%",
+    "chart": null,
+    "aggregates": {
+      "kpi": "profit_margin",
+      "label": "Profit Margin",
+      "category": "profit",
+      "value": 100.0,
+      "output_type": "percent",
+      "formula": "((Revenue - COGS) / Revenue) * 100",
+      "explanation": "Gross profit expressed as a percent of revenue.",
+      "sql_used": "SELECT CASE WHEN s.r = 0 THEN 0 ELSE (s.r - p.c) * 100.0 / s.r END AS value FROM (SELECT COALESCE(SUM(\"Total Amount\"), 0) AS r FROM sales) s, (SELECT COALESCE(SUM(\"Total Amount\"), 0) AS c FROM purchase) p",
+      "required_columns": [
+        "Total Amount"
+      ],
+      "missing_columns": [],
+      "rows": [
+        {
+          "value": 100.0
+        }
+      ],
+      "computed_at": "2026-05-12T16:41:51+00:00",
+      "warnings": [],
+      "error": null,
+      "chart_supported": false
+    },
+    "stored_at": "2026-05-12T16:41:51+00:00"
+  },
+  "e0806bf18db2e5f2c90c7a5539a341981ca996d540bf941c25188eaf3ead8710": {
+    "mode": "kpi",
+    "sub_agent": "KPIEngine",
+    "final_answer": "Last 7 Days Sales (dataset-relative): 1,500.00",
+    "chart": null,
+    "aggregates": {
+      "kpi": "last_7_days_sales",
+      "label": "Last 7 Days Sales (dataset-relative)",
+      "category": "sales",
+      "value": 1500.0,
+      "output_type": "currency",
+      "formula": "SUM(Total Amount) WHERE Date BETWEEN dataset_today - 6 AND dataset_today",
+      "explanation": "Revenue across the 7 most recent dataset days, inclusive.",
+      "sql_used": "SELECT COALESCE(SUM(\"Total Amount\"), 0) AS value FROM sales WHERE \"Date\" BETWEEN '2026-05-13' AND '2026-05-19'",
+      "required_columns": [
+        "Date",
+        "Total Amount"
+      ],
+      "missing_columns": [],
+      "rows": [
+        {
+          "value": 1500.0
+        }
+      ],
+      "computed_at": "2026-05-12T16:41:51+00:00",
+      "warnings": [],
+      "error": null,
+      "chart_supported": false
+    },
+    "stored_at": "2026-05-12T16:41:51+00:00"
+  },
+  "ef1a1a03d3f2a8e84fe354f5d72714d272e61d8c0ef2abeaae212d396306ab01": {
+    "mode": "kpi",
+    "sub_agent": "KPIEngine",
+    "final_answer": "Top Brand by Revenue: no data",
+    "chart": null,
+    "aggregates": {
+      "kpi": "top_brand",
+      "label": "Top Brand by Revenue",
+      "category": "hierarchy",
+      "value": null,
+      "output_type": "list",
+      "formula": "argmax(brand, SUM(Total Amount))",
+      "explanation": "Brand contributing the highest revenue among classified products.",
+      "sql_used": "SELECT br.name AS label,        COALESCE(SUM(s.\"Total Amount\"), 0) AS value FROM sales s JOIN product_master pm ON pm.product_name = s.\"Product Name\" JOIN product_hierarchy br ON br.id = pm.brand_id GROUP BY br.name ORDER BY value DESC LIMIT 1",
+      "required_columns": [
+        "Product Name",
+        "Total Amount"
+      ],
+      "missing_columns": [],
+      "rows": [],
+      "computed_at": "2026-05-12T16:41:51+00:00",
+      "warnings": [
+        "No rows returned — dataset may be empty."
+      ],
+      "error": null,
+      "chart_supported": true
+    },
+    "stored_at": "2026-05-12T16:41:51+00:00"
+  },
+  "048b82c3c5e6e5e54636ef31f3092fa7c6a076f40aa3393d4b0e97855ae7631e": {
+    "mode": "kpi",
+    "sub_agent": "KPIEngine",
+    "final_answer": "Total Customers: 2",
+    "chart": null,
+    "aggregates": {
+      "kpi": "total_customers",
+      "label": "Total Customers",
+      "category": "customers",
+      "value": 2,
+      "output_type": "count",
+      "formula": "COUNT(DISTINCT Party Name)",
+      "explanation": "Distinct customer (Party Name) count.",
+      "sql_used": "SELECT COUNT(DISTINCT \"Party Name\") AS value FROM sales WHERE \"Party Name\" IS NOT NULL AND \"Party Name\" <> ''",
+      "required_columns": [
+        "Party Name"
+      ],
+      "missing_columns": [],
+      "rows": [
+        {
+          "value": 2
+        }
+      ],
+      "computed_at": "2026-05-12T16:41:51+00:00",
+      "warnings": [],
+      "error": null,
+      "chart_supported": false
+    },
+    "stored_at": "2026-05-12T16:41:51+00:00"
+  },
+  "479b5f1c4675cf2fbd19c7218e8b4ed7d2a959c65fced55f31f5c968589127fb": {
+    "turn_id": "2babd395-a89a-4ff9-aea4-4cdd22f512dd",
+    "cache_key": "479b5f1c4675cf2fbd19c7218e8b4ed7d2a959c65fced55f31f5c968589127fb",
+    "stored_at": "2026-05-12T22:12:44+05:30",
+    "query": "what is the sun",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This AI assistant is restricted to business intelligence, analytics, KPIs, reports, and platform-related operations only. Please ask questions related to your uploaded business data or platform modules.",
+    "matched_term": null
+  },
+  "bbb8f8d0d44c49e9eaa576b10e08e98d2d7bbe11e6a10e416b62a99bbf3572a8": {
+    "turn_id": "ed6f05a1-74ec-42cf-a739-c38b4783cc1b",
+    "cache_key": "bbb8f8d0d44c49e9eaa576b10e08e98d2d7bbe11e6a10e416b62a99bbf3572a8",
+    "stored_at": "2026-05-12T22:12:44+05:30",
+    "query": "who invented AI",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This AI assistant is restricted to business intelligence, analytics, KPIs, reports, and platform-related operations only. Please ask questions related to your uploaded business data or platform modules.",
+    "matched_term": null
+  },
+  "a4b649b07d5418e24791cfac2b044077f80dbd71cc7d8a7d4dc280983ee8f1d3": {
+    "turn_id": "ee62d6e2-e59a-48c7-9670-1e1d9a94b34c",
+    "cache_key": "a4b649b07d5418e24791cfac2b044077f80dbd71cc7d8a7d4dc280983ee8f1d3",
+    "stored_at": "2026-05-12T22:12:44+05:30",
+    "query": "teach me python",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This AI assistant is restricted to business intelligence, analytics, KPIs, reports, and platform-related operations only. Please ask questions related to your uploaded business data or platform modules.",
+    "matched_term": null
+  },
+  "efa5c925efed18a1fc15fac2a1564df6e9de33895d23ce60affc595750e5ca0e": {
+    "turn_id": "1941da45-dad5-4d15-8412-8a450aab1f36",
+    "cache_key": "efa5c925efed18a1fc15fac2a1564df6e9de33895d23ce60affc595750e5ca0e",
+    "stored_at": "2026-05-12T22:12:44+05:30",
+    "query": "what is world history",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This AI assistant is restricted to business intelligence, analytics, KPIs, reports, and platform-related operations only. Please ask questions related to your uploaded business data or platform modules.",
+    "matched_term": null
+  },
+  "dd5e8aa4c1a17ac83ed45f929d5672198ebfbb71ea1b41b232777c614f0f5b8f": {
+    "mode": "kpi",
+    "sub_agent": "KPIEngine",
+    "final_answer": "Profit Margin: 100.00%",
+    "chart": null,
+    "aggregates": {
+      "kpi": "profit_margin",
+      "label": "Profit Margin",
+      "category": "profit",
+      "value": 100.0,
+      "output_type": "percent",
+      "formula": "((Revenue - COGS) / Revenue) * 100",
+      "explanation": "Gross profit expressed as a percent of revenue.",
+      "sql_used": "SELECT CASE WHEN s.r = 0 THEN 0 ELSE (s.r - p.c) * 100.0 / s.r END AS value FROM (SELECT COALESCE(SUM(\"Total Amount\"), 0) AS r FROM sales) s, (SELECT COALESCE(SUM(\"Total Amount\"), 0) AS c FROM purchase) p",
+      "required_columns": [
+        "Total Amount"
+      ],
+      "missing_columns": [],
+      "rows": [
+        {
+          "value": 100.0
+        }
+      ],
+      "computed_at": "2026-05-12T16:42:44+00:00",
+      "warnings": [],
+      "error": null,
+      "chart_supported": false
+    },
+    "stored_at": "2026-05-12T16:42:44+00:00"
+  },
+  "e39f14a238babcfedc5f04b8d155644356fa9811296361a28b78d480cb82f860": {
+    "mode": "kpi",
+    "sub_agent": "KPIEngine",
+    "final_answer": "Last 7 Days Sales (dataset-relative): 1,500.00",
+    "chart": null,
+    "aggregates": {
+      "kpi": "last_7_days_sales",
+      "label": "Last 7 Days Sales (dataset-relative)",
+      "category": "sales",
+      "value": 1500.0,
+      "output_type": "currency",
+      "formula": "SUM(Total Amount) WHERE Date BETWEEN dataset_today - 6 AND dataset_today",
+      "explanation": "Revenue across the 7 most recent dataset days, inclusive.",
+      "sql_used": "SELECT COALESCE(SUM(\"Total Amount\"), 0) AS value FROM sales WHERE \"Date\" BETWEEN '2026-05-13' AND '2026-05-19'",
+      "required_columns": [
+        "Date",
+        "Total Amount"
+      ],
+      "missing_columns": [],
+      "rows": [
+        {
+          "value": 1500.0
+        }
+      ],
+      "computed_at": "2026-05-12T16:42:44+00:00",
+      "warnings": [],
+      "error": null,
+      "chart_supported": false
+    },
+    "stored_at": "2026-05-12T16:42:44+00:00"
+  },
+  "37c7da0b47340102db11315a7d551945a31aaf2d25281dc18d90639e122b6bc9": {
+    "mode": "kpi",
+    "sub_agent": "KPIEngine",
+    "final_answer": "Top Brand by Revenue: no data",
+    "chart": null,
+    "aggregates": {
+      "kpi": "top_brand",
+      "label": "Top Brand by Revenue",
+      "category": "hierarchy",
+      "value": null,
+      "output_type": "list",
+      "formula": "argmax(brand, SUM(Total Amount))",
+      "explanation": "Brand contributing the highest revenue among classified products.",
+      "sql_used": "SELECT br.name AS label,        COALESCE(SUM(s.\"Total Amount\"), 0) AS value FROM sales s JOIN product_master pm ON pm.product_name = s.\"Product Name\" JOIN product_hierarchy br ON br.id = pm.brand_id GROUP BY br.name ORDER BY value DESC LIMIT 1",
+      "required_columns": [
+        "Product Name",
+        "Total Amount"
+      ],
+      "missing_columns": [],
+      "rows": [],
+      "computed_at": "2026-05-12T16:42:44+00:00",
+      "warnings": [
+        "No rows returned — dataset may be empty."
+      ],
+      "error": null,
+      "chart_supported": true
+    },
+    "stored_at": "2026-05-12T16:42:44+00:00"
+  },
+  "0febdc825a88cd2bd6da580a39283e1969051a8063e32afdcf15008b4145678f": {
+    "mode": "kpi",
+    "sub_agent": "KPIEngine",
+    "final_answer": "Total Customers: 2",
+    "chart": null,
+    "aggregates": {
+      "kpi": "total_customers",
+      "label": "Total Customers",
+      "category": "customers",
+      "value": 2,
+      "output_type": "count",
+      "formula": "COUNT(DISTINCT Party Name)",
+      "explanation": "Distinct customer (Party Name) count.",
+      "sql_used": "SELECT COUNT(DISTINCT \"Party Name\") AS value FROM sales WHERE \"Party Name\" IS NOT NULL AND \"Party Name\" <> ''",
+      "required_columns": [
+        "Party Name"
+      ],
+      "missing_columns": [],
+      "rows": [
+        {
+          "value": 2
+        }
+      ],
+      "computed_at": "2026-05-12T16:42:44+00:00",
+      "warnings": [],
+      "error": null,
+      "chart_supported": false
+    },
+    "stored_at": "2026-05-12T16:42:44+00:00"
+  },
+  "c12ce2da4fde07552c5a60651552dae8766a31af1cf418115082d12882997cb4": {
+    "turn_id": "ee2dccc3-0048-40af-9974-8713ad8ca2c4",
+    "cache_key": "c12ce2da4fde07552c5a60651552dae8766a31af1cf418115082d12882997cb4",
+    "stored_at": "2026-05-12T22:13:12+05:30",
+    "query": "what is the sun",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This AI assistant is restricted to business intelligence, analytics, KPIs, reports, and platform-related operations only. Please ask questions related to your uploaded business data or platform modules.",
+    "matched_term": null
+  },
+  "2329b3d7e5be3a90e5b3c49d9e6e234f4df0098c763599284cc32cd8ad2154f9": {
+    "turn_id": "29f33306-607d-4e1f-bb1f-852555297bfd",
+    "cache_key": "2329b3d7e5be3a90e5b3c49d9e6e234f4df0098c763599284cc32cd8ad2154f9",
+    "stored_at": "2026-05-12T22:13:12+05:30",
+    "query": "who invented AI",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This AI assistant is restricted to business intelligence, analytics, KPIs, reports, and platform-related operations only. Please ask questions related to your uploaded business data or platform modules.",
+    "matched_term": null
+  },
+  "3ac216fdd2fd80230899c8c438a0e410c47434026e443799ffa1202177d72f6b": {
+    "turn_id": "2278bd12-4ba8-467a-9441-77c556f36436",
+    "cache_key": "3ac216fdd2fd80230899c8c438a0e410c47434026e443799ffa1202177d72f6b",
+    "stored_at": "2026-05-12T22:13:12+05:30",
+    "query": "teach me python",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This AI assistant is restricted to business intelligence, analytics, KPIs, reports, and platform-related operations only. Please ask questions related to your uploaded business data or platform modules.",
+    "matched_term": null
+  },
+  "eb2ff8fccd032836589855356d58c22089556d18b12f92272e964569514706d4": {
+    "turn_id": "ab307592-9cdb-4a0f-88b8-69ac89eb8d90",
+    "cache_key": "eb2ff8fccd032836589855356d58c22089556d18b12f92272e964569514706d4",
+    "stored_at": "2026-05-12T22:13:12+05:30",
+    "query": "what is world history",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This AI assistant is restricted to business intelligence, analytics, KPIs, reports, and platform-related operations only. Please ask questions related to your uploaded business data or platform modules.",
+    "matched_term": null
+  },
+  "f1a7489daf7e6e157bd250b8994d618c18deaed5f2cbb5b80a3015511bec701a": {
+    "turn_id": "2a06a727-957c-4010-8bc8-28ddb07d1c4b",
+    "cache_key": "f1a7489daf7e6e157bd250b8994d618c18deaed5f2cbb5b80a3015511bec701a",
+    "stored_at": "2026-05-12T22:13:12+05:30",
+    "query": "who is elon musk",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This AI assistant is restricted to business intelligence, analytics, KPIs, reports, and platform-related operations only. Please ask questions related to your uploaded business data or platform modules.",
+    "matched_term": null
+  },
+  "262cb2ca143a2d0a4847bf0c9230e50fc1b529aa27ab6946c8555c5fbb5538d9": {
+    "turn_id": "0b11464b-26e1-4efb-bfee-6d110200b244",
+    "cache_key": "262cb2ca143a2d0a4847bf0c9230e50fc1b529aa27ab6946c8555c5fbb5538d9",
+    "stored_at": "2026-05-12T22:13:12+05:30",
+    "query": "explain quantum physics",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This AI assistant is restricted to business intelligence, analytics, KPIs, reports, and platform-related operations only. Please ask questions related to your uploaded business data or platform modules.",
+    "matched_term": null
+  },
+  "d3cc4e019a1ba8b16c93d52e0240b4d9b0bb69cd4d021174c7f285e57ec60023": {
+    "turn_id": "a1ae2b67-2903-42aa-ae04-2e4c6eb1be26",
+    "cache_key": "d3cc4e019a1ba8b16c93d52e0240b4d9b0bb69cd4d021174c7f285e57ec60023",
+    "stored_at": "2026-05-12T22:13:12+05:30",
+    "query": "tell me a joke",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This AI assistant is restricted to business intelligence, analytics, KPIs, reports, and platform-related operations only. Please ask questions related to your uploaded business data or platform modules.",
+    "matched_term": null
+  },
+  "fe5f4b91855635ba014214b91b9c9e206dc01d9636a885724a48d2e0d2dbe1ae": {
+    "mode": "kpi",
+    "sub_agent": "KPIEngine",
+    "final_answer": "Profit Margin: 100.00%",
+    "chart": null,
+    "aggregates": {
+      "kpi": "profit_margin",
+      "label": "Profit Margin",
+      "category": "profit",
+      "value": 100.0,
+      "output_type": "percent",
+      "formula": "((Revenue - COGS) / Revenue) * 100",
+      "explanation": "Gross profit expressed as a percent of revenue.",
+      "sql_used": "SELECT CASE WHEN s.r = 0 THEN 0 ELSE (s.r - p.c) * 100.0 / s.r END AS value FROM (SELECT COALESCE(SUM(\"Total Amount\"), 0) AS r FROM sales) s, (SELECT COALESCE(SUM(\"Total Amount\"), 0) AS c FROM purchase) p",
+      "required_columns": [
+        "Total Amount"
+      ],
+      "missing_columns": [],
+      "rows": [
+        {
+          "value": 100.0
+        }
+      ],
+      "computed_at": "2026-05-12T16:43:12+00:00",
+      "warnings": [],
+      "error": null,
+      "chart_supported": false
+    },
+    "stored_at": "2026-05-12T16:43:12+00:00"
+  },
+  "59152aaf772f27fe73820966504b5a8fcf156cb21375f384603080ef3467b9fb": {
+    "mode": "kpi",
+    "sub_agent": "KPIEngine",
+    "final_answer": "Last 7 Days Sales (dataset-relative): 1,500.00",
+    "chart": null,
+    "aggregates": {
+      "kpi": "last_7_days_sales",
+      "label": "Last 7 Days Sales (dataset-relative)",
+      "category": "sales",
+      "value": 1500.0,
+      "output_type": "currency",
+      "formula": "SUM(Total Amount) WHERE Date BETWEEN dataset_today - 6 AND dataset_today",
+      "explanation": "Revenue across the 7 most recent dataset days, inclusive.",
+      "sql_used": "SELECT COALESCE(SUM(\"Total Amount\"), 0) AS value FROM sales WHERE \"Date\" BETWEEN '2026-05-13' AND '2026-05-19'",
+      "required_columns": [
+        "Date",
+        "Total Amount"
+      ],
+      "missing_columns": [],
+      "rows": [
+        {
+          "value": 1500.0
+        }
+      ],
+      "computed_at": "2026-05-12T16:43:12+00:00",
+      "warnings": [],
+      "error": null,
+      "chart_supported": false
+    },
+    "stored_at": "2026-05-12T16:43:12+00:00"
+  },
+  "88d4452285377679a5ab84b5c5a0252746f2ecce38fb238ad95ab8f674e9cd0b": {
+    "mode": "kpi",
+    "sub_agent": "KPIEngine",
+    "final_answer": "Top Brand by Revenue: no data",
+    "chart": null,
+    "aggregates": {
+      "kpi": "top_brand",
+      "label": "Top Brand by Revenue",
+      "category": "hierarchy",
+      "value": null,
+      "output_type": "list",
+      "formula": "argmax(brand, SUM(Total Amount))",
+      "explanation": "Brand contributing the highest revenue among classified products.",
+      "sql_used": "SELECT br.name AS label,        COALESCE(SUM(s.\"Total Amount\"), 0) AS value FROM sales s JOIN product_master pm ON pm.product_name = s.\"Product Name\" JOIN product_hierarchy br ON br.id = pm.brand_id GROUP BY br.name ORDER BY value DESC LIMIT 1",
+      "required_columns": [
+        "Product Name",
+        "Total Amount"
+      ],
+      "missing_columns": [],
+      "rows": [],
+      "computed_at": "2026-05-12T16:43:12+00:00",
+      "warnings": [
+        "No rows returned — dataset may be empty."
+      ],
+      "error": null,
+      "chart_supported": true
+    },
+    "stored_at": "2026-05-12T16:43:12+00:00"
+  },
+  "aed3ace581d72c165f71ec0bc290137839f1e52b606a26832fe82a444a63eaaa": {
+    "mode": "kpi",
+    "sub_agent": "KPIEngine",
+    "final_answer": "Total Customers: 2",
+    "chart": null,
+    "aggregates": {
+      "kpi": "total_customers",
+      "label": "Total Customers",
+      "category": "customers",
+      "value": 2,
+      "output_type": "count",
+      "formula": "COUNT(DISTINCT Party Name)",
+      "explanation": "Distinct customer (Party Name) count.",
+      "sql_used": "SELECT COUNT(DISTINCT \"Party Name\") AS value FROM sales WHERE \"Party Name\" IS NOT NULL AND \"Party Name\" <> ''",
+      "required_columns": [
+        "Party Name"
+      ],
+      "missing_columns": [],
+      "rows": [
+        {
+          "value": 2
+        }
+      ],
+      "computed_at": "2026-05-12T16:43:12+00:00",
+      "warnings": [],
+      "error": null,
+      "chart_supported": false
+    },
+    "stored_at": "2026-05-12T16:43:12+00:00"
+  },
+  "bb5a2b6fb1a170dfd89fd97de0bcceee0463439c4110d0c76ca85e5814b9aad0": {
+    "turn_id": "6654f66c-0219-4fdf-bfab-5f53aa258b3b",
+    "cache_key": "bb5a2b6fb1a170dfd89fd97de0bcceee0463439c4110d0c76ca85e5814b9aad0",
+    "stored_at": "2026-05-12T22:13:12+05:30",
+    "query": "hi",
+    "mode": "greeting",
+    "final_answer": "Hi! I'm your business analytics assistant. Ask me about your sales, purchases, KPIs, top customers/products, trends, or any other question about your uploaded data."
+  },
+  "42e62853a59f163df7cf8a4073cc41f106fb5d041a4250f2ea7649f7d8511ad9": {
+    "turn_id": "7bcaac42-a234-4c0e-b5d1-2435970c4d50",
+    "cache_key": "42e62853a59f163df7cf8a4073cc41f106fb5d041a4250f2ea7649f7d8511ad9",
+    "stored_at": "2026-05-12T22:13:12+05:30",
+    "query": "hello",
+    "mode": "greeting",
+    "final_answer": "Hi! I'm your business analytics assistant. Ask me about your sales, purchases, KPIs, top customers/products, trends, or any other question about your uploaded data."
+  },
+  "ec392e315b3186141a484ef729b13fcb4868c28469150c23bcfc3b26cda9aba0": {
+    "turn_id": "3ec2a1dd-7bbf-4798-86cc-b8203884c10b",
+    "cache_key": "ec392e315b3186141a484ef729b13fcb4868c28469150c23bcfc3b26cda9aba0",
+    "stored_at": "2026-05-12T22:13:12+05:30",
+    "query": "thanks",
+    "mode": "greeting",
+    "final_answer": "Hi! I'm your business analytics assistant. Ask me about your sales, purchases, KPIs, top customers/products, trends, or any other question about your uploaded data."
+  },
+  "0b7e8886ea3802667100c52ee29ca3d487a2ebe6edb6fa2c487a8e4b84e40a8c": {
+    "turn_id": "463c7518-276c-4136-9bf2-bffb866e6f88",
+    "cache_key": "0b7e8886ea3802667100c52ee29ca3d487a2ebe6edb6fa2c487a8e4b84e40a8c",
+    "stored_at": "2026-05-12T22:13:12+05:30",
+    "query": "ok",
+    "mode": "greeting",
+    "final_answer": "Hi! I'm your business analytics assistant. Ask me about your sales, purchases, KPIs, top customers/products, trends, or any other question about your uploaded data."
+  },
+  "f9eface9f1d32260008c4eb4a05d7b747f5d2eafb51f1d0b790cde153105aa62": {
+    "turn_id": "cc391a73-15eb-4ffb-8291-78643631d708",
+    "cache_key": "f9eface9f1d32260008c4eb4a05d7b747f5d2eafb51f1d0b790cde153105aa62",
+    "stored_at": "2026-05-12T23:06:45+05:30",
+    "query": "who invented AI",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This question is not related to your business data or platform operations. Please ask questions related to sales, inventory, KPIs, reports, analytics, forecasting, or other business modules only.",
+    "matched_term": null
+  },
+  "f5cd95916570388bf96d9fd12fcac24ea8c5fd4189c1936c9edc635268921e3e": {
+    "turn_id": "56126a80-8690-47d5-8b37-3bf2fff5abd6",
+    "cache_key": "f5cd95916570388bf96d9fd12fcac24ea8c5fd4189c1936c9edc635268921e3e",
+    "stored_at": "2026-05-12T23:06:45+05:30",
+    "query": "teach me python",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This question is not related to your business data or platform operations. Please ask questions related to sales, inventory, KPIs, reports, analytics, forecasting, or other business modules only.",
+    "matched_term": null
+  },
+  "a22643face8d6c755054ae182c7292a2ba4eca4ca5e309321568e1fd8dc62794": {
+    "turn_id": "407a2442-ce0a-4d86-950e-314c89096927",
+    "cache_key": "a22643face8d6c755054ae182c7292a2ba4eca4ca5e309321568e1fd8dc62794",
+    "stored_at": "2026-05-12T23:06:45+05:30",
+    "query": "who is elon musk",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This question is not related to your business data or platform operations. Please ask questions related to sales, inventory, KPIs, reports, analytics, forecasting, or other business modules only.",
+    "matched_term": null
+  },
+  "61e67a903043a249415dc1997f75e98bb328cfbcea7c6793e9fc6aad6fe5e42a": {
+    "turn_id": "168c17dc-d136-4e81-abbc-37f5b4a94e7b",
+    "cache_key": "61e67a903043a249415dc1997f75e98bb328cfbcea7c6793e9fc6aad6fe5e42a",
+    "stored_at": "2026-05-12T23:06:45+05:30",
+    "query": "explain quantum physics",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This question is not related to your business data or platform operations. Please ask questions related to sales, inventory, KPIs, reports, analytics, forecasting, or other business modules only.",
+    "matched_term": null
+  },
+  "857e044ec950d620a5f281da138f0934cff2070096cc9e3bf1a4d41f526d51fe": {
+    "turn_id": "2d3ac64c-d7aa-406a-9c86-cb362f6fce2a",
+    "cache_key": "857e044ec950d620a5f281da138f0934cff2070096cc9e3bf1a4d41f526d51fe",
+    "stored_at": "2026-05-12T23:06:45+05:30",
+    "query": "tell me a joke",
+    "mode": "restricted",
+    "sub_agent": null,
+    "route": null,
+    "sql": null,
+    "rows": null,
+    "aggregates": null,
+    "insights": null,
+    "chart": null,
+    "final_answer": "This question is not related to your business data or platform operations. Please ask questions related to sales, inventory, KPIs, reports, analytics, forecasting, or other business modules only.",
+    "matched_term": null
+  },
+  "470807ebf0e049d024e31b0946e114602c14f11a980c4e30968c4997c7a431ed": {
+    "turn_id": "f44fc961-6f8c-4522-8d18-21aad8cc41de",
+    "cache_key": "470807ebf0e049d024e31b0946e114602c14f11a980c4e30968c4997c7a431ed",
+    "stored_at": "2026-05-12T23:06:45+05:30",
+    "query": "hi",
+    "mode": "greeting",
+    "final_answer": "Hi! I'm your business analytics assistant. Ask me about your sales, purchases, KPIs, top customers/products, trends, or any other question about your uploaded data."
+  },
+  "d1f47bbd96f07d73764015e3853e6aa59e17fecdc15ebde9afd9bb311a2fcfdb": {
+    "turn_id": "79a4bf36-f07b-4251-8711-75f31cb762cc",
+    "cache_key": "d1f47bbd96f07d73764015e3853e6aa59e17fecdc15ebde9afd9bb311a2fcfdb",
+    "stored_at": "2026-05-12T23:06:45+05:30",
+    "query": "hello",
+    "mode": "greeting",
+    "final_answer": "Hi! I'm your business analytics assistant. Ask me about your sales, purchases, KPIs, top customers/products, trends, or any other question about your uploaded data."
+  },
+  "73e0ab4dbb8991fd20fb50b45456442cf5d1a88f089a3d08bbdb709b548b3460": {
+    "turn_id": "7cdf1262-dfe7-4a56-b86e-944ddcd105b3",
+    "cache_key": "73e0ab4dbb8991fd20fb50b45456442cf5d1a88f089a3d08bbdb709b548b3460",
+    "stored_at": "2026-05-12T23:06:45+05:30",
+    "query": "thanks",
+    "mode": "greeting",
+    "final_answer": "Hi! I'm your business analytics assistant. Ask me about your sales, purchases, KPIs, top customers/products, trends, or any other question about your uploaded data."
+  },
+  "c66da9a77a61001b950067e0b89cec2e12d437c811fde87460e2a865c91f84ed": {
+    "turn_id": "18d59fa1-9913-44d1-b88b-c90d36229978",
+    "cache_key": "c66da9a77a61001b950067e0b89cec2e12d437c811fde87460e2a865c91f84ed",
+    "stored_at": "2026-05-12T23:06:45+05:30",
+    "query": "ok",
+    "mode": "greeting",
+    "final_answer": "Hi! I'm your business analytics assistant. Ask me about your sales, purchases, KPIs, top customers/products, trends, or any other question about your uploaded data."
   }
 }

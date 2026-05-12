@@ -1,0 +1,92 @@
+{
+  "ef1a1a03d3f2a8e84fe354f5d72714d272e61d8c0ef2abeaae212d396306ab01": {
+    "mode": "kpi",
+    "sub_agent": "KPIEngine",
+    "final_answer": "Top Brand by Revenue: Nike, contributing ₹1,000.00.",
+    "chart": null,
+    "aggregates": {
+      "metric": "Top Brand by Revenue",
+      "value": 1000.0,
+      "format": "list",
+      "category_label": "Category Performance",
+      "rows": [
+        {
+          "label": "Nike",
+          "value": 1000.0
+        }
+      ],
+      "chartable": true
+    },
+    "_internal": {
+      "kpi": "top_brand",
+      "label": "Top Brand by Revenue",
+      "category": "hierarchy",
+      "value": 1000.0,
+      "output_type": "list",
+      "formula": "argmax(brand, SUM(Total Amount))",
+      "explanation": "Brand contributing the highest revenue among classified products.",
+      "sql_used": "SELECT br.name AS label,        COALESCE(SUM(s.\"Total Amount\"), 0) AS value FROM sales s JOIN product_master pm ON pm.product_name = s.\"Product Name\" JOIN product_hierarchy br ON br.id = pm.brand_id GROUP BY br.name ORDER BY value DESC LIMIT 1",
+      "required_columns": [
+        "Product Name",
+        "Total Amount"
+      ],
+      "missing_columns": [],
+      "rows": [
+        {
+          "label": "Nike",
+          "value": 1000.0
+        }
+      ],
+      "computed_at": "2026-05-12T20:12:19+00:00",
+      "warnings": [],
+      "error": null,
+      "chart_supported": true
+    },
+    "stored_at": "2026-05-12T20:12:19+00:00"
+  },
+  "37c7da0b47340102db11315a7d551945a31aaf2d25281dc18d90639e122b6bc9": {
+    "mode": "kpi",
+    "sub_agent": "KPIEngine",
+    "final_answer": "Top Brand by Revenue: Nike, contributing ₹2,000.00.",
+    "chart": null,
+    "aggregates": {
+      "metric": "Top Brand by Revenue",
+      "value": 2000.0,
+      "format": "list",
+      "category_label": "Category Performance",
+      "rows": [
+        {
+          "label": "Nike",
+          "value": 2000.0
+        }
+      ],
+      "chartable": true
+    },
+    "_internal": {
+      "kpi": "top_brand",
+      "label": "Top Brand by Revenue",
+      "category": "hierarchy",
+      "value": 2000.0,
+      "output_type": "list",
+      "formula": "argmax(brand, SUM(Total Amount))",
+      "explanation": "Brand contributing the highest revenue among classified products.",
+      "sql_used": "SELECT br.name AS label,        COALESCE(SUM(s.\"Total Amount\"), 0) AS value FROM sales s JOIN product_master pm ON pm.product_name = s.\"Product Name\" JOIN product_hierarchy br ON br.id = pm.brand_id GROUP BY br.name ORDER BY value DESC LIMIT 1",
+      "required_columns": [
+        "Product Name",
+        "Total Amount"
+      ],
+      "missing_columns": [],
+      "rows": [
+        {
+          "label": "Nike",
+          "value": 2000.0
+        }
+      ],
+      "computed_at": "2026-05-12T20:12:36+00:00",
+      "warnings": [],
+      "error": null,
+      "chart_supported": true
+    },
+    "stored_at": "2026-05-12T20:12:36+00:00"
+  }
+}

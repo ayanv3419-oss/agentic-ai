@@ -295,6 +295,7 @@ def _build_create(table: str) -> str:
         f"  batch_id TEXT NOT NULL,\n"
         f"  source TEXT NOT NULL DEFAULT 'upload',\n"
         f"  file_name TEXT,\n"
+        f"  row_hash TEXT,\n"
         f"  inserted_at TEXT NOT NULL DEFAULT (datetime('now')),\n"
         f"{cols_sql}\n"
         f")"
@@ -303,10 +304,33 @@ def _build_create(table: str) -> str:
 
 def _build_indexes(table: str) -> list[str]:
     return [
-        f'CREATE INDEX IF NOT EXISTS "idx_{table}_date"    ON {quoted(table)}("Date")',
-        f'CREATE INDEX IF NOT EXISTS "idx_{table}_party"   ON {quoted(table)}("Party Name")',
-        f'CREATE INDEX IF NOT EXISTS "idx_{table}_batch"   ON {quoted(table)}(batch_id)',
+        f'CREATE INDEX IF NOT EXISTS "idx_{table}_date"      ON {quoted(table)}("Date")',
+        f'CREATE INDEX IF NOT EXISTS "idx_{table}_party"     ON {quoted(table)}("Party Name")',
+        f'CREATE INDEX IF NOT EXISTS "idx_{table}_batch"     ON {quoted(table)}(batch_id)',
+        f'CREATE INDEX IF NOT EXISTS "idx_{table}_row_hash"  ON {quoted(table)}(row_hash)',
     ]
+
+
+# Idempotent column additions for already-deployed sales/purchase tables.
+_TABLE_HASH_ALTERS: tuple[str, ...] = ("row_hash",)
+
+
+# is_mock_named: 1 when a row's "Product Name" was filled by the mock-
+# backfill engine because the original upload row had a blank product
+# name. Real product-name rows always have is_mock_named = 0.
+def _table_mock_alter(table: str) -> str:
+    return f'ALTER TABLE {quoted(table)} ADD COLUMN is_mock_named INTEGER NOT NULL DEFAULT 0'
+
+
+# Quantity column — synthesized when a row lands without it, so unit-
+# velocity / profit-per-product analytics work even for legacy uploads.
+def _table_quantity_alter(table: str) -> str:
+    return f'ALTER TABLE {quoted(table)} ADD COLUMN "Quantity" REAL'
+
+
+# is_mock_quantity: 1 when Quantity was backfilled (vs supplied at upload).
+def _table_qty_flag_alter(table: str) -> str:
+    return f'ALTER TABLE {quoted(table)} ADD COLUMN is_mock_quantity INTEGER NOT NULL DEFAULT 0'
 
 
 _UPLOADS_DDL = """
@@ -321,6 +345,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     min_date      TEXT,
     max_date      TEXT,
     error_message TEXT,
+    file_path     TEXT,                            -- absolute path to persisted source file
     uploaded_at   TEXT NOT NULL DEFAULT (datetime('now'))
 )
 """
@@ -330,7 +355,253 @@ _UPLOADS_ALTERS: list[str] = [
     "ALTER TABLE uploads ADD COLUMN min_date      TEXT",
     "ALTER TABLE uploads ADD COLUMN max_date      TEXT",
     "ALTER TABLE uploads ADD COLUMN error_message TEXT",
+    "ALTER TABLE uploads ADD COLUMN file_path     TEXT",
+    "ALTER TABLE uploads ADD COLUMN file_hash     TEXT",
+    "ALTER TABLE uploads ADD COLUMN file_bytes    INTEGER",
+    "ALTER TABLE uploads ADD COLUMN dedup_mode    TEXT",
+    "ALTER TABLE uploads ADD COLUMN rows_skipped_duplicate INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE uploads ADD COLUMN rows_replaced INTEGER NOT NULL DEFAULT 0",
 ]
+
+_UPLOADS_INDEXES: tuple[str, ...] = (
+    'CREATE INDEX IF NOT EXISTS "idx_uploads_file_hash" ON uploads(file_hash, status)',
+)
+
+
+def uploads_dir() -> Path:
+    """Permanent directory for source CSV/XLSX files. Files live here until
+    the user explicitly disconnects the dataset — never auto-cleaned."""
+    p = Path(settings.financial_db_path).parent / "uploads"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Product & Location hierarchy tables — populated from uploaded data only.
+# Trees are stored adjacency-list style (parent_id pointing to same table).
+# ---------------------------------------------------------------------------
+
+_PRODUCT_HIERARCHY_DDL = """
+CREATE TABLE IF NOT EXISTS product_hierarchy (
+    id          TEXT PRIMARY KEY,
+    level       TEXT NOT NULL,           -- 'business' | 'category' | 'subcategory' | 'product_type' | 'brand'
+    parent_id   TEXT,                    -- NULL for root
+    name        TEXT NOT NULL,
+    slug        TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(parent_id, slug)
+)
+"""
+
+_PRODUCT_MASTER_DDL = """
+CREATE TABLE IF NOT EXISTS product_master (
+    id             TEXT PRIMARY KEY,
+    product_name   TEXT NOT NULL UNIQUE,         -- canonical name as it appears in uploads
+    business_id    TEXT,
+    category_id    TEXT,
+    subcategory_id TEXT,
+    product_type_id TEXT,
+    brand_id       TEXT,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
+_LOCATION_HIERARCHY_DDL = """
+CREATE TABLE IF NOT EXISTS location_hierarchy (
+    id          TEXT PRIMARY KEY,
+    level       TEXT NOT NULL,           -- 'business' | 'city' | 'branch' | 'counter'
+    parent_id   TEXT,
+    name        TEXT NOT NULL,
+    slug        TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(parent_id, slug)
+)
+"""
+
+_BRANCH_MASTER_DDL = """
+CREATE TABLE IF NOT EXISTS branch_master (
+    id          TEXT PRIMARY KEY,
+    branch_name TEXT NOT NULL UNIQUE,
+    city        TEXT,
+    address     TEXT,
+    is_default  INTEGER NOT NULL DEFAULT 0,      -- exactly one row should have is_default=1
+    location_id TEXT,                            -- → location_hierarchy.id (the branch node)
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
+_HIERARCHY_INDEXES: tuple[str, ...] = (
+    'CREATE INDEX IF NOT EXISTS "idx_product_hierarchy_parent" ON product_hierarchy(parent_id)',
+    'CREATE INDEX IF NOT EXISTS "idx_product_hierarchy_level"  ON product_hierarchy(level)',
+    'CREATE INDEX IF NOT EXISTS "idx_product_master_name"      ON product_master(product_name)',
+    'CREATE INDEX IF NOT EXISTS "idx_product_master_category"  ON product_master(category_id)',
+    'CREATE INDEX IF NOT EXISTS "idx_location_hierarchy_parent" ON location_hierarchy(parent_id)',
+    'CREATE INDEX IF NOT EXISTS "idx_branch_master_enabled"    ON branch_master(enabled)',
+)
+
+
+# ---------------------------------------------------------------------------
+# Product Hierarchy v2 — 6-level synthetic enterprise hierarchy.
+#
+# Coexists with the original 5-level product_hierarchy table; all existing
+# KPIs continue to use the original. v2 is a strictly additive enrichment
+# layer for enterprise-style drilldown queries.
+#
+#   Need → Family → Class → Line → Type → Item (SKU)
+# ---------------------------------------------------------------------------
+
+_PRODUCT_HIERARCHY_V2_DDL = """
+CREATE TABLE IF NOT EXISTS product_hierarchy_v2 (
+    id          TEXT PRIMARY KEY,
+    level       TEXT NOT NULL,       -- 'need' | 'family' | 'class' | 'line' | 'type'
+    parent_id   TEXT,
+    name        TEXT NOT NULL,
+    slug        TEXT NOT NULL,
+    code        TEXT,                -- short code like 'FW', 'SHOE', 'ATH'
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(parent_id, slug)
+)
+"""
+
+# product_sku_master: maps a canonical Product Name (from sales/purchase
+# uploads) to its full 6-level path + a stable SKU code. Joinable from
+# any v2 KPI exactly like product_master joins for the v1 KPIs.
+_PRODUCT_SKU_MASTER_DDL = """
+CREATE TABLE IF NOT EXISTS product_sku_master (
+    id              TEXT PRIMARY KEY,            -- 'sku-<hex12>'
+    sku_code        TEXT NOT NULL UNIQUE,        -- 'SKU-FW-001' style
+    product_name    TEXT NOT NULL UNIQUE,        -- matches sales."Product Name"
+    need_id         TEXT,                        -- → product_hierarchy_v2.id (level=need)
+    family_id       TEXT,
+    class_id        TEXT,
+    line_id         TEXT,
+    type_id         TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
+_HIERARCHY_V2_INDEXES: tuple[str, ...] = (
+    'CREATE INDEX IF NOT EXISTS "idx_product_hierarchy_v2_parent" ON product_hierarchy_v2(parent_id)',
+    'CREATE INDEX IF NOT EXISTS "idx_product_hierarchy_v2_level"  ON product_hierarchy_v2(level)',
+    'CREATE INDEX IF NOT EXISTS "idx_product_sku_master_name"     ON product_sku_master(product_name)',
+    'CREATE INDEX IF NOT EXISTS "idx_product_sku_master_class"    ON product_sku_master(class_id)',
+    'CREATE INDEX IF NOT EXISTS "idx_product_sku_master_family"   ON product_sku_master(family_id)',
+)
+
+
+# ---------------------------------------------------------------------------
+# Enrichment layers — Inventory + Forecast.
+#
+# These tables are DERIVED from the real sales/purchase data:
+#   • sku_inventory   — current stock + velocity + status per SKU
+#   • sku_forecast    — 14-day forward projection per SKU
+#
+# Every row is regenerated by app/enrichment/* on startup and after every
+# upload. The real transactional tables (sales, purchase) are never written
+# or modified by enrichment — they are read-only inputs.
+# ---------------------------------------------------------------------------
+
+_SKU_INVENTORY_DDL = """
+CREATE TABLE IF NOT EXISTS sku_inventory (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    sku_code            TEXT NOT NULL UNIQUE,
+    product_name        TEXT NOT NULL,
+    on_hand_qty         INTEGER NOT NULL DEFAULT 0,
+    reorder_level       INTEGER NOT NULL DEFAULT 0,
+    avg_daily_sales     REAL NOT NULL DEFAULT 0,
+    avg_daily_revenue   REAL NOT NULL DEFAULT 0,
+    days_of_cover       REAL,
+    status              TEXT NOT NULL DEFAULT 'unknown',  -- ok | low | overstocked | dead | unknown
+    last_refreshed_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    source              TEXT NOT NULL DEFAULT 'synthetic'
+)
+"""
+
+_SKU_FORECAST_DDL = """
+CREATE TABLE IF NOT EXISTS sku_forecast (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    sku_code        TEXT NOT NULL,
+    forecast_date   TEXT NOT NULL,
+    forecast_qty    REAL NOT NULL DEFAULT 0,
+    forecast_revenue REAL NOT NULL DEFAULT 0,
+    method          TEXT NOT NULL DEFAULT 'trailing_30',
+    confidence      REAL,
+    generated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(sku_code, forecast_date)
+)
+"""
+
+_ENRICHMENT_INDEXES: tuple[str, ...] = (
+    'CREATE INDEX IF NOT EXISTS "idx_sku_inventory_status" ON sku_inventory(status)',
+    'CREATE INDEX IF NOT EXISTS "idx_sku_inventory_sku"    ON sku_inventory(sku_code)',
+    'CREATE INDEX IF NOT EXISTS "idx_sku_forecast_sku"     ON sku_forecast(sku_code)',
+    'CREATE INDEX IF NOT EXISTS "idx_sku_forecast_date"    ON sku_forecast(forecast_date)',
+)
+
+
+# Per-product unit cost — required for profit / margin / loss KPIs that
+# operate at SKU granularity. Costs are deterministically generated from
+# the average sale price * a class-aware margin band (e.g. ~55-65% of
+# avg sale price for footwear). Source is tagged 'synthetic' or 'manual'
+# so the user knows what's mock vs. user-supplied.
+_PRODUCT_COST_MASTER_DDL = """
+CREATE TABLE IF NOT EXISTS product_cost_master (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_name       TEXT NOT NULL UNIQUE,
+    unit_cost          REAL NOT NULL,
+    avg_sale_price     REAL NOT NULL,
+    margin_pct         REAL NOT NULL,
+    source             TEXT NOT NULL DEFAULT 'synthetic',
+    last_refreshed_at  TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
+_PRODUCT_COST_INDEXES: tuple[str, ...] = (
+    'CREATE INDEX IF NOT EXISTS "idx_product_cost_master_name" ON product_cost_master(product_name)',
+)
+
+
+# ---------------------------------------------------------------------------
+# Central error log table.
+#
+# Every uncaught exception, validation failure, upload error, AI pipeline
+# crash, and explicitly-reported frontend error lands here. The /errors API
+# reads from this table; analytics rolls up counts by module + severity.
+# ---------------------------------------------------------------------------
+
+_ERROR_LOG_DDL = """
+CREATE TABLE IF NOT EXISTS error_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    error_id        TEXT NOT NULL UNIQUE,
+    occurred_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    severity        TEXT NOT NULL,        -- critical | high | medium | low
+    module          TEXT NOT NULL,        -- sales | upload | ai | kpi | dashboard | auth | database | system | frontend | ...
+    error_type      TEXT NOT NULL,        -- ExceptionType or 'frontend' / 'validation' / etc.
+    message         TEXT NOT NULL,
+    endpoint        TEXT,                  -- HTTP path or null
+    method          TEXT,                  -- HTTP verb or null
+    user_facing     INTEGER NOT NULL DEFAULT 0,
+    suggested_fix   TEXT,
+    source          TEXT,                  -- file:line or logical source identifier
+    stack_trace     TEXT,                  -- full traceback for developers
+    request_payload TEXT,                  -- JSON snippet of request body / args
+    context         TEXT,                  -- JSON of extra fields
+    resolved        INTEGER NOT NULL DEFAULT 0,
+    resolved_at     TEXT,
+    resolved_note   TEXT
+)
+"""
+
+_ERROR_LOG_INDEXES: tuple[str, ...] = (
+    'CREATE INDEX IF NOT EXISTS "idx_error_log_occurred"   ON error_log(occurred_at DESC)',
+    'CREATE INDEX IF NOT EXISTS "idx_error_log_module"     ON error_log(module, severity)',
+    'CREATE INDEX IF NOT EXISTS "idx_error_log_resolved"   ON error_log(resolved, occurred_at DESC)',
+    'CREATE INDEX IF NOT EXISTS "idx_error_log_type"       ON error_log(error_type)',
+)
 
 
 async def init_database() -> None:
@@ -342,9 +613,31 @@ async def init_database() -> None:
         await db.execute("PRAGMA synchronous=NORMAL")
         for table in ALLOWED_TABLES:
             await db.execute(_build_create(table))
+            # Forward-migration: add hash + SCHEMA_SPEC columns missing
+            # from older DBs (must run BEFORE indexes that reference them).
+            for col in _TABLE_HASH_ALTERS:
+                try:
+                    await db.execute(
+                        f'ALTER TABLE {quoted(table)} ADD COLUMN {col} TEXT'
+                    )
+                except aiosqlite.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+            # is_mock_named flag for the product-name backfill engine.
+            try:
+                await db.execute(_table_mock_alter(table))
+            except aiosqlite.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+            # Quantity + is_mock_quantity flag for unit-velocity analytics.
+            for alter in (_table_quantity_alter(table), _table_qty_flag_alter(table)):
+                try:
+                    await db.execute(alter)
+                except aiosqlite.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
             for stmt in _build_indexes(table):
                 await db.execute(stmt)
-            # Forward-migration: add SCHEMA_SPEC columns missing from older DBs.
             for col_name, sql_type, required in SCHEMA_SPEC:
                 null_clause = "NOT NULL" if required else "NULL"
                 try:
@@ -355,6 +648,35 @@ async def init_database() -> None:
                 except aiosqlite.OperationalError as e:
                     if "duplicate column" not in str(e).lower():
                         raise
+            # Archive table — identical shape to the live table. Rows are
+            # physically moved here when a dataset is archived, so live
+            # analytics SELECTs (which target sales/purchase) never see
+            # archived data without any KPI-template changes.
+            archive_table = f"{table}_archive"
+            await db.execute(_build_create(archive_table))
+            # Mirror the same ALTERs onto the archive table so a future
+            # archive_upload() can INSERT ... SELECT * without column-
+            # count mismatches.
+            for col in _TABLE_HASH_ALTERS:
+                try:
+                    await db.execute(
+                        f'ALTER TABLE {quoted(archive_table)} ADD COLUMN {col} TEXT'
+                    )
+                except aiosqlite.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+            try:
+                await db.execute(_table_mock_alter(archive_table))
+            except aiosqlite.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+            for alter in (_table_quantity_alter(archive_table),
+                          _table_qty_flag_alter(archive_table)):
+                try:
+                    await db.execute(alter)
+                except aiosqlite.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
         await db.execute(_UPLOADS_DDL)
         for stmt in _UPLOADS_ALTERS:
             try:
@@ -362,6 +684,33 @@ async def init_database() -> None:
             except aiosqlite.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+        for stmt in _UPLOADS_INDEXES:
+            await db.execute(stmt)
+        # Hierarchy tables — idempotent.
+        await db.execute(_PRODUCT_HIERARCHY_DDL)
+        await db.execute(_PRODUCT_MASTER_DDL)
+        await db.execute(_LOCATION_HIERARCHY_DDL)
+        await db.execute(_BRANCH_MASTER_DDL)
+        for stmt in _HIERARCHY_INDEXES:
+            await db.execute(stmt)
+        # v2 enterprise hierarchy — additive, alongside the original.
+        await db.execute(_PRODUCT_HIERARCHY_V2_DDL)
+        await db.execute(_PRODUCT_SKU_MASTER_DDL)
+        for stmt in _HIERARCHY_V2_INDEXES:
+            await db.execute(stmt)
+        # Enrichment layers — inventory + forecast, derived from real sales.
+        await db.execute(_SKU_INVENTORY_DDL)
+        await db.execute(_SKU_FORECAST_DDL)
+        for stmt in _ENRICHMENT_INDEXES:
+            await db.execute(stmt)
+        # Product cost master (per-product unit cost, for profit/margin KPIs).
+        await db.execute(_PRODUCT_COST_MASTER_DDL)
+        for stmt in _PRODUCT_COST_INDEXES:
+            await db.execute(stmt)
+        # Error-log table.
+        await db.execute(_ERROR_LOG_DDL)
+        for stmt in _ERROR_LOG_INDEXES:
+            await db.execute(stmt)
         await db.commit()
     log.info("financial DB initialized at %s", p)
 
@@ -388,7 +737,10 @@ async def fetch_one(sql: str, params: Iterable[Any] = ()) -> dict[str, Any] | No
 
 
 async def count_rows(table: str) -> int:
-    if table not in ALLOWED_TABLES:
+    # Accept the live tables AND their archive counterparts. Everything
+    # else returns 0 — keeps count_rows safe from arbitrary table reads.
+    allowed = set(ALLOWED_TABLES) | {f"{t}_archive" for t in ALLOWED_TABLES}
+    if table not in allowed:
         return 0
     row = await fetch_one(f"SELECT COUNT(*) AS n FROM {quoted(table)}")
     return int(row["n"]) if row else 0
@@ -401,28 +753,38 @@ def insert_rows(
     batch_id: str,
     source: str = "upload",
     file_name: str | None = None,
+    row_hashes: list[str] | None = None,
 ) -> int:
     """Synchronous bulk insert wrapped in one transaction. Returns rows inserted.
 
     Run this inside `asyncio.to_thread` from async callers — it uses the
     plain sqlite3 driver because executemany is fastest there.
+
+    `row_hashes` parallels `rows`. When None, row_hash is NULL — older
+    callers keep working but lose duplicate-detection benefits on those rows.
     """
     if table not in ALLOWED_TABLES:
         raise ValueError(f"unknown table: {table!r}")
     if not rows:
         return 0
+    if row_hashes is not None and len(row_hashes) != len(rows):
+        raise ValueError(
+            f"row_hashes length ({len(row_hashes)}) != rows length ({len(rows)})"
+        )
 
-    cols = ["batch_id", "source", "file_name", *SCHEMA_COLUMNS]
+    cols = ["batch_id", "source", "file_name", "row_hash", *SCHEMA_COLUMNS]
     placeholders = ",".join(["?"] * len(cols))
     col_sql = ",".join(quoted(c) for c in cols)
     sql = f"INSERT INTO {quoted(table)} ({col_sql}) VALUES ({placeholders})"
 
     payload: list[tuple[Any, ...]] = []
-    for r in rows:
+    for i, r in enumerate(rows):
+        rh = row_hashes[i] if row_hashes is not None else None
         payload.append((
             batch_id,
             source,
             file_name,
+            rh,
             *(r.get(c) for c in SCHEMA_COLUMNS),
         ))
 
@@ -449,6 +811,13 @@ def insert_rows(
 # 5. UPLOAD REGISTRY — uploads-table CRUD
 # ===========================================================================
 
+_UPLOAD_META_COLS = (
+    "batch_id, filename, target, rows_inserted, rows_failed, "
+    "source, status, min_date, max_date, error_message, file_path, "
+    "file_hash, file_bytes, dedup_mode, rows_skipped_duplicate, rows_replaced, uploaded_at"
+)
+
+
 async def record_upload_meta(
     batch_id: str,
     filename: str,
@@ -461,43 +830,177 @@ async def record_upload_meta(
     min_date: str | None = None,
     max_date: str | None = None,
     error_message: str | None = None,
+    file_path: str | None = None,
+    file_hash: str | None = None,
+    file_bytes: int | None = None,
+    dedup_mode: str | None = None,
+    rows_skipped_duplicate: int = 0,
+    rows_replaced: int = 0,
 ) -> None:
-    if status not in ("active", "error", "removed"):
+    if status not in ("active", "archived", "error", "removed"):
         raise ValueError(f"unknown upload status: {status!r}")
     async with get_connection() as db:
         await db.execute(
             """INSERT OR REPLACE INTO uploads
                (batch_id, filename, target, rows_inserted, rows_failed,
-                source, status, min_date, max_date, error_message)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                source, status, min_date, max_date, error_message, file_path,
+                file_hash, file_bytes, dedup_mode,
+                rows_skipped_duplicate, rows_replaced)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (batch_id, filename, target, rows_inserted, rows_failed,
-             source, status, min_date, max_date, error_message),
+             source, status, min_date, max_date, error_message, file_path,
+             file_hash, file_bytes, dedup_mode,
+             rows_skipped_duplicate, rows_replaced),
         )
         await db.commit()
 
 
 async def list_uploads_meta(limit: int = 200) -> list[dict[str, Any]]:
     return await fetch_all(
-        """SELECT batch_id, filename, target, rows_inserted, rows_failed,
-                  source, status, min_date, max_date, error_message, uploaded_at
-           FROM uploads
-           ORDER BY uploaded_at DESC
-           LIMIT ?""",
+        f"SELECT {_UPLOAD_META_COLS} FROM uploads "
+        "ORDER BY uploaded_at DESC LIMIT ?",
         (limit,),
     )
 
 
 async def get_upload_meta(batch_id: str) -> dict[str, Any] | None:
     return await fetch_one(
-        """SELECT batch_id, filename, target, rows_inserted, rows_failed,
-                  source, status, min_date, max_date, error_message, uploaded_at
-           FROM uploads WHERE batch_id = ?""",
+        f"SELECT {_UPLOAD_META_COLS} FROM uploads WHERE batch_id = ?",
         (batch_id,),
     )
 
 
+async def find_active_upload_by_file_hash(file_hash: str) -> dict[str, Any] | None:
+    """Return the metadata of an existing active upload whose source file
+    hashes to the same SHA256. None if no match."""
+    if not file_hash:
+        return None
+    return await fetch_one(
+        f"SELECT {_UPLOAD_META_COLS} FROM uploads "
+        "WHERE file_hash = ? AND status = 'active' "
+        "ORDER BY uploaded_at DESC LIMIT 1",
+        (file_hash,),
+    )
+
+
+async def archive_upload(batch_id: str) -> dict[str, Any]:
+    """Soft-deactivate a dataset: move its rows from the live table to the
+    archive table and flip status='archived'. The source file is kept.
+    Analytics SELECTs target the live table only, so the AI immediately
+    stops using archived data — no KPI template changes required.
+
+    Idempotent: archiving an already-archived batch is a no-op success.
+    """
+    meta = await get_upload_meta(batch_id)
+    if meta is None:
+        raise ValueError(f"unknown batch_id: {batch_id}")
+    target = meta["target"]
+    if target not in ALLOWED_TABLES:
+        raise ValueError(f"upload metadata has invalid target: {target!r}")
+    status = meta.get("status")
+    if status == "archived":
+        return {
+            "batch_id": batch_id, "rows_moved": 0,
+            "table": target, "status": "archived", "already_archived": True,
+        }
+    if status == "removed":
+        raise ValueError(f"cannot archive a removed batch: {batch_id}")
+    if status != "active":
+        raise ValueError(f"cannot archive batch in status {status!r}")
+
+    live_t = quoted(target)
+    arch_t = quoted(target + "_archive")
+    rows_moved = 0
+    async with get_connection() as db:
+        # Move rows: INSERT then DELETE in one transaction. SQLite supports
+        # INSERT ... SELECT with column lists; we use SELECT * since the
+        # archive schema is identical (built from the same _build_create).
+        # We list columns explicitly so a future schema drift produces a
+        # clear error rather than a silent mismatch.
+        cur = await db.execute(
+            f'SELECT COUNT(*) AS n FROM {live_t} WHERE batch_id = ?', (batch_id,)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        rows_moved = int(dict(row).get("n") or 0) if row else 0
+
+        if rows_moved > 0:
+            await db.execute(
+                f'INSERT INTO {arch_t} SELECT * FROM {live_t} WHERE batch_id = ?',
+                (batch_id,),
+            )
+            await db.execute(
+                f'DELETE FROM {live_t} WHERE batch_id = ?', (batch_id,),
+            )
+        await db.execute(
+            "UPDATE uploads SET status='archived' WHERE batch_id = ?",
+            (batch_id,),
+        )
+        await db.commit()
+    log.info("archive_upload: batch=%s table=%s rows_moved=%d", batch_id, target, rows_moved)
+    return {
+        "batch_id": batch_id, "rows_moved": rows_moved,
+        "table": target, "status": "archived", "already_archived": False,
+    }
+
+
+async def unarchive_upload(batch_id: str) -> dict[str, Any]:
+    """Reverse of archive_upload: move rows back from the archive table to
+    the live table and flip status='active'."""
+    meta = await get_upload_meta(batch_id)
+    if meta is None:
+        raise ValueError(f"unknown batch_id: {batch_id}")
+    target = meta["target"]
+    if target not in ALLOWED_TABLES:
+        raise ValueError(f"upload metadata has invalid target: {target!r}")
+    status = meta.get("status")
+    if status == "active":
+        return {
+            "batch_id": batch_id, "rows_moved": 0,
+            "table": target, "status": "active", "already_active": True,
+        }
+    if status != "archived":
+        raise ValueError(f"cannot unarchive batch in status {status!r}")
+
+    live_t = quoted(target)
+    arch_t = quoted(target + "_archive")
+    rows_moved = 0
+    async with get_connection() as db:
+        cur = await db.execute(
+            f'SELECT COUNT(*) AS n FROM {arch_t} WHERE batch_id = ?', (batch_id,)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        rows_moved = int(dict(row).get("n") or 0) if row else 0
+        if rows_moved > 0:
+            await db.execute(
+                f'INSERT INTO {live_t} SELECT * FROM {arch_t} WHERE batch_id = ?',
+                (batch_id,),
+            )
+            await db.execute(
+                f'DELETE FROM {arch_t} WHERE batch_id = ?', (batch_id,),
+            )
+        await db.execute(
+            "UPDATE uploads SET status='active' WHERE batch_id = ?",
+            (batch_id,),
+        )
+        await db.commit()
+    log.info("unarchive_upload: batch=%s table=%s rows_moved=%d", batch_id, target, rows_moved)
+    return {
+        "batch_id": batch_id, "rows_moved": rows_moved,
+        "table": target, "status": "active", "already_active": False,
+    }
+
+
 async def disconnect_upload(batch_id: str) -> dict[str, Any]:
-    """Remove a dataset from active sources. Deletes rows + marks 'removed'."""
+    """Remove a dataset permanently. Deletes:
+      • All rows in sales/purchase AND sales_archive/purchase_archive
+        tagged with this batch_id (handles archived datasets correctly).
+      • The persisted source file on disk (if any).
+    Marks the uploads row 'removed' (kept for audit history).
+
+    The user must explicitly call this — nothing else removes a dataset.
+    """
     meta = await get_upload_meta(batch_id)
     if meta is None:
         raise ValueError(f"unknown batch_id: {batch_id}")
@@ -508,6 +1011,7 @@ async def disconnect_upload(batch_id: str) -> dict[str, Any]:
         return {
             "batch_id": batch_id,
             "rows_removed": 0,
+            "file_removed": False,
             "table": target,
             "already_removed": True,
             "status": "removed",
@@ -519,18 +1023,40 @@ async def disconnect_upload(batch_id: str) -> dict[str, Any]:
         )
         rows_removed = cur.rowcount or 0
         await cur.close()
+        # Also remove from the archive table — handles datasets that were
+        # archived before being deleted.
+        cur = await db.execute(
+            f'DELETE FROM {quoted(target + "_archive")} WHERE batch_id = ?',
+            (batch_id,),
+        )
+        rows_removed += (cur.rowcount or 0)
+        await cur.close()
         await db.execute(
             "UPDATE uploads SET status='removed' WHERE batch_id = ?",
             (batch_id,),
         )
         await db.commit()
+    # Also delete the persisted source file, if it exists. Failure to delete
+    # is logged but doesn't break the request — the database state is what
+    # matters for analytics correctness.
+    file_removed = False
+    fp = meta.get("file_path")
+    if fp:
+        try:
+            p = Path(fp)
+            if p.exists() and p.is_file():
+                p.unlink()
+                file_removed = True
+        except Exception:
+            log.warning("failed to delete persisted upload file: %s", fp, exc_info=True)
     log.info(
-        "disconnect_upload: batch=%s table=%s rows_removed=%d",
-        batch_id, target, rows_removed,
+        "disconnect_upload: batch=%s table=%s rows_removed=%d file_removed=%s",
+        batch_id, target, rows_removed, file_removed,
     )
     return {
         "batch_id": batch_id,
         "rows_removed": int(rows_removed),
+        "file_removed": file_removed,
         "table": target,
         "already_removed": False,
         "status": "removed",
