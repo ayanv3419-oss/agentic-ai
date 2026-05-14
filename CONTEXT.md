@@ -1,38 +1,45 @@
 # Agentic AI — Domain Context
 
-> Read this before touching any code. It defines the vocabulary, boundaries, and
-> architectural contracts every agent and human contributor must respect.
+> Read this before touching any code. Defines the vocabulary, module boundaries,
+> invariants, and known risks every agent and contributor must respect.
+> For deep architecture details see ARCHITECTURE.md.
+> For production risks see PRODUCTION_READINESS_REPORT.md.
 
 ---
 
 ## 1. What this system is
 
-**Agentic AI** is an LLM-coordinated analytics platform for small businesses.
-A user uploads their sales / purchase records (CSV or XLSX), then asks
-natural-language questions. The system replies with grounded numeric results,
-narrative insight, and chart-ready aggregates — all streamed live via SSE.
+**Agentic AI** is a local-first, single-user, LLM-coordinated analytics platform for small businesses.
+Users upload CSV/XLSX financial records (sales + purchases), then ask natural-language questions.
+The system answers with grounded numeric results, narrative insight, and chart-ready aggregates — streamed live.
+
+Current maturity: **MVP / pre-production** (score 58/100). Not suitable for multi-tenant or high-traffic deployments without auth and Postgres.
 
 ---
 
-## 2. Glossary (use these terms exactly)
+## 2. Glossary — use these terms exactly
 
-| Term | Meaning |
+| Term | Definition |
 |---|---|
-| **Turn** | One complete question → answer cycle, from `POST /query_stream` to `turn.end` |
-| **Sub-agent** | A named pipeline that handles one class of analytic intent (`QueryAgent`, `AnalyticsAgent`, `RCAAgent`, `ForecastAgent`) |
-| **Tool** | A single deterministic step in a sub-agent pipeline (e.g. `SqlPlanner`, `SqlExecutor`) |
-| **TurnState** | The immutable, frozen state object passed between tools in a single turn |
-| **Intent router** | The first-stage classifier — deterministic keyword+regex; outputs `chat` or `agentic` |
-| **Dispatcher** | The second-stage LLM call that picks which sub-agent to invoke |
-| **Pipeline** | The ordered list of `(tool_name, args)` steps a sub-agent declares |
-| **Batch** | A single file upload — tracked in the `uploads` table with a `batch_id` |
+| **Turn** | One complete question → answer cycle, from `POST /query_stream` to `turn.end` SSE event |
+| **TurnState** | Frozen Pydantic model — single source of truth passed between tools. Never mutated; use `.apply(**updates)` |
+| **Sub-agent** | A named class declaring a fixed `pipeline` of `(tool_name, args)` steps |
+| **Tool** | A single deterministic step in a pipeline. Extends `Tool` ABC, implements `async run(state, args) → ToolResult` |
+| **ToolResult** | Return value of a tool: `{ok, output, state_updates, delta_metrics, error}` |
+| **Intent router** | `classify_query_kind()` — deterministic keyword+regex classifier. Outputs `data_query | chat | general_knowledge | missing_data` |
+| **KPI fast-path** | Before the 14-tool pipeline, the coordinator matches the question against the KPI registry. On a confident match, executes a pre-validated SQL template — no LLM |
+| **Dispatcher** | Single Groq LLM call that picks which sub-agent to run. Returns `{sub_agent, reason}` |
+| **Pipeline** | Ordered list of `(tool_name, args)` steps a sub-agent declares at definition time |
+| **Batch** | A single file upload — tracked in the `uploads` table with a `batch_id` (UUID) |
 | **Dataset** | Either `sales` or `purchase` — two physically identical SQLite tables |
-| **Response cache** | SHA-256-keyed JSON store in `data/response_store.json`; invalidated on any upload/disconnect |
-| **Cost guard** | Hard per-turn limits on LLM iterations (default: 8) and USD spend (default: $1) |
-| **Capability token** | `INGESTION_PIN` / `READ_PIN` — the only way to access the Database tool; prevents ad-hoc SQL from tools that shouldn't write |
+| **Response cache** | SHA-256-keyed JSON store in `data/response_store.json`. Invalidated on any upload/disconnect |
+| **Cost guard** | Hard per-turn limits: iterations (default 8) and USD spend (default $1.00) |
+| **Capability token** | `INGESTION_PIN` / `READ_PIN` — the only way to access the `Database` tool |
 | **SSE event** | Server-Sent Event emitted during a turn: `tool.call`, `tool.result`, `cache.hit`, `final`, `turn.end` |
-| **KPI** | A named metric (e.g. total_sales, orders) computed by the KPI engine without an LLM |
-| **ADR** | Architectural Decision Record — a `docs/adr/NNNN-*.md` file recording a past design decision |
+| **PresentationEmitter** | Wrapper that strips internal fields (`sql_used`, `formula`, `stack_trace`, etc.) before events reach the browser |
+| **KPI** | A named metric (e.g. `total_sales`, `orders`) computed by the KPI engine without an LLM |
+| **Data version** | Monotonic counter bumped on every upload/disconnect — used by frontend to detect stale data |
+| **ADR** | Architectural Decision Record in `docs/adr/NNNN-*.md` |
 
 ---
 
@@ -42,54 +49,59 @@ narrative insight, and chart-ready aggregates — all streamed live via SSE.
 
 | File / folder | Owns |
 |---|---|
-| `app/infrastructure.py` | Settings (pydantic-settings), SQLite schema, DB connection helpers, upload parsers, JSON cache, memory/synonyms |
-| `app/analytics_engine.py` | TurnState + 14 tools + tool registry + Groq client + SSE EventEmitter + cost guard + Coordinator + 7 sub-agents |
-| `app/core_system.py` | FastAPI app, all HTTP routes, CORS, exception handlers, startup hook |
-| `app/kpi/` | KPI registry, matcher, engine — computes named metrics without LLM |
-| `app/hierarchy/` | Product / location / clarification hierarchy resolution |
-| `app/vector/` | Vector store, embeddings, semantic search (pluggable adapter pattern) |
-| `app/monitoring/` | Sentry config, tracing, instrumentation |
-| `app/enrichment/` | Forecast, inventory, cost enrichment (mock + real adapters) |
-| `app/database/` | DB engine abstraction (SQLite default; Postgres via `DATABASE_URL`) |
-| `app/time_engine.py` | Date token resolution and dataset date-range queries |
-| `app/dedup.py` | Deduplication logic for uploaded batches |
-| `app/errors.py` | Typed error hierarchy |
+| `app/infrastructure.py` | Settings, SQLite schema, DB helpers, upload parsers, response cache, synonyms |
+| `app/analytics_engine.py` | TurnState, EventEmitter, CostGuard, GroqClient, 14 tools, registry, 7 sub-agents, Coordinator |
+| `app/core_system.py` | FastAPI app, all HTTP routes, CORS, rate limiter, startup, exception handlers |
+| `app/kpi/` | KPI registry (SQLite-backed), matcher, formula execution engine |
+| `app/hierarchy/` | Product + location tree management (v1 adjacency list + v2 6-level enterprise) |
+| `app/vector/` | Vector store, embeddings, semantic search — **installed but not yet wired into pipeline** |
+| `app/monitoring/` | Sentry config, tracing, request context |
+| `app/enrichment/` | Forecast (linear regression), inventory snapshot, cost master |
+| `app/database/` | Engine abstraction — SQLite default, asyncpg Postgres when `DATABASE_URL` is set |
+| `app/time_engine.py` | Dataset-relative date token resolution |
+| `app/dedup.py` | File-level SHA-256 deduplication |
+| `app/errors.py` | Typed error log (SQLite-backed, queryable via `/errors`) |
 
-Import direction (never reverse): `core_system → analytics_engine → infrastructure`
+**Import direction (never reverse):**
+```
+core_system → analytics_engine → infrastructure
+core_system → kpi / hierarchy / vector / monitoring / enrichment / database / time_engine / dedup / errors
+```
 
 ### Frontend — `frontend/src/`
 
 | File | Owns |
 |---|---|
-| `App.tsx` | Layout shell, auth gate, view switcher |
-| `ui_system.tsx` | All routable pages + subcomponents |
-| `client_core.ts` | TypeScript types + API client (REST + SSE) + Zustand store |
+| `App.tsx` | Layout shell, login gate (cosmetic only — not real auth), view switcher, error boundaries |
+| `ui_system.tsx` | All pages: Dashboard, AiAssistant, UploadData, ShopInfo |
+| `client_core.ts` | TypeScript types, API client (REST + SSE), Zustand global store |
 | `index.css` | Tailwind directives + theme tokens |
 
 ---
 
-## 4. Data model
+## 4. Key invariants — never break these
 
-Two tables — `sales` and `purchase` — sharing an identical 19-column schema:
-
-```
-Date (required), Total Amount (required), Party Name, Voucher No,
-Voucher Type, Quantity, Rate, Discount, Tax, Batch No,
-Item Name, Group, Category, Unit, Narration,
-id (PK), batch_id (FK→uploads), source, file_name, inserted_at
-```
-
-Header aliases: a closed `HEADER_ALIASES` map normalises messy ERP headers on ingest.
+1. **TurnState is immutable.** Never `state.field = value`. Always `state = state.apply(field=value)`.
+2. **Database tool is the only SQL path.** All SQLite access from the pipeline must go through the `Database` tool with `READ_PIN` or `INGESTION_PIN`. No direct `fetch_all()` calls from tools.
+3. **Pipelines are deterministic.** No LLM-driven tool selection inside a pipeline. Only the Dispatcher chooses the sub-agent.
+4. **No cross-request Groq key leakage.** Each turn uses a `contextvars`-scoped `GroqClient`. Never store user keys in shared state.
+5. **Cache invalidation is total.** Any upload or disconnect calls `invalidate_all()` — no partial invalidation.
+6. **Import direction is downward.** `core_system → analytics_engine → infrastructure`. No reverse imports.
+7. **PresentationEmitter wraps all user-facing SSE.** Never emit raw internal events directly to the browser.
 
 ---
 
-## 5. Key invariants (never break these)
+## 5. Known critical issues (from audit)
 
-1. **No cross-request Groq key leakage** — each turn uses a `contextvars`-scoped `GroqClient`; the browser supplies the key in `X-Groq-Api-Key`.
-2. **Database tool is the only SQL path** — no tool may query SQLite directly; all access must go through `Database` tool with `READ_PIN` or `INGESTION_PIN`.
-3. **Sub-agent pipelines are deterministic** — no dynamic tool selection inside a pipeline; only the Dispatcher LLM chooses the sub-agent.
-4. **Cache invalidation is total** — any upload or disconnect clears `response_store.json` completely.
-5. **Import direction is downward** — `core_system → analytics_engine → infrastructure`. No upward imports.
+| ID | Issue | Severity |
+|---|---|---|
+| C1 | Frontend credentials hardcoded in `App.tsx` (user: Mansuri, pass: 182012) | CRITICAL |
+| C2 | Backend has no authentication — all routes are public | CRITICAL |
+| C3 | LLM-generated SQL executed with keyword-denylist only (no parameterization) | HIGH |
+| C4 | Response cache unbounded flat JSON file (no TTL, no eviction) | HIGH |
+| C5 | `analytics_engine.py` is a 57 KB monolith | HIGH |
+
+See `PRODUCTION_READINESS_REPORT.md` for full list and remediation plan.
 
 ---
 
@@ -97,5 +109,18 @@ Header aliases: a closed `HEADER_ALIASES` map normalises messy ERP headers on in
 
 - **Provider:** Groq (`/openai/v1/chat/completions`)
 - **Default model:** `llama-3.3-70b-versatile`
-- **Used for:** Dispatcher (sub-agent selection), InsightEngine (narrative), SqlPlanner (SQL generation), chat responder
-- **Not used for:** intent routing (deterministic), KPI calculation, dashboard aggregates, forecasting (in-house linear regression)
+- **Used for:** Dispatcher (sub-agent selection), SqlPlanner, InsightEngine, chat/knowledge responder
+- **Not used for:** intent routing (deterministic), KPI calculation, dashboard aggregates, forecasting (linear regression)
+- **Fallback:** None — if Groq is down, agentic pipeline is unavailable
+
+---
+
+## 7. Scores (audit 2025-05-15)
+
+| Dimension | Score |
+|---|---|
+| System Maturity | 58 / 100 |
+| Production Readiness | 42 / 100 |
+| Scalability | 35 / 100 |
+| Security | 30 / 100 |
+| AI Orchestration Quality | 68 / 100 |
