@@ -93,6 +93,11 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, alias="PORT")
     reload: bool = Field(default=False, alias="RELOAD")
 
+    # --- CORS -----------------------------------------------------------
+    # Comma-separated list of allowed origins. "*" means allow all (dev only).
+    # Example: https://myapp.vercel.app,https://myapp.com
+    allowed_origins: str = Field(default="*", alias="ALLOWED_ORIGINS")
+
     # --- Observability (Sentry — optional, no-op when DSN empty) -------
     sentry_dsn:                    str = Field(default="", alias="SENTRY_DSN")
     sentry_environment:            str = Field(default="development", alias="SENTRY_ENVIRONMENT")

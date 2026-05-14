@@ -27,18 +27,15 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: "Agentic Ai/backend/requirements.txt"
+          cache-dependency-path: "agentic-ai/backend/requirements.txt"
 
       - name: Install backend deps
-        working-directory: "Agentic Ai"
+        working-directory: "agentic-ai"
         run: pip install -r backend/requirements.txt
 
       - name: Boot smoke (FastAPI app imports cleanly)
-        working-directory: "Agentic Ai"
+        working-directory: "agentic-ai"
         env:
-          ADMIN_USERNAME: ci
-          ADMIN_PASSWORD: ci
-          AUTH_TOKEN_SECRET: ci-test-secret-1234567890123456
           FINANCIAL_DB_PATH: /tmp/_ci_boot.db
         run: |
           python -c "
@@ -49,11 +46,8 @@ jobs:
           "
 
       - name: Run regression suites
-        working-directory: "Agentic Ai"
+        working-directory: "agentic-ai"
         env:
-          ADMIN_USERNAME: ci
-          ADMIN_PASSWORD: ci
-          AUTH_TOKEN_SECRET: ci-test-secret-1234567890123456
           FINANCIAL_DB_PATH: /tmp/_ci_test.db
         run: |
           set -e
@@ -61,9 +55,17 @@ jobs:
             backend/tests/test_intent_router.py \
             backend/tests/test_dashboard_pie.py \
             backend/tests/test_analytics_intent.py \
-            backend/tests/test_multitenant_foundations.py \
-            backend/tests/test_advanced_subsystems.py \
-            backend/tests/test_saas_auth_tenant.py
+            backend/tests/test_business_intelligence.py \
+            backend/tests/test_costs_and_advanced.py \
+            backend/tests/test_dedup.py \
+            backend/tests/test_enrichment.py \
+            backend/tests/test_errors.py \
+            backend/tests/test_hierarchy_v2.py \
+            backend/tests/test_mock_backfill.py \
+            backend/tests/test_persistence_lifecycle.py \
+            backend/tests/test_presentation_layer.py \
+            backend/tests/test_restriction.py \
+            backend/tests/test_time_engine.py
           do
             echo "::group::$t"
             python "$t"
@@ -81,16 +83,16 @@ jobs:
         with:
           node-version: "20"
           cache: npm
-          cache-dependency-path: "Agentic Ai/frontend/package-lock.json"
+          cache-dependency-path: "agentic-ai/frontend/package-lock.json"
 
       - name: Install frontend deps
-        working-directory: "Agentic Ai/frontend"
+        working-directory: "agentic-ai/frontend"
         run: npm ci
 
       - name: Type-check (tsc --noEmit)
-        working-directory: "Agentic Ai/frontend"
+        working-directory: "agentic-ai/frontend"
         run: npx tsc --noEmit
 
       - name: Production build (vite)
-        working-directory: "Agentic Ai/frontend"
+        working-directory: "agentic-ai/frontend"
         run: npx vite build

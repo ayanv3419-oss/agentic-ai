@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: agentic-ai-backend
+    runtime: python
+    region: oregon
+    plan: free
+    rootDir: .
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.app.core_system:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+
+    disk:
+      name: agentic-ai-data
+      mountPath: /data
+      sizeGB: 1
+
+    envVars:
+      - key: FINANCIAL_DB_PATH
+        value: /data/financial_records.db
+      - key: RESPONSE_STORE_PATH
+        value: /data/response_store.json
+      - key: RELOAD
+        value: "false"
+      - key: ALLOWED_ORIGINS
+        value: "*"
+        # After Vercel deploys, change this to your Vercel URL, e.g.:
+        # value: https://agentic-ai.vercel.app
+      - key: GROQ_API_KEY
+        sync: false   # set manually in Render dashboard (optional server-side key)
+      - key: SENTRY_DSN
+        sync: false   # set in Render dashboard if you use Sentry
