@@ -745,6 +745,11 @@ const TOOL_LABELS: Record<string, string> = {
   ResponseFormatter: 'Formatting the response',
   ResponseStored: 'Saving the response',
   Database: 'Storing data',
+  // AgenticLoop capabilities — the names the LLM picks from.
+  resolve_time_window: 'Resolving the time window',
+  resolve_entities: 'Resolving named entities',
+  run_data_query: 'Querying your data',
+  generate_narrative: 'Writing the analysis',
 }
 
 const SUGGESTIONS = [
@@ -829,6 +834,10 @@ export function AiAssistant() {
     abortRef.current = ctrl
 
     let toolEvents: ToolEvent[] = []
+    // The AgenticLoop emits `loop.iteration` (LLM picked capability X, here's
+    // why) immediately before the matching `tool.call`. Stash the reasoning
+    // and attach it to the tool event the next `tool.call` creates.
+    let pendingReasoning: string | undefined
 
     try {
       await streamAIQuery(
@@ -836,10 +845,19 @@ export function AiAssistant() {
         (e: SseEvent) => {
           const data = e.data as Record<string, unknown> | undefined
           switch (e.event) {
+            case 'loop.iteration': {
+              const reasoning = data?.reasoning ? String(data.reasoning) : ''
+              pendingReasoning = reasoning || undefined
+              break
+            }
             case 'tool.call': {
               const tool = String(data?.name ?? '')
               if (!tool) return
-              toolEvents = [...toolEvents, { tool, status: 'running' }]
+              toolEvents = [
+                ...toolEvents,
+                { tool, status: 'running', reasoning: pendingReasoning },
+              ]
+              pendingReasoning = undefined
               updateMessage(assistantMsg.id, {
                 status: 'streaming',
                 toolEvents,
@@ -1424,25 +1442,33 @@ function ThinkingBlock({ toolEvents }: { toolEvents: ToolEvent[] }) {
         <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-400" />
         <span>{label}</span>
       </div>
+      {current?.reasoning && (
+        <div className="mt-1 text-xs text-zinc-500 italic">{current.reasoning}</div>
+      )}
       {completed.length > 0 && (
         <ul className="mt-2 space-y-1">
           {completed.map((t, i) => (
             <li
               key={`${t.tool}-${i}`}
               className={cn(
-                'text-xs flex items-center gap-2',
+                'text-xs',
                 t.status === 'failed' ? 'text-red-400' : 'text-zinc-500',
               )}
             >
-              <span
-                className={cn(
-                  'w-1 h-1 rounded-full',
-                  t.status === 'failed' ? 'bg-red-400' : 'bg-emerald-400',
+              <div className="flex items-center gap-2">
+                <span
+                  className={cn(
+                    'w-1 h-1 rounded-full',
+                    t.status === 'failed' ? 'bg-red-400' : 'bg-emerald-400',
+                  )}
+                />
+                <span className="text-zinc-400">{TOOL_LABELS[t.tool] ?? t.tool}</span>
+                {t.durationMs != null && (
+                  <span className="text-zinc-600">· {Math.round(t.durationMs)}ms</span>
                 )}
-              />
-              <span className="text-zinc-400">{TOOL_LABELS[t.tool] ?? t.tool}</span>
-              {t.durationMs != null && (
-                <span className="text-zinc-600">· {Math.round(t.durationMs)}ms</span>
+              </div>
+              {t.reasoning && (
+                <div className="ml-3 text-zinc-600 italic">{t.reasoning}</div>
               )}
             </li>
           ))}

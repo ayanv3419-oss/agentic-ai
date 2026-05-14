@@ -1,6 +1,6 @@
 # ADR-0002 — Deterministic sub-agent pipelines
 
-**Status:** Accepted  
+**Status:** Superseded by [ADR-0004](0004-llm-orchestrated-agentic-loop.md)  
 **Date:** 2025-05-15
 
 ## Context

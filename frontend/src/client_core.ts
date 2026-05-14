@@ -27,6 +27,9 @@ export interface ToolEvent {
   status: 'running' | 'done' | 'failed'
   durationMs?: number
   error?: string
+  // The LLM's one-line reasoning for picking this capability, carried by the
+  // `loop.iteration` SSE event the AgenticLoop emits before each tool call.
+  reasoning?: string
 }
 
 export interface ChatMessage {

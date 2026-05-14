@@ -1308,6 +1308,11 @@ def _safe_create_task(coro):
 # Internal event names that MUST NOT reach the user-facing SSE stream.
 # Dropped silently by PresentationEmitter; the originals stay in the
 # backend logs and Sentry breadcrumbs for debugging.
+#
+# Note: `loop.iteration` (emitted by the AgenticLoop each time the LLM picks
+# a capability) is intentionally NOT hidden — it carries the loop's
+# decision/reasoning for the frontend to surface, and its payload (iteration,
+# capability, args, reasoning) contains no internal-only fields.
 _HIDDEN_INTERNAL_EVENTS = {
     "tool.start",            # internal pipeline step names
     "tool.end",

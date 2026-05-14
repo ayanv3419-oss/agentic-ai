@@ -242,8 +242,31 @@ class GroqStreamChunk(BaseModel):
     error_kind: str | None = None
 
 
+class GroqToolCall(BaseModel):
+    """One tool the model asked to invoke in a tool-calling turn."""
+    id: str
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class GroqToolResponse(BaseModel):
+    """Result of a native tool-calling completion. `tool_calls` is non-empty
+    when the model wants to act; `content` carries the final answer otherwise."""
+    content: str = ""
+    tool_calls: list[GroqToolCall] = Field(default_factory=list)
+    tokens_in: int = 0
+    tokens_out: int = 0
+    finish_reason: str | None = None
+    error: str | None = None
+    error_kind: str | None = None
+
+
 def _err_response(msg: str, kind: str) -> GroqResponse:
     return GroqResponse(content="", tokens_in=0, tokens_out=0, error=msg, error_kind=kind)
+
+
+def _err_tool_response(msg: str, kind: str) -> GroqToolResponse:
+    return GroqToolResponse(error=msg, error_kind=kind)
 
 
 def _err_chunk(msg: str, kind: str) -> GroqStreamChunk:
@@ -409,6 +432,112 @@ class GroqClient:
         except Exception as e:
             _groq_log.exception("groq.complete_stream unexpected failure")
             yield _err_chunk(f"{type(e).__name__}: {e}", "unknown")
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]],
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+    ) -> GroqToolResponse:
+        """Native tool-calling completion. `messages` are raw OpenAI-format
+        dicts (so assistant `tool_calls` + `tool` role replies round-trip).
+        Never raises — returns a GroqToolResponse with `error` set on failure.
+        When `tools` is empty the call degrades to a plain completion (used
+        for the cost-guard 'answer with what you have' final turn)."""
+        try:
+            return await self._complete_with_tools_inner(
+                messages, tools, temperature, max_tokens
+            )
+        except Exception as e:
+            _groq_log.exception("groq.complete_with_tools unexpected failure")
+            return _err_tool_response(f"{type(e).__name__}: {e}", "unknown")
+
+    async def _complete_with_tools_inner(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+    ) -> GroqToolResponse:
+        headers, err = self._headers_or_error()
+        if err is not None:
+            return _err_tool_response(err.error or "auth error", err.error_kind or "auth")
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        url = f"{self.base_url}/chat/completions"
+        last_status: int | None = None
+        last_body = ""
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = await self._client.post(url, headers=headers, json=payload)
+            except httpx.RequestError as e:
+                last_err = e
+                await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
+            if resp.status_code in (401, 403):
+                return _err_tool_response(
+                    f"Groq auth rejected: HTTP {resp.status_code}", "auth"
+                )
+            if resp.status_code >= 400:
+                last_status = resp.status_code
+                try:
+                    last_body = (resp.text or "")[:300]
+                except Exception:
+                    last_body = ""
+                if resp.status_code >= 500 or resp.status_code == 429:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    continue
+                return _err_tool_response(
+                    f"Groq error: HTTP {resp.status_code} {last_body}", "upstream"
+                )
+            try:
+                data = resp.json()
+                choice = data["choices"][0]
+                message = choice.get("message", {}) or {}
+                usage = data.get("usage", {}) or {}
+                raw_calls = message.get("tool_calls") or []
+                tool_calls: list[GroqToolCall] = []
+                for rc in raw_calls:
+                    fn = (rc or {}).get("function", {}) or {}
+                    raw_args = fn.get("arguments")
+                    if isinstance(raw_args, dict):
+                        parsed_args = raw_args
+                    else:
+                        try:
+                            parsed_args = json.loads(raw_args) if raw_args else {}
+                        except (json.JSONDecodeError, TypeError):
+                            parsed_args = {}
+                    tool_calls.append(GroqToolCall(
+                        id=str(rc.get("id") or f"call_{len(tool_calls)}"),
+                        name=str(fn.get("name") or ""),
+                        arguments=parsed_args if isinstance(parsed_args, dict) else {},
+                    ))
+                return GroqToolResponse(
+                    content=message.get("content") or "",
+                    tool_calls=tool_calls,
+                    tokens_in=int(usage.get("prompt_tokens", 0)),
+                    tokens_out=int(usage.get("completion_tokens", 0)),
+                    finish_reason=choice.get("finish_reason"),
+                )
+            except (KeyError, IndexError, ValueError, TypeError) as e:
+                return _err_tool_response(f"Malformed Groq response: {e}", "parse")
+        if last_status is not None:
+            return _err_tool_response(
+                f"Groq retries exhausted (last HTTP {last_status}): {last_body}",
+                "upstream",
+            )
+        return _err_tool_response(f"Groq retries exhausted: {last_err}", "network")
 
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -1453,8 +1582,8 @@ class SqlPlannerTool(Tool):
         # about kind without re-reading state.intent.
         plan["intent_type"] = intent_type
         state_updates: dict[str, Any] = {"sql_plan": plan}
-        # Forecast plan forces daily granularity (ForecastAgent's projector
-        # only handles ISO YYYY-MM-DD buckets); reflect that in state so
+        # Forecast plan forces daily granularity (the forecast projector only
+        # handles ISO YYYY-MM-DD buckets); reflect that in state so
         # ResultAggregator + chart payload stay consistent.
         if intent_type == "forecasting":
             state_updates["granularity"] = "daily"
@@ -1513,7 +1642,7 @@ class SqlPlannerTool(Tool):
         """Daily series + totals — works for sales_summary, trend, forecast,
         and the *current-window* portion of comparison / RCA."""
         intent = state.intent or {}
-        # ForecastAgent's projector expects daily ISO buckets to extrapolate;
+        # The forecast projector expects daily ISO buckets to extrapolate;
         # phrases like "forecast next week" set granularity="weekly" via
         # TimeKPI, which breaks the projector. Force daily for forecast.
         granularity = state.granularity or "daily"
@@ -1898,7 +2027,7 @@ AGGREGATE_KINDS: tuple[str, ...] = (
     "ranking",      # top-N items keyed on Party Name
     "comparison",   # current vs previous window
     "rca",          # comparison + decline narration
-    "forecast",     # daily series ready for ForecastAgent's projector
+    "forecast",     # daily series ready for the forecast projector
     "anomaly",      # daily series, narrated as outlier scan
 )
 
@@ -2559,10 +2688,264 @@ class ResponseStoredTool(Tool):
 
 
 # ===========================================================================
+# 6.5 CAPABILITY TOOLS — coarse, LLM-orchestrated wrappers over the 14 tools.
+# ===========================================================================
+#
+# The agentic loop never picks the 14 fine-grained tools directly — their
+# ordering dependencies (SqlWriter needs sql_plan, SqlValidator needs
+# sql_draft, …) would force the LLM to relearn the pipeline. Instead it picks
+# from these ~4 coarse capabilities, each of which composes a deterministic
+# sub-sequence of the underlying tools. The rigid SQL micro-chain
+# (SchemaRetriever → SqlPlanner → SqlWriter → SqlValidator → SqlExecutor →
+# ResultAggregator) is collapsed into one `run_data_query` capability.
+
+# Query shapes `run_data_query` accepts — these map 1:1 onto the intent types
+# SqlPlanner / ResultAggregator already branch on.
+QUERY_TYPES: tuple[str, ...] = (
+    "sales_summary",
+    "purchase_analysis",
+    "product_performance",
+    "trend_analysis",
+    "comparison",
+    "root_cause_analysis",
+    "anomaly_detection",
+    "forecasting",
+)
+
+
+async def _run_internal(
+    state: TurnState, steps: list[tuple[str, dict]]
+) -> tuple[TurnState, ToolResult | None]:
+    """Run a fixed sub-sequence of registry tools, threading TurnState.
+
+    Returns (updated_state, None) on success or (state_at_failure, failing
+    ToolResult) on the first tool that returns ok=False. Token deltas from
+    each step are folded into the threaded state."""
+    registry = get_registry()
+    work = state
+    for name, targs in steps:
+        res = await registry.execute(name, targs, work)
+        if not res.ok:
+            return work, res
+        if res.state_updates:
+            work = work.apply(**res.state_updates)
+        if res.delta_metrics:
+            work = work.apply(
+                tokens_in=work.tokens_in + int(res.delta_metrics.get("tokens_in", 0)),
+                tokens_out=work.tokens_out + int(res.delta_metrics.get("tokens_out", 0)),
+            )
+    return work, None
+
+
+def _capability_result(
+    base: TurnState, work: TurnState, fields: tuple[str, ...], output: Any
+) -> ToolResult:
+    """Build a ToolResult carrying only the TurnState fields a capability
+    produced, plus the token delta accumulated while it ran."""
+    return ToolResult(
+        ok=True,
+        output=output,
+        state_updates={f: getattr(work, f) for f in fields},
+        delta_metrics={
+            "tokens_in": work.tokens_in - base.tokens_in,
+            "tokens_out": work.tokens_out - base.tokens_out,
+        },
+    )
+
+
+class ResolveTimeWindowArgs(BaseModel):
+    pass
+
+
+class ResolveTimeWindowTool(Tool):
+    name = "resolve_time_window"
+    description = (
+        "Resolve the date range the question is asking about. Anchors "
+        "relative phrases ('last month', 'this quarter', 'yesterday') to the "
+        "latest date present in the dataset — not today's calendar date. "
+        "Call this before run_data_query whenever the question mentions any "
+        "time period. Sets the time window, granularity, and KPI list."
+    )
+    args_model = ResolveTimeWindowArgs
+
+    async def run(self, state: TurnState, args: ResolveTimeWindowArgs) -> ToolResult:
+        work, fail = await _run_internal(state, [("TimeKPI", {})])
+        if fail is not None:
+            return ToolResult(ok=False, error=f"TimeKPI: {fail.error}")
+        return _capability_result(
+            state, work, ("time_window", "granularity", "kpis"),
+            {"time_window": work.time_window, "granularity": work.granularity},
+        )
+
+
+class ResolveEntitiesArgs(BaseModel):
+    pass
+
+
+class ResolveEntitiesTool(Tool):
+    name = "resolve_entities"
+    description = (
+        "Map fuzzy names in the question (merchants, customers, products, "
+        "categories, brands) onto their canonical database values. Call this "
+        "when the question names a specific entity ('how did Nike do', "
+        "'sales for ACME Corp'). Skip it for whole-dataset questions. Sets "
+        "the resolved entity list used as SQL filters."
+    )
+    args_model = ResolveEntitiesArgs
+
+    async def run(self, state: TurnState, args: ResolveEntitiesArgs) -> ToolResult:
+        work, fail = await _run_internal(state, [("EntityResolver", {})])
+        if fail is not None:
+            return ToolResult(ok=False, error=f"EntityResolver: {fail.error}")
+        return _capability_result(
+            state, work, ("entities",), {"entities": work.entities},
+        )
+
+
+class RunDataQueryArgs(BaseModel):
+    query_type: str = Field(
+        ...,
+        description=(
+            "The shape of analysis to run. One of: sales_summary, "
+            "purchase_analysis, product_performance (top-N ranking), "
+            "trend_analysis, comparison (period-over-period), "
+            "root_cause_analysis, anomaly_detection, forecasting."
+        ),
+    )
+
+
+class RunDataQueryTool(Tool):
+    name = "run_data_query"
+    description = (
+        "Plan, write, validate, and execute a SQL query against the financial "
+        "dataset, then aggregate the rows into chart-ready totals + series. "
+        "This is the core data capability — call it once you know the time "
+        "window (and entities, if any). Pick `query_type` to match what the "
+        "user wants: a plain total is sales_summary; 'top 5 products' is "
+        "product_performance; 'vs last month' is comparison; 'why did X drop' "
+        "is root_cause_analysis; 'predict next week' is forecasting. "
+        "comparison and root_cause_analysis automatically probe the previous "
+        "period; forecasting automatically projects the series forward."
+    )
+    args_model = RunDataQueryArgs
+
+    async def run(self, state: TurnState, args: RunDataQueryArgs) -> ToolResult:
+        query_type = (args.query_type or "").strip()
+        if query_type not in QUERY_TYPES:
+            return ToolResult(
+                ok=False,
+                error=(
+                    f"unknown query_type {query_type!r}; "
+                    f"valid: {', '.join(QUERY_TYPES)}"
+                ),
+            )
+
+        work = state
+        # Defensive: the loop is told to resolve the time window first, but if
+        # it skipped that step, resolve it now so SqlPlanner has a window.
+        if work.time_window is None:
+            work, fail = await _run_internal(work, [("TimeKPI", {})])
+            if fail is not None:
+                return ToolResult(ok=False, error=f"TimeKPI: {fail.error}")
+
+        # Override the (non-binding) deterministic intent hint with the
+        # query_type the LLM chose. SqlPlanner + ResultAggregator branch on
+        # intent.type, so this is how the LLM steers the query shape.
+        merged_intent = {**(work.intent or {}), "type": query_type}
+        work = work.apply(intent=merged_intent)
+
+        work, fail = await _run_internal(work, [
+            ("SchemaRetriever", {}),
+            ("SqlPlanner", {}),
+            ("SqlWriter", {}),
+            ("SqlValidator", {}),
+            ("SqlExecutor", {}),
+            ("ResultAggregator", {}),
+        ])
+        if fail is not None:
+            return ToolResult(ok=False, error=fail.error)
+
+        # Forecasting: project the daily series forward in-memory (same
+        # least-squares projection the old ForecastAgent used).
+        if query_type == "forecasting" and work.aggregates:
+            aggregates = dict(work.aggregates)
+            series = list(aggregates.get("series") or [])
+            aggregates["series"] = _project_forecast(series)
+            aggregates["forecast_horizon_days"] = _FORECAST_HORIZON_DAYS
+            work = work.apply(aggregates=aggregates, chart_data=aggregates)
+
+        aggregates = work.aggregates or {}
+        # Compact summary for the LLM — `series` is omitted (only its length
+        # matters for narration) and `items` is capped so the tool reply
+        # stays small enough to round-trip cleanly.
+        items = aggregates.get("items")
+        if isinstance(items, list) and len(items) > 25:
+            items = items[:25]
+        summary = {
+            "query_type":  query_type,
+            "kind":        aggregates.get("kind"),
+            "row_count":   len(work.rows or []),
+            "totals":      aggregates.get("totals"),
+            "series_len":  len(aggregates.get("series") or []),
+            "items":       items,
+            "comparison":  aggregates.get("comparison"),
+            "empty_reason": aggregates.get("empty_reason"),
+        }
+        return _capability_result(
+            state, work,
+            ("intent", "time_window", "granularity", "kpis", "db_schema",
+             "sql_plan", "sql_draft", "sql_final", "rows", "aggregates",
+             "chart_data"),
+            summary,
+        )
+
+
+class GenerateNarrativeArgs(BaseModel):
+    pass
+
+
+class GenerateNarrativeTool(Tool):
+    name = "generate_narrative"
+    description = (
+        "Write a short plain-English analyst narrative over the aggregates "
+        "produced by the most recent run_data_query. Optional — call it when "
+        "the user wants insight/explanation rather than a bare number. "
+        "Requires run_data_query to have run first."
+    )
+    args_model = GenerateNarrativeArgs
+
+    async def run(self, state: TurnState, args: GenerateNarrativeArgs) -> ToolResult:
+        miss = require(state, "aggregates")
+        if miss:
+            return ToolResult(
+                ok=False,
+                error="no aggregates yet — call run_data_query before generate_narrative",
+            )
+        work, fail = await _run_internal(state, [("InsightEngine", {"mode": "llm"})])
+        if fail is not None:
+            return ToolResult(ok=False, error=f"InsightEngine: {fail.error}")
+        return _capability_result(
+            state, work, ("insights",),
+            {"narrative": (work.insights or {}).get("narrative")},
+        )
+
+
+# Capabilities the agentic loop exposes to the LLM, in no particular order.
+QUERY_CAPABILITIES: tuple[str, ...] = (
+    "resolve_time_window",
+    "resolve_entities",
+    "run_data_query",
+    "generate_narrative",
+)
+
+
+# ===========================================================================
 # 7. TOOL REGISTRY
 # ===========================================================================
 
 # Authoritative list of tool names — must equal the registered set at boot.
+# The first 14 are the fine-grained pipeline tools; the last 4 are the coarse
+# LLM-orchestrated capabilities (section 6.5) that compose them.
 TOOL_NAMES: tuple[str, ...] = (
     "RouteClassifier",
     "IntentAnalyzer",
@@ -2578,6 +2961,10 @@ TOOL_NAMES: tuple[str, ...] = (
     "ResponseFormatter",
     "ResponseStored",
     "Database",
+    "resolve_time_window",
+    "resolve_entities",
+    "run_data_query",
+    "generate_narrative",
 )
 
 
@@ -2640,7 +3027,7 @@ _registry: ToolRegistry | None = None
 
 
 def _bootstrap(registry: ToolRegistry) -> None:
-    """Register all 14 tools. Order matters only for determinism."""
+    """Register the 14 pipeline tools + 4 LLM-orchestrated capabilities."""
     classes: list[type[Tool]] = [
         RouteClassifierTool,
         IntentAnalyzerTool,
@@ -2656,6 +3043,10 @@ def _bootstrap(registry: ToolRegistry) -> None:
         ResponseFormatterTool,
         ResponseStoredTool,
         DatabaseTool,
+        ResolveTimeWindowTool,
+        ResolveEntitiesTool,
+        RunDataQueryTool,
+        GenerateNarrativeTool,
     ]
 
     registered_names: list[str] = []
@@ -2710,11 +3101,10 @@ from app.infrastructure import (ALLOWED_TABLES,
 
 import logging
 import re
-from abc import ABC
 from collections import defaultdict
 from datetime import date as _date_cls, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Literal, Sequence, Union
+from typing import Any, Literal
 from uuid import uuid4
 
 # ===========================================================================
@@ -3292,65 +3682,13 @@ def classify(
 
 
 # ---------------------------------------------------------------------------
-# 1.2 Dispatcher — Groq picks an analytic sub-agent (strict JSON, no fallback).
+# 1.2 Dispatch — the LLM-orchestrated AgenticLoop replaces the old dispatcher.
 # ---------------------------------------------------------------------------
-
-_dispatch_log = logging.getLogger("agentic_ai.coordinator.dispatcher")
-
-DISPATCH_SYSTEM_PROMPT = """You are the Agentic AI Coordinator. Your only job is to
-select EXACTLY ONE sub-agent to handle the user's question.
-
-Available sub-agents:
-  - QueryAgent      — straightforward lookup (totals, counts, simple filters).
-  - AnalyticsAgent  — comparisons, trends, growth, period-over-period.
-  - RCAAgent        — "why did X drop", root-cause-analysis questions.
-  - ForecastAgent   — predictions / projections about the future.
-
-OUTPUT FORMAT — STRICT JSON, NO PROSE, NO MARKDOWN:
-  {"sub_agent": "<one of the four names above>", "reason": "<one short sentence>"}
-
-Hard rules:
-  1. Choose EXACTLY one sub-agent name from the list above.
-  2. Never pick DashboardAgent, DataCleanAgent, or ResponseAgent — those have
-     dedicated entrypoints and are not user-query-callable.
-  3. Never invent a sub-agent name.
-  4. Never produce any text outside the JSON object.
-"""
-
-
-async def select_sub_agent(question: str) -> tuple[str, str, dict]:
-    """Returns (sub_agent_name, reason, llm_metrics).
-
-    Raises ValueError on any dispatch failure (LLM error, invalid JSON,
-    invalid sub-agent name). The caller emits the structured error event.
-    """
-    if not question or not question.strip():
-        raise ValueError("empty question")
-
-    groq = get_groq()
-    resp = await groq.complete(
-        [
-            GroqMessage(role="system", content=DISPATCH_SYSTEM_PROMPT),
-            GroqMessage(role="user", content=question.strip()),
-        ],
-        temperature=0.0,
-        max_tokens=200,
-        force_json=True,
-    )
-    metrics = {"tokens_in": resp.tokens_in, "tokens_out": resp.tokens_out}
-    if resp.error:
-        raise ValueError(f"LLM dispatch failed: {resp.error_kind}: {resp.error}")
-    try:
-        parsed = parse_strict_json(resp.content)
-    except ValueError as e:
-        raise ValueError(f"LLM returned invalid JSON: {e}") from e
-    name = str(parsed.get("sub_agent") or "").strip()
-    reason = str(parsed.get("reason") or "")
-    if name not in ANALYTIC_AGENTS:
-        raise ValueError(
-            f"LLM picked unknown sub-agent {name!r}; allowed: {list(ANALYTIC_AGENTS)}"
-        )
-    return name, reason, metrics
+#
+# There is no longer a separate "pick a sub-agent" LLM call. run_query_turn
+# runs a free deterministic pre-pass (RouteClassifier + IntentAnalyzer) for
+# non-binding hints, then hands the turn to AgenticLoop, which is itself the
+# orchestrator — the LLM picks capabilities directly. See ADR 0004.
 
 
 # ---------------------------------------------------------------------------
@@ -3930,32 +4268,6 @@ async def _respond_missing_data(
 _loop_log = logging.getLogger("agentic_ai.coordinator.loop")
 
 
-# Deterministic intent → sub-agent mapping. Used when the classifier hits a
-# rule with confidence ≥ DETERMINISTIC_CONFIDENCE; below that threshold the
-# LLM dispatcher takes over.
-INTENT_TO_AGENT: dict[str, str] = {
-    "sales_summary":        "QueryAgent",
-    "purchase_analysis":    "QueryAgent",
-    "product_performance":  "AnalyticsAgent",
-    "trend_analysis":       "AnalyticsAgent",
-    "comparison":           "AnalyticsAgent",
-    "anomaly_detection":    "AnalyticsAgent",
-    "root_cause_analysis":  "RCAAgent",
-    "forecasting":          "ForecastAgent",
-}
-
-# An LLM-picked sub-agent name maps back to the authoritative intent type
-# so downstream tools always see a populated state.intent.type.
-AGENT_TO_INTENT: dict[str, str] = {
-    "QueryAgent":     "sales_summary",
-    "AnalyticsAgent": "trend_analysis",
-    "RCAAgent":       "root_cause_analysis",
-    "ForecastAgent":  "forecasting",
-}
-
-DETERMINISTIC_CONFIDENCE = 0.7
-
-
 # Per-intent expected shapes. The diagnostics record below uses these so an
 # operator (or a regression test) can see in ONE place what SQL and chart
 # kind a given intent should produce — without having to read SqlPlanner or
@@ -4229,13 +4541,11 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
         })
         return state.append_error(str(e))
 
-    # ---- 4. Intent classification + sub-agent selection ------------------
+    # ---- 4. Deterministic pre-pass + agentic loop dispatch ---------------
+    # The free deterministic classifiers still run — but their output is now
+    # a NON-BINDING hint handed to the LLM, not a routing decision. The LLM
+    # itself orchestrates the tools from here on (see ADR 0004).
     intent_type, intent_conf, intent_hints = classify_intent(state.question)
-    # Build a single structured diagnostics record covering every layer the
-    # operator wants visible per-turn: detected intent, entity, metric,
-    # ranking direction, expected SQL shape, expected chart kind. This is
-    # the canonical observability surface for analytics requests; SSE
-    # consumers and structured logs both use it.
     diagnostics = _build_intent_diagnostics(state.question, intent_type, intent_hints)
     _loop_log.info(
         "intent: type=%s confidence=%.2f hints=%s diagnostics=%s",
@@ -4248,72 +4558,34 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
         "diagnostics": diagnostics,
     })
 
-    metrics: dict[str, Any] = {"tokens_in": 0, "tokens_out": 0}
-    routing_strategy: str
-    sa_reason: str
-
-    if intent_conf >= DETERMINISTIC_CONFIDENCE:
-        # High-confidence — deterministic agent pick, no LLM call.
-        sub_agent_name = INTENT_TO_AGENT.get(intent_type, "QueryAgent")
-        routing_strategy = "deterministic"
-        sa_reason = (
-            f"intent={intent_type} conf={intent_conf:.2f} "
-            f"matched={intent_hints.get('matched')!r}"
-        )
-    else:
-        # Low-confidence — try the LLM dispatcher; on ANY failure (Groq down,
-        # rate-limited, JSON parse error, network blip) fall through to a
-        # deterministic QueryAgent route. The previous behaviour was to
-        # bubble the error back through SSE → user sees a turn-level failure
-        # for what is really an upstream provider issue. The deterministic
-        # fallback gives a generic-but-correct sales_summary answer; the
-        # SSE event stream surfaces `routing_strategy=deterministic_fallback`
-        # so ops can still see when the LLM dispatcher is unhealthy.
-        try:
-            sub_agent_name, sa_reason, dispatch_metrics = await select_sub_agent(
-                state.question
-            )
-            metrics = dispatch_metrics
-            routing_strategy = "llm_fallback"
-            # Override the low-confidence intent with the LLM's pick.
-            intent_type = AGENT_TO_INTENT.get(sub_agent_name, intent_type)
-        except Exception as e:
-            _loop_log.warning(
-                "LLM dispatcher failed; falling back to deterministic QueryAgent: %s",
-                e, exc_info=True,
-            )
-            sub_agent_name = "QueryAgent"
-            sa_reason = (
-                f"llm_dispatcher_failed: {type(e).__name__}; "
-                f"deterministic fallback to QueryAgent (intent={intent_type})"
-            )
-            routing_strategy = "deterministic_fallback"
-
-    # Seed state.intent so the pipeline tools see a fully-populated dict
-    # before IntentAnalyzer runs (it then merges in metric / top_n / etc).
+    # Seed state.intent, then run RouteClassifier + IntentAnalyzer as a free
+    # pre-pass so the loop opens with populated route + intent hints.
     state = state.apply(
         intent={
             "type":       intent_type,
             "confidence": intent_conf,
             "hints":      intent_hints,
         },
-        sub_agent=sub_agent_name,
-        tokens_in=state.tokens_in + int(metrics.get("tokens_in", 0)),
-        tokens_out=state.tokens_out + int(metrics.get("tokens_out", 0)),
+        sub_agent="AgenticLoop",
     )
+    registry = get_registry()
+    for pre_tool in ("RouteClassifier", "IntentAnalyzer"):
+        pre_result = await registry.execute(pre_tool, {}, state)
+        if pre_result.ok and pre_result.state_updates:
+            state = state.apply(**pre_result.state_updates)
+
     await emit.emit("sub_agent.dispatched", {
-        "sub_agent":  sub_agent_name,
-        "reason":     sa_reason,
-        "intent":     intent_type,
+        "sub_agent":  "AgenticLoop",
+        "reason":     "LLM orchestrates capabilities directly",
+        "intent":     (state.intent or {}).get("type", intent_type),
         "confidence": round(intent_conf, 2),
-        "strategy":   routing_strategy,
+        "strategy":   "agentic_loop",
     })
 
-    agent = get_analytic_agent(sub_agent_name)
     try:
-        state = await agent.run(state, emit)
+        state = await AgenticLoop().run(state, emit)
     except Exception as e:
-        _loop_log.exception("sub-agent crashed")
+        _loop_log.exception("agentic loop crashed")
         await emit.emit("agent.result", {
             "error": f"{type(e).__name__}: {e}",
             "kind":  "internal",
@@ -4358,146 +4630,19 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
 
 
 # ===========================================================================
-# 2. SUB-AGENTS
+# 2. AGENTIC LOOP — LLM-orchestrated tool selection (replaces fixed pipelines)
 # ===========================================================================
+#
+# The query path no longer walks a hardcoded tool pipeline. The LLM drives a
+# tool-calling loop: it picks a capability, inspects the result, and either
+# picks another or emits the final answer. Deterministic shortcuts (response
+# cache, KPI fast-path) still sit in front in run_query_turn; only the
+# non-shortcut question path reaches this loop. See ADR 0004 — this
+# supersedes ADR 0002's fixed deterministic pipelines.
 
 _agents_log = logging.getLogger("agentic_ai.agents")
+_loop_agent_log = logging.getLogger("agentic_ai.agentic_loop")
 
-# Each pipeline step is either:
-#   ("ToolName", {"arg": value})
-#   ("ToolName", lambda state: {"arg": ...})  # dynamic args from current state
-PipelineStep = tuple[str, Union[dict, Callable[[TurnState], dict]]]
-
-
-# ---------------------------------------------------------------------------
-# 2.1 Sub-agent base — fixed deterministic tool sequence per agent.
-# ---------------------------------------------------------------------------
-
-class SubAgent(ABC):
-    """Walks a fixed tool pipeline; emits SSE events; halts on first error."""
-
-    name: str = ""
-    pipeline: Sequence[PipelineStep] = ()
-
-    async def run(
-        self,
-        state: TurnState,
-        emit: EventEmitter,
-    ) -> TurnState:
-        registry = get_registry()
-        for tool_name, args_spec in self.pipeline:
-            args = args_spec(state) if callable(args_spec) else dict(args_spec)
-            iteration = state.iteration + 1
-            state = state.apply(iteration=iteration)
-            await emit.emit("tool.call", {
-                "name": tool_name, "args": args, "iteration": iteration,
-            })
-            result: ToolResult = await registry.execute(tool_name, args, state)
-            await emit.emit("tool.result", {
-                "name": tool_name,
-                "ok": result.ok,
-                "output": result.output,
-                "error": result.error,
-                "duration_ms": round(result.duration_ms, 2),
-            })
-            record = ToolCallRecord(
-                name=tool_name,
-                args=args,
-                output=result.output,
-                ok=result.ok,
-                error=result.error,
-                duration_ms=result.duration_ms,
-                iteration=iteration,
-            )
-            state = state.append_tool_call(record)
-            if not result.ok:
-                state = state.append_error(f"{tool_name}: {result.error}")
-                # Halt the pipeline on first failure — strict mode.
-                return state
-            if result.state_updates:
-                state = state.apply(**result.state_updates)
-            if result.delta_metrics:
-                state = state.apply(
-                    tokens_in=state.tokens_in + int(result.delta_metrics.get("tokens_in", 0)),
-                    tokens_out=state.tokens_out + int(result.delta_metrics.get("tokens_out", 0)),
-                )
-        return state
-
-
-# ---------------------------------------------------------------------------
-# 2.2 QueryAgent — straightforward lookup queries (totals, counts, distincts).
-# ---------------------------------------------------------------------------
-
-class QueryAgent(SubAgent):
-    name = "QueryAgent"
-    pipeline = (
-        ("RouteClassifier",   {}),
-        ("IntentAnalyzer",    {}),
-        ("TimeKPI",           {}),
-        ("EntityResolver",    {}),
-        ("SchemaRetriever",   {}),
-        ("SqlPlanner",        {}),
-        ("SqlWriter",         {}),
-        ("SqlValidator",      {}),
-        ("SqlExecutor",       {}),
-        ("ResultAggregator",  {}),
-        ("InsightEngine",     {"mode": "rule"}),
-        ("ResponseFormatter", {}),
-        ("ResponseStored",    {}),
-    )
-
-
-# ---------------------------------------------------------------------------
-# 2.3 AnalyticsAgent — trend / comparison questions; LLM-narrated insight.
-# ---------------------------------------------------------------------------
-
-class AnalyticsAgent(SubAgent):
-    name = "AnalyticsAgent"
-    pipeline = (
-        ("RouteClassifier",   {}),
-        ("IntentAnalyzer",    {}),
-        ("TimeKPI",           {}),
-        ("EntityResolver",    {}),
-        ("SchemaRetriever",   {}),
-        ("SqlPlanner",        {}),
-        ("SqlWriter",         {}),
-        ("SqlValidator",      {}),
-        ("SqlExecutor",       {}),
-        ("ResultAggregator",  {}),
-        ("InsightEngine",     {"mode": "llm"}),
-        ("ResponseFormatter", {}),
-        ("ResponseStored",    {}),
-    )
-
-
-# ---------------------------------------------------------------------------
-# 2.4 RCAAgent — root-cause analysis questions.
-# ---------------------------------------------------------------------------
-
-class RCAAgent(SubAgent):
-    name = "RCAAgent"
-    pipeline = (
-        ("RouteClassifier",   {}),
-        ("IntentAnalyzer",    {}),
-        ("TimeKPI",           {}),
-        ("EntityResolver",    {}),
-        ("SchemaRetriever",   {}),
-        ("SqlPlanner",        {}),
-        ("SqlWriter",         {}),
-        ("SqlValidator",      {}),
-        ("SqlExecutor",       {}),
-        ("ResultAggregator",  {}),
-        ("InsightEngine",     {"mode": "llm"}),
-        ("ResponseFormatter", {}),
-        ("ResponseStored",    {}),
-    )
-
-
-# ---------------------------------------------------------------------------
-# 2.5 ForecastAgent — projects metric forward via least-squares regression.
-# ---------------------------------------------------------------------------
-
-_forecast_log = logging.getLogger("agentic_ai.agents.forecast")
 _FORECAST_HORIZON_DAYS = 14
 
 
@@ -4531,101 +4676,312 @@ def _project_forecast(series: list[dict]) -> list[dict]:
     return out
 
 
-_FORECAST_PRE: tuple[PipelineStep, ...] = (
-    ("RouteClassifier",   {}),
-    ("IntentAnalyzer",    {}),
-    ("TimeKPI",           {}),
-    ("EntityResolver",    {}),
-    ("SchemaRetriever",   {}),
-    ("SqlPlanner",        {}),
-    ("SqlWriter",         {}),
-    ("SqlValidator",      {}),
-    ("SqlExecutor",       {}),
-    ("ResultAggregator",  {}),
-)
-_FORECAST_POST: tuple[PipelineStep, ...] = (
-    ("InsightEngine",     {"mode": "llm"}),
-    ("ResponseFormatter", {}),
-    ("ResponseStored",    {}),
-)
+# ---------------------------------------------------------------------------
+# 2.1 Loop prompt + capability tool schemas
+# ---------------------------------------------------------------------------
+
+def _schema_summary_text() -> str:
+    """Compact dataset description injected into the loop's system prompt."""
+    try:
+        sd = schema_dict()
+        lines = []
+        for tname, tinfo in (sd.get("tables") or {}).items():
+            cols = ", ".join(c["name"] for c in tinfo.get("columns", []))
+            lines.append(f"  - {tname}: {tinfo.get('description', '')}. Columns: {cols}")
+        notes = "\n".join(f"  * {n}" for n in sd.get("notes", []))
+        body = "Tables:\n" + "\n".join(lines)
+        return body + ("\nNotes:\n" + notes if notes else "")
+    except Exception:
+        return ('Tables: sales, purchase (identical shape). Key columns: '
+                'Date, "Total Amount", "Party Name", "Product Name".')
 
 
-class ForecastAgent(SubAgent):
-    name = "ForecastAgent"
-    # Informational — the actual run() splits at the seam to inject the
-    # projector step between PRE and POST.
-    pipeline = _FORECAST_PRE + _FORECAST_POST
+AGENTIC_LOOP_SYSTEM = """You are the orchestrator for Agentic AI, a business
+analytics assistant. A user has asked a question about their uploaded sales /
+purchase data. Decide which capabilities to call, in what order, inspect each
+result, call more if needed — then write the final answer yourself.
+
+Dataset schema:
+{schema}
+
+Available capabilities (call them as tools):
+  - resolve_time_window: resolve the date range. Call first whenever the
+    question mentions any time period. Dates anchor to the dataset's latest
+    date, not today.
+  - resolve_entities: map named merchants / customers / products to canonical
+    DB values. Call only when the question names a specific entity.
+  - run_data_query: the core capability — runs SQL and aggregates the rows.
+    Pick query_type to match the question. Resolve the time window first.
+  - generate_narrative: write an analyst paragraph over the most recent
+    run_data_query result. Call only when the user wants explanation/insight,
+    not a bare number.
+
+Discipline:
+  - Call only the capabilities you actually need. A plain "total sales last
+    month" needs resolve_time_window then run_data_query — nothing else.
+  - Always inspect each tool result. If run_data_query reports empty_reason
+    or fails, decide whether to retry with a different query_type / window or
+    explain the gap to the user.
+  - When you have enough to answer, STOP calling tools and reply with the
+    final answer as plain text — 2-4 sentences, grounded only in the numbers
+    returned. Never invent values. Use the rupee sign for currency.
+  - Never describe your tool calls or internal steps in the final answer.
+"""
+
+
+def _loop_hints(state: TurnState) -> str:
+    """Non-binding deterministic pre-pass signal handed to the LLM."""
+    intent = state.intent or {}
+    parts: list[str] = []
+    if state.route:
+        parts.append(f"route={state.route}")
+    if intent.get("type"):
+        parts.append(f"likely_intent={intent['type']}")
+    if intent.get("metric"):
+        parts.append(f"metric={intent['metric']}")
+    if intent.get("top_n"):
+        parts.append(f"top_n={intent['top_n']}")
+    return ", ".join(parts) if parts else "none"
+
+
+def _capability_tool_schemas() -> list[dict[str, Any]]:
+    """Build OpenAI-format function schemas for the loop's capabilities,
+    sourced from the registered capability tools so they stay in sync."""
+    registry = get_registry()
+    schemas: list[dict[str, Any]] = []
+    for cap_name in QUERY_CAPABILITIES:
+        try:
+            tool = registry.get(cap_name)
+            params = tool.args_model.model_json_schema()
+        except Exception:
+            continue
+        params.pop("title", None)
+        schemas.append({
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": params,
+            },
+        })
+    return schemas
+
+
+def _tool_result_message(tc_id: str, result: ToolResult) -> dict[str, Any]:
+    """Render a capability result as a `tool` role message for the LLM."""
+    if result.ok:
+        body: dict[str, Any] = {"ok": True, "result": result.output}
+    else:
+        body = {"ok": False, "error": result.error}
+    return {
+        "role": "tool",
+        "tool_call_id": tc_id,
+        "content": json.dumps(body, default=str)[:8000],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 2.2 AgenticLoop — the orchestrator
+# ---------------------------------------------------------------------------
+
+class AgenticLoop:
+    """LLM-orchestrated replacement for the fixed sub-agent pipelines.
+
+    One LLM call per iteration: the model either requests capabilities (we
+    execute them and feed the results back) or emits the final answer. The
+    cost guard caps iterations + spend; on the ceiling we force one final
+    best-effort answer rather than erroring out."""
+
+    name = "AgenticLoop"
 
     async def run(self, state: TurnState, emit: EventEmitter) -> TurnState:
-        state = await self._run_steps(state, emit, _FORECAST_PRE)
-        if state.errors:
-            return state
-        state = self._inject_forecast(state)
-        await emit.emit("tool.result", {
-            "name": "ForecastProjector",
-            "ok": True,
-            "output": {"horizon_days": _FORECAST_HORIZON_DAYS},
-            "error": None,
-            "duration_ms": 0.0,
-        })
-        return await self._run_steps(state, emit, _FORECAST_POST)
-
-    @staticmethod
-    def _inject_forecast(state: TurnState) -> TurnState:
-        aggregates = dict(state.aggregates or {})
-        series = list(aggregates.get("series") or [])
-        projected = _project_forecast(series)
-        aggregates["series"] = projected
-        aggregates["forecast_horizon_days"] = _FORECAST_HORIZON_DAYS
-        return state.apply(aggregates=aggregates, chart_data=aggregates)
-
-    async def _run_steps(
-        self, state: TurnState, emit: EventEmitter, steps: tuple[PipelineStep, ...]
-    ) -> TurnState:
+        groq = get_groq()
+        tools = _capability_tool_schemas()
         registry = get_registry()
-        for tool_name, args_spec in steps:
-            args = args_spec(state) if callable(args_spec) else dict(args_spec)
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system",
+             "content": AGENTIC_LOOP_SYSTEM.format(schema=_schema_summary_text())},
+            {"role": "user",
+             "content": (
+                 f"Question: {state.question}\n"
+                 f"Deterministic hints (non-binding): {_loop_hints(state)}"
+             )},
+        ]
+
+        while True:
+            # Cost guard — on the ceiling, force a best-effort final answer.
+            try:
+                check_loop_iteration(state)
+                check_cost(state)
+            except CostGuardError as e:
+                _loop_agent_log.info("cost guard hit: %s — forcing final answer", e)
+                return await self._force_final(state, emit, messages, groq)
+
             iteration = state.iteration + 1
             state = state.apply(iteration=iteration)
-            await emit.emit("tool.call", {
-                "name": tool_name, "args": args, "iteration": iteration,
+
+            resp = await groq.complete_with_tools(
+                messages, tools=tools, temperature=0.0, max_tokens=900,
+            )
+            state = state.apply(
+                tokens_in=state.tokens_in + resp.tokens_in,
+                tokens_out=state.tokens_out + resp.tokens_out,
+            )
+
+            if resp.error:
+                msg = f"LLM orchestration failed: {resp.error_kind}: {resp.error}"
+                _loop_agent_log.warning(msg)
+                return state.append_error(msg)
+
+            if not resp.tool_calls:
+                # No tool requested — the LLM is satisfied and has answered.
+                answer = (resp.content or "").strip() or (
+                    "I could not produce an answer for that question."
+                )
+                return await self._finalize(state, emit, answer, incomplete=False)
+
+            # Record the assistant turn (with its tool_calls) so the tool
+            # replies have an anchor to attach to.
+            messages.append({
+                "role": "assistant",
+                "content": resp.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments, default=str),
+                        },
+                    }
+                    for tc in resp.tool_calls
+                ],
             })
-            result: ToolResult = await registry.execute(tool_name, args, state)
-            await emit.emit("tool.result", {
-                "name": tool_name, "ok": result.ok, "output": result.output,
-                "error": result.error, "duration_ms": round(result.duration_ms, 2),
-            })
-            state = state.append_tool_call(ToolCallRecord(
-                name=tool_name, args=args, output=result.output,
-                ok=result.ok, error=result.error,
-                duration_ms=result.duration_ms, iteration=iteration,
-            ))
-            if not result.ok:
-                state = state.append_error(f"{tool_name}: {result.error}")
-                return state
-            if result.state_updates:
-                state = state.apply(**result.state_updates)
-            if result.delta_metrics:
-                state = state.apply(
-                    tokens_in=state.tokens_in + int(result.delta_metrics.get("tokens_in", 0)),
-                    tokens_out=state.tokens_out + int(result.delta_metrics.get("tokens_out", 0)),
+
+            for tc in resp.tool_calls:
+                await emit.emit("loop.iteration", {
+                    "iteration":  iteration,
+                    "capability": tc.name,
+                    "args":       tc.arguments,
+                    "reasoning":  (resp.content or "").strip()[:400],
+                })
+                await emit.emit("tool.call", {
+                    "name": tc.name, "args": tc.arguments, "iteration": iteration,
+                })
+                if tc.name not in QUERY_CAPABILITIES:
+                    result = ToolResult(
+                        ok=False,
+                        error=(f"unknown capability {tc.name!r}; valid: "
+                               f"{', '.join(QUERY_CAPABILITIES)}"),
+                    )
+                else:
+                    result = await registry.execute(tc.name, tc.arguments, state)
+                await emit.emit("tool.result", {
+                    "name": tc.name, "ok": result.ok, "output": result.output,
+                    "error": result.error,
+                    "duration_ms": round(result.duration_ms, 2),
+                })
+                state = state.append_tool_call(ToolCallRecord(
+                    name=tc.name, args=tc.arguments, output=result.output,
+                    ok=result.ok, error=result.error,
+                    duration_ms=result.duration_ms, iteration=iteration,
+                ))
+                if result.ok:
+                    if result.state_updates:
+                        state = state.apply(**result.state_updates)
+                    if result.delta_metrics:
+                        state = state.apply(
+                            tokens_in=state.tokens_in
+                            + int(result.delta_metrics.get("tokens_in", 0)),
+                            tokens_out=state.tokens_out
+                            + int(result.delta_metrics.get("tokens_out", 0)),
+                        )
+                else:
+                    # Feed the error back — the LLM self-corrects next round.
+                    _loop_agent_log.info(
+                        "capability %s failed: %s", tc.name, result.error
+                    )
+                # The tool reply goes back into the conversation either way.
+                messages.append(_tool_result_message(tc.id, result))
+
+    async def _force_final(
+        self,
+        state: TurnState,
+        emit: EventEmitter,
+        messages: list[dict[str, Any]],
+        groq: GroqClient,
+    ) -> TurnState:
+        """Cost-guard ceiling reached. One last tool-free call: answer with
+        whatever has been gathered so far."""
+        messages.append({
+            "role": "user",
+            "content": (
+                "You have reached the work budget for this question. Do not "
+                "request any more tools. Answer now using only what you have "
+                "gathered so far. If the picture is incomplete, say so briefly."
+            ),
+        })
+        resp = await groq.complete_with_tools(
+            messages, tools=[], temperature=0.0, max_tokens=600,
+        )
+        state = state.apply(
+            tokens_in=state.tokens_in + resp.tokens_in,
+            tokens_out=state.tokens_out + resp.tokens_out,
+        )
+        answer = (resp.content or "").strip() or (
+            "I ran out of analysis budget before I could fully answer that. "
+            "Please try a narrower question."
+        )
+        return await self._finalize(state, emit, answer, incomplete=True)
+
+    async def _finalize(
+        self,
+        state: TurnState,
+        emit: EventEmitter,
+        answer: str,
+        *,
+        incomplete: bool,
+    ) -> TurnState:
+        """Attach the final answer + build/persist the response record.
+        run_query_turn emits the `final` / `turn.end` SSE events."""
+        if incomplete:
+            answer = answer.rstrip() + (
+                "\n\n(Note: this answer may be incomplete — the analysis "
+                "budget for this question was reached.)"
+            )
+        aggregates = state.aggregates or {}
+        record = {
+            "turn_id":         state.turn_id,
+            "cache_key":       state.cache_key,
+            "stored_at":       datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "query":           state.question,
+            "sub_agent":       "AgenticLoop",
+            "route":           state.route,
+            "sql":             state.sql_final,
+            "rows":            state.rows,
+            "aggregates":      aggregates,
+            "insights":        state.insights or {},
+            "chart":           aggregates or None,
+            "final_answer":    answer,
+            "response_format": "agentic",
+            "incomplete":      incomplete,
+        }
+        state = state.apply(
+            final_answer=answer,
+            response_record=record,
+            chart_data=state.chart_data or (aggregates or None),
+        )
+        # Persist for the response cache. An incomplete answer is never cached
+        # — a partial result must not later masquerade as a clean cache hit.
+        if not incomplete and state.cache_key:
+            try:
+                put_cached(state.cache_key, record)
+            except Exception:
+                _loop_agent_log.warning(
+                    "response cache persist failed", exc_info=True
                 )
         return state
-
-
-# ---------------------------------------------------------------------------
-# 2.6 ResponseAgent — pipeline coda (formatter + persistence).
-# ---------------------------------------------------------------------------
-
-class ResponseAgent(SubAgent):
-    """Pipeline coda. The analytic agents already include ResponseFormatter +
-    ResponseStored as their last two steps; this exists for catalog
-    completeness so the response phase has one named place."""
-    name = "ResponseAgent"
-    pipeline = (
-        ("ResponseFormatter", {}),
-        ("ResponseStored",    {}),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -4966,6 +5322,7 @@ class DataCleanAgent:
         batch_id: str | None = None,
         dedup_mode: str = "block",
         preview_only: bool = False,
+        source: str = "upload",
     ) -> dict[str, Any]:
         """Parse + validate + (optionally) insert.
 
@@ -4976,6 +5333,9 @@ class DataCleanAgent:
         preview_only : bool
             When True, runs the full pipeline up to classification and
             returns the breakdown WITHOUT inserting. Used by /upload/preview.
+        source : str
+            Origin tag stamped on every inserted row + the uploads audit
+            row — 'upload' for manual file uploads, 'drive' for Google Drive.
         """
         from app.dedup import (
             DEDUP_MODES, classify_batch, delete_rows_with_hashes,
@@ -5126,7 +5486,7 @@ class DataCleanAgent:
             # upload audit row, just with zero inserts.
             await record_upload_meta(
                 batch_id=batch_id, filename=filename, target=target,
-                rows_inserted=0, rows_failed=len(errors), source="upload",
+                rows_inserted=0, rows_failed=len(errors), source=source,
                 status="active",
                 dedup_mode=dedup_mode,
                 rows_skipped_duplicate=classification.duplicate_count
@@ -5162,7 +5522,7 @@ class DataCleanAgent:
                 "table":        target,
                 "rows":         rows_to_insert,
                 "batch_id":     batch_id,
-                "source":       "upload",
+                "source":       source,
                 "file_name":    filename,
                 "row_hashes":   hashes_to_insert,
             },
@@ -5194,7 +5554,7 @@ class DataCleanAgent:
             target=target,
             rows_inserted=rows_inserted,
             rows_failed=rows_failed,
-            source="upload",
+            source=source,
             status="active",
             min_date=validation.get("min_date"),
             max_date=validation.get("max_date"),
@@ -5233,40 +5593,20 @@ class DataCleanAgent:
 
 
 # ===========================================================================
-# 3. AGENT REGISTRY (after class definitions so dispatcher can validate)
+# 3. AGENT REGISTRY
 # ===========================================================================
 
-# Coordinator-callable analytic sub-agents (LLM picks one of these).
-ANALYTIC_AGENTS: dict[str, type] = {
-    "QueryAgent":     QueryAgent,
-    "AnalyticsAgent": AnalyticsAgent,
-    "RCAAgent":       RCAAgent,
-    "ForecastAgent":  ForecastAgent,
-}
-
-# Sub-agents that the LLM may NOT pick — they have dedicated routes.
+# The natural-language question path is handled by the AgenticLoop (the LLM
+# orchestrates capabilities directly — there is no sub-agent to pick). The
+# remaining named agents are UI-triggered, deterministic, and never go
+# through the loop.
 ROUTE_ONLY_AGENTS: tuple[str, ...] = (
     "DashboardAgent",
     "DataCleanAgent",
 )
 
-# Auto-coda after every analytic agent (informational; the analytic agents
-# already include ResponseFormatter + ResponseStored in their pipeline).
-CODA_AGENT = "ResponseAgent"
-
 ALL_AGENT_NAMES: tuple[str, ...] = (
-    "QueryAgent",
-    "AnalyticsAgent",
-    "RCAAgent",
-    "ForecastAgent",
+    "AgenticLoop",
     "DashboardAgent",
     "DataCleanAgent",
-    "ResponseAgent",
 )
-
-
-def get_analytic_agent(name: str):
-    cls = ANALYTIC_AGENTS.get(name)
-    if cls is None:
-        raise KeyError(f"Unknown analytic sub-agent: {name!r}")
-    return cls()

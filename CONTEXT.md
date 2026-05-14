@@ -23,13 +23,14 @@ Current maturity: **MVP / pre-production** (score 58/100). Not suitable for mult
 |---|---|
 | **Turn** | One complete question → answer cycle, from `POST /query_stream` to `turn.end` SSE event |
 | **TurnState** | Frozen Pydantic model — single source of truth passed between tools. Never mutated; use `.apply(**updates)` |
-| **Sub-agent** | A named class declaring a fixed `pipeline` of `(tool_name, args)` steps |
-| **Tool** | A single deterministic step in a pipeline. Extends `Tool` ABC, implements `async run(state, args) → ToolResult` |
+| **Agentic loop** | `AgenticLoop` — the LLM-orchestrated engine for the natural-language question path. The LLM picks a capability, inspects the result, and loops until satisfied, then writes the final answer. Replaced the fixed sub-agent pipelines (see ADR-0004) |
+| **Capability** | A coarse, LLM-callable wrapper the agentic loop chooses from: `resolve_time_window`, `resolve_entities`, `run_data_query`, `generate_narrative`. Each composes a deterministic sub-sequence of the 14 fine-grained tools |
+| **Sub-agent** | A named class for a UI-triggered deterministic flow — now only `DashboardAgent` (dashboard payload) and `DataCleanAgent` (upload ingest). The query path no longer uses sub-agents |
+| **Tool** | A single deterministic step. Extends `Tool` ABC, implements `async run(state, args) → ToolResult`. The 14 fine-grained tools are composed by capabilities; the LLM never picks them directly |
 | **ToolResult** | Return value of a tool: `{ok, output, state_updates, delta_metrics, error}` |
 | **Intent router** | `classify_query_kind()` — deterministic keyword+regex classifier. Outputs `data_query | chat | general_knowledge | missing_data` |
-| **KPI fast-path** | Before the 14-tool pipeline, the coordinator matches the question against the KPI registry. On a confident match, executes a pre-validated SQL template — no LLM |
-| **Dispatcher** | Single Groq LLM call that picks which sub-agent to run. Returns `{sub_agent, reason}` |
-| **Pipeline** | Ordered list of `(tool_name, args)` steps a sub-agent declares at definition time |
+| **KPI fast-path** | Before the agentic loop, the coordinator matches the question against the KPI registry. On a confident match, executes a pre-validated SQL template — no LLM |
+| **Deterministic pre-pass** | `RouteClassifier` + `IntentAnalyzer` run free before the loop; their output is a *non-binding hint* in the loop's opening context, not a routing decision |
 | **Batch** | A single file upload — tracked in the `uploads` table with a `batch_id` (UUID) |
 | **Dataset** | Either `sales` or `purchase` — two physically identical SQLite tables |
 | **Response cache** | SHA-256-keyed JSON store in `data/response_store.json`. Invalidated on any upload/disconnect |
@@ -50,7 +51,7 @@ Current maturity: **MVP / pre-production** (score 58/100). Not suitable for mult
 | File / folder | Owns |
 |---|---|
 | `app/infrastructure.py` | Settings, SQLite schema, DB helpers, upload parsers, response cache, synonyms |
-| `app/analytics_engine.py` | TurnState, EventEmitter, CostGuard, GroqClient, 14 tools, registry, 7 sub-agents, Coordinator |
+| `app/analytics_engine.py` | TurnState, EventEmitter, CostGuard, GroqClient, 14 tools + 4 capabilities, registry, AgenticLoop, Dashboard/DataClean sub-agents, Coordinator |
 | `app/core_system.py` | FastAPI app, all HTTP routes, CORS, rate limiter, startup, exception handlers |
 | `app/kpi/` | KPI registry (SQLite-backed), matcher, formula execution engine |
 | `app/hierarchy/` | Product + location tree management (v1 adjacency list + v2 6-level enterprise) |
@@ -83,7 +84,7 @@ core_system → kpi / hierarchy / vector / monitoring / enrichment / database / 
 
 1. **TurnState is immutable.** Never `state.field = value`. Always `state = state.apply(field=value)`.
 2. **Database tool is the only SQL path.** All SQLite access from the pipeline must go through the `Database` tool with `READ_PIN` or `INGESTION_PIN`. No direct `fetch_all()` calls from tools.
-3. **Pipelines are deterministic.** No LLM-driven tool selection inside a pipeline. Only the Dispatcher chooses the sub-agent.
+3. **The LLM orchestrates capabilities; capabilities are deterministic inside.** On the query path the LLM picks capabilities dynamically (the agentic loop). But each capability composes a *fixed* sub-sequence of the 14 tools, and the LLM never picks those 14 directly. The cheap front door (response cache, KPI fast-path) and the `RouteClassifier`/`IntentAnalyzer` pre-pass stay fully deterministic. See ADR-0004.
 4. **No cross-request Groq key leakage.** Each turn uses a `contextvars`-scoped `GroqClient`. Never store user keys in shared state.
 5. **Cache invalidation is total.** Any upload or disconnect calls `invalidate_all()` — no partial invalidation.
 6. **Import direction is downward.** `core_system → analytics_engine → infrastructure`. No reverse imports.
@@ -109,9 +110,9 @@ See `PRODUCTION_READINESS_REPORT.md` for full list and remediation plan.
 
 - **Provider:** Groq (`/openai/v1/chat/completions`)
 - **Default model:** `llama-3.3-70b-versatile`
-- **Used for:** Dispatcher (sub-agent selection), SqlPlanner, InsightEngine, chat/knowledge responder
-- **Not used for:** intent routing (deterministic), KPI calculation, dashboard aggregates, forecasting (linear regression)
-- **Fallback:** None — if Groq is down, agentic pipeline is unavailable
+- **Used for:** AgenticLoop orchestration (native tool calling — the LLM picks capabilities), SqlPlanner, InsightEngine, chat/knowledge responder
+- **Not used for:** the deterministic pre-pass (`RouteClassifier`/`IntentAnalyzer`), `classify_query_kind`, KPI calculation, dashboard aggregates, forecasting (linear regression), the response cache + KPI fast-path
+- **Fallback:** None — if Groq is down, the agentic loop returns a turn-level error (there is no deterministic fallback pipeline; the cache + KPI fast-path still serve what they can)
 
 ---
 
