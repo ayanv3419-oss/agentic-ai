@@ -1,13 +1,12 @@
 name: CI
 
-# Runs every push + every PR. Three jobs:
-#   - backend-tests: 6 regression suites + boot smoke
-#   - frontend-build: tsc + vite build
-#   - lint: a tiny syntactic sanity check (ruff/eslint added later if needed)
+# Runs every push + every PR. Two jobs:
+#   - backend-tests: v1 regression suites (14) + v2 reflective-orchestrator
+#                    suites (5) + boot smoke
+#   - frontend-build: tsc --noEmit + vite build
 #
-# Tests are written as plain python scripts (no pytest dep) so the
-# workflow stays simple. When a test suite is added, drop it into the
-# matrix step and it runs automatically.
+# Tests are plain Python scripts (no pytest dep) so the workflow stays
+# simple. Drop a new test path into either matrix step and CI picks it up.
 
 on:
   push:
@@ -18,7 +17,7 @@ on:
 jobs:
   backend-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
 
@@ -27,48 +26,70 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: "agentic-ai/backend/requirements.txt"
+          cache-dependency-path: "backend/requirements.txt"
 
       - name: Install backend deps
-        working-directory: "agentic-ai"
         run: pip install -r backend/requirements.txt
 
-      - name: Boot smoke (FastAPI app imports cleanly)
-        working-directory: "agentic-ai"
+      - name: Boot smoke (FastAPI app imports cleanly + new routes present)
         env:
           FINANCIAL_DB_PATH: /tmp/_ci_boot.db
+          PYTHONPATH: backend
         run: |
           python -c "
-          import sys
-          sys.path.insert(0, 'backend')
           from app.core_system import app
           print(f'FastAPI routes: {len(app.routes)}')
+          paths = {r.path for r in app.routes if hasattr(r, 'path')}
+          assert '/auth/login' in paths, 'auth/login route missing'
+          assert '/query_stream' in paths, 'query_stream route missing'
+          assert '/health' in paths, 'health route missing'
+          print('boot smoke OK')
           "
 
-      - name: Run regression suites
-        working-directory: "agentic-ai"
+      - name: Run v1 regression suites
         env:
-          FINANCIAL_DB_PATH: /tmp/_ci_test.db
+          FINANCIAL_DB_PATH: /tmp/_ci_v1_test.db
+          PYTHONPATH: backend
+        working-directory: backend
         run: |
           set -e
           for t in \
-            backend/tests/test_intent_router.py \
-            backend/tests/test_dashboard_pie.py \
-            backend/tests/test_analytics_intent.py \
-            backend/tests/test_business_intelligence.py \
-            backend/tests/test_costs_and_advanced.py \
-            backend/tests/test_dedup.py \
-            backend/tests/test_enrichment.py \
-            backend/tests/test_errors.py \
-            backend/tests/test_hierarchy_v2.py \
-            backend/tests/test_mock_backfill.py \
-            backend/tests/test_persistence_lifecycle.py \
-            backend/tests/test_presentation_layer.py \
-            backend/tests/test_restriction.py \
-            backend/tests/test_time_engine.py
+            test_intent_router \
+            test_dashboard_pie \
+            test_analytics_intent \
+            test_business_intelligence \
+            test_costs_and_advanced \
+            test_dedup \
+            test_enrichment \
+            test_errors \
+            test_hierarchy_v2 \
+            test_mock_backfill \
+            test_persistence_lifecycle \
+            test_presentation_layer \
+            test_restriction \
+            test_time_engine
           do
-            echo "::group::$t"
-            python "$t"
+            echo "::group::tests.$t"
+            python -m "tests.$t"
+            echo "::endgroup::"
+          done
+
+      - name: Run v2 reflective-orchestrator suites
+        env:
+          FINANCIAL_DB_PATH: /tmp/_ci_v2_test.db
+          PYTHONPATH: backend
+        working-directory: backend
+        run: |
+          set -e
+          for t in \
+            test_p1_capability_layer \
+            test_p2_pipeline \
+            test_p3_validators \
+            test_p4_reflection \
+            test_p5_memory
+          do
+            echo "::group::app.orchestrator_v2.tests.$t"
+            python -m "app.orchestrator_v2.tests.$t"
             echo "::endgroup::"
           done
 
@@ -83,16 +104,16 @@ jobs:
         with:
           node-version: "20"
           cache: npm
-          cache-dependency-path: "agentic-ai/frontend/package-lock.json"
+          cache-dependency-path: "frontend/package-lock.json"
 
       - name: Install frontend deps
-        working-directory: "agentic-ai/frontend"
+        working-directory: frontend
         run: npm ci
 
       - name: Type-check (tsc --noEmit)
-        working-directory: "agentic-ai/frontend"
+        working-directory: frontend
         run: npx tsc --noEmit
 
       - name: Production build (vite)
-        working-directory: "agentic-ai/frontend"
+        working-directory: frontend
         run: npx vite build
