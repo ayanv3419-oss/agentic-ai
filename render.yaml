@@ -25,7 +25,21 @@ services:
         value: "*"
         # After Vercel deploys, change this to your Vercel URL, e.g.:
         # value: https://agentic-ai.vercel.app
+      # Where the Google OAuth callback bounces the browser back to once
+      # the user grants Drive access. NOT a secret — just a URL, safe in
+      # git. Without this the callback fell back to localhost:5173 and the
+      # production user landed on a "site can't be reached" page.
+      - key: FRONTEND_URL
+        value: https://agentic-ai-ayanv3419-oss-projects.vercel.app
       - key: GROQ_API_KEY
         sync: false   # set manually in Render dashboard (optional server-side key)
       - key: SENTRY_DSN
         sync: false   # set in Render dashboard if you use Sentry
+      # Google Drive OAuth — secrets only in the Render dashboard, never
+      # in git. Set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET there.
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false   # set to https://<backend>/auth/google/callback
