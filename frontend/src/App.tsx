@@ -29,10 +29,7 @@ import {
   Activity,
   AlertTriangle,
   Building2,
-  Eye,
-  EyeOff,
   LayoutDashboard,
-  Lock,
   LogOut,
   MessageSquare,
   Sparkles,
@@ -44,208 +41,26 @@ import type { NavKey } from '@/client_core'
 import { AiAssistant, Dashboard, ShopInfo, UploadData } from '@/ui_system'
 
 // ===========================================================================
-// Lightweight startup gate — frontend-only, hardcoded credentials
+// Startup gate removed
 // ===========================================================================
 //
-// This is NOT real authentication. It's a client-side flag in localStorage
-// (with a sessionStorage fallback for private-browsing mode) so the app can
-// ask for a password on first open. Anyone with browser dev tools can bypass
-// it by running `localStorage.setItem('agentic-ai:gate','1')` and refreshing.
-//
-// Comparison is whitespace-trimmed; username is case-insensitive, password
-// stays case-sensitive. These tolerance rules eliminate the most common
-// "I typed the right thing but it says wrong password" failure modes:
-//   - mobile keyboards adding trailing spaces
-//   - autofill inserting invisible characters
-//   - "mansuri" vs "Mansuri" mistypes
+// Previous versions had a client-side login screen (hardcoded creds in
+// localStorage). It was cosmetic — anyone with browser dev tools could
+// bypass it — so it has been dropped. Users land directly in the app.
+// The backend's POST /auth/login still exists for forward-compatible
+// auth, but the frontend no longer calls it.
 
-const AUTH_USERNAME = 'Mansuri'
-const AUTH_PASSWORD = '182012'
-const AUTH_KEY = 'agentic-ai:gate'
+// --- Legacy gate helpers removed. The block below stays as a stub
+//     reference so a real future auth flow can re-introduce them.
 
-// Sanitize input — strip whitespace + zero-width / BOM chars some keyboards add.
-function clean(s: string): string {
-  return (s ?? '').replace(/[​-‍﻿]/g, '').trim()
-}
-
-function readGate(): boolean {
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      if (localStorage.getItem(AUTH_KEY) === '1') return true
-    }
-  } catch { /* private mode */ }
-  try {
-    if (typeof window !== 'undefined' && window.sessionStorage) {
-      if (sessionStorage.getItem(AUTH_KEY) === '1') return true
-    }
-  } catch { /* same-origin block */ }
-  return false
-}
-
-function setGate(open: boolean): { persisted: boolean; storage: string } {
-  let persisted = false
-  let storage = 'memory'
-  try {
-    if (open) localStorage.setItem(AUTH_KEY, '1')
-    else localStorage.removeItem(AUTH_KEY)
-    persisted = true
-    storage = 'localStorage'
-  } catch {
-    try {
-      if (open) sessionStorage.setItem(AUTH_KEY, '1')
-      else sessionStorage.removeItem(AUTH_KEY)
-      persisted = true
-      storage = 'sessionStorage'
-    } catch { /* fall through to in-memory */ }
+// Remove any stale gate flag from prior frontend builds. Safe no-op
+// when localStorage is unavailable (private mode, embedded view).
+try {
+  if (typeof window !== 'undefined') {
+    try { window.localStorage?.removeItem('agentic-ai:gate') } catch {}
+    try { window.sessionStorage?.removeItem('agentic-ai:gate') } catch {}
   }
-  return { persisted, storage }
-}
-
-function LoginGate({ onUnlock }: { onUnlock: () => void }) {
-  const [username, setUsername] = useState('')
-  const [password, setPassword] = useState('')
-  const [showPassword, setShowPassword] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [attempts, setAttempts] = useState(0)
-
-  const onSubmit = (e: React.FormEvent) => {
-    e.preventDefault()
-    const u = clean(username)
-    const p = clean(password)
-
-    // Username is case-insensitive; password is exact (case-sensitive).
-    const usernameOk = u.toLowerCase() === AUTH_USERNAME.toLowerCase()
-    const passwordOk = p === AUTH_PASSWORD
-
-    // Diagnostic logging — visible in the browser console.
-    // eslint-disable-next-line no-console
-    console.info('[login] attempt', {
-      username_entered_len: u.length,
-      password_entered_len: p.length,
-      username_match: usernameOk,
-      password_match: passwordOk,
-      storage_available: typeof window !== 'undefined' && !!window.localStorage,
-    })
-
-    if (usernameOk && passwordOk) {
-      const persist = setGate(true)
-      // eslint-disable-next-line no-console
-      console.info('[login] success', persist)
-      if (!persist.persisted) {
-        // Storage blocked — proceed but warn user the session won't persist.
-        // We still unlock so they can use the app this session.
-        setError('Logged in — but storage is blocked, so refresh will require login again.')
-      }
-      onUnlock()
-      return
-    }
-
-    // Produce a HELPFUL error so the user can self-diagnose.
-    const next = attempts + 1
-    setAttempts(next)
-    if (!usernameOk && !passwordOk) {
-      setError('Username and password are both incorrect. Check capitalization.')
-    } else if (!usernameOk) {
-      setError(`Username is incorrect. (Hint: it should start with capital "M".)`)
-    } else {
-      setError('Password is incorrect.')
-    }
-  }
-
-  return (
-    <div className="min-h-screen w-full flex items-center justify-center bg-zinc-950 text-zinc-100 px-4">
-      <div className="w-full max-w-sm">
-        <div className="flex items-center justify-center mb-6">
-          <div className="w-12 h-12 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
-            <Sparkles className="w-5 h-5 text-emerald-400" />
-          </div>
-        </div>
-        <h1 className="text-center text-xl font-semibold tracking-tight">
-          Agentic AI
-        </h1>
-        <p className="text-center text-sm text-zinc-500 mt-1">
-          Sign in to continue.
-        </p>
-
-        <form onSubmit={onSubmit} className="mt-6 card p-6 space-y-4">
-          <div>
-            <label className="label" htmlFor="login-username">Username</label>
-            <input
-              id="login-username"
-              className="input"
-              type="text"
-              value={username}
-              onChange={(e) => { setUsername(e.target.value); setError(null) }}
-              autoComplete="username"
-              autoCapitalize="off"
-              spellCheck={false}
-              autoFocus
-              required
-            />
-          </div>
-
-          <div>
-            <label className="label" htmlFor="login-password">Password</label>
-            <div className="relative">
-              <input
-                id="login-password"
-                className="input pr-10"
-                type={showPassword ? 'text' : 'password'}
-                value={password}
-                onChange={(e) => { setPassword(e.target.value); setError(null) }}
-                autoComplete="current-password"
-                autoCapitalize="off"
-                spellCheck={false}
-                required
-              />
-              <button
-                type="button"
-                onClick={() => setShowPassword((s) => !s)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-zinc-500 hover:text-zinc-200"
-                tabIndex={-1}
-                aria-label={showPassword ? 'Hide password' : 'Show password'}
-              >
-                {showPassword
-                  ? <EyeOff className="w-3.5 h-3.5" />
-                  : <Eye className="w-3.5 h-3.5" />}
-              </button>
-            </div>
-          </div>
-
-          {error && (
-            <div className="flex items-start gap-2 text-xs text-red-300 bg-red-950/30 border border-red-900/40 rounded-md px-3 py-2">
-              <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-              <span>{error}</span>
-            </div>
-          )}
-
-          <button
-            type="submit"
-            disabled={!username.trim() || !password.trim()}
-            className="btn btn-primary w-full"
-          >
-            <Lock className="w-4 h-4" />
-            Sign in
-          </button>
-        </form>
-
-        {attempts >= 2 && (
-          <div className="mt-4 text-[11px] text-zinc-500 leading-relaxed text-center">
-            Still locked out? Open browser DevTools (F12) → Console, paste
-            <code className="mx-1 px-1 py-0.5 rounded bg-zinc-900 text-zinc-300">
-              localStorage.setItem('agentic-ai:gate','1')
-            </code>
-            and refresh.
-          </div>
-        )}
-
-        <p className="text-center text-[11px] text-zinc-600 mt-6">
-          Local single-user gate. No accounts, no signup.
-        </p>
-      </div>
-    </div>
-  )
-}
+} catch { /* fall through */ }
 
 // ===========================================================================
 // Sidebar
@@ -439,24 +254,24 @@ class ErrorBoundary extends React.Component<
 }
 
 // ===========================================================================
-// App root — gate first, then app
+// App root — login gate removed; users land directly in the app
 // ===========================================================================
+//
+// The previous client-side login gate (Mansuri / 182012) was a cosmetic
+// flag in localStorage and offered no real security — the backend has
+// always been the actual enforcement point. Removing the gate so the
+// app loads straight to the dashboard. A future real-auth flow can
+// re-introduce LoginGate by reading from the backend's POST /auth/login
+// endpoint, which the backend still exposes.
 
 export default function App() {
   const [view, setView] = useState<NavKey>('dashboard')
-  const [unlocked, setUnlocked] = useState<boolean>(readGate)
 
-  if (!unlocked) {
-    return (
-      <ErrorBoundary fallbackTitle="Login screen crashed.">
-        <LoginGate onUnlock={() => setUnlocked(true)} />
-      </ErrorBoundary>
-    )
-  }
-
+  // ``onLogout`` is kept for the Sidebar API but is now a soft refresh —
+  // there's no gate to send the user back to. The module-level cleanup
+  // above already removes any stale ``agentic-ai:gate`` flag.
   const onLogout = () => {
-    setGate(false)
-    setUnlocked(false)
+    window.location.reload()
   }
 
   return (
