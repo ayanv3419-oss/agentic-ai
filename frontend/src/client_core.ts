@@ -201,27 +201,39 @@ export interface AuthMe {
   google_configured?: boolean
 }
 
-export interface DriveImportDetail {
-  file: string
-  status: string
-  rows?: number
+export interface DriveFile {
+  id: string
+  name: string
+  mimeType: string
+  modifiedTime?: string
+  size?: string
+}
+
+export interface DriveStatus {
+  connected: boolean
+  configured: boolean
+  files: DriveFile[]
+}
+
+export interface DriveSyncFileResult {
+  ok: boolean
+  file_id: string
   batch_id?: string
-  file_id?: string
-  mime_type?: string
+  filename?: string
+  target?: string
+  rows_inserted?: number
+  rows_failed?: number
+  rows_skipped_duplicate?: number
+  rows_replaced?: number
+  table_total?: number
   error?: string
 }
 
 export interface DriveSyncResult {
-  ok: boolean
-  discovered: number
-  imported: number
-  rows_inserted: number
-  skipped_already: number
-  skipped_too_large: number
-  failed: number
-  details: DriveImportDetail[]
-  error?: string
-  kind?: string
+  target: string
+  dedup_mode: string
+  results: DriveSyncFileResult[]
+  rows_inserted_total: number
 }
 
 // ---------------------------------------------------------------------------
@@ -419,8 +431,20 @@ export async function logout(): Promise<{ ok: boolean }> {
   return apiPost<{ ok: boolean }>('/auth/logout')
 }
 
-export async function syncDrive(): Promise<DriveSyncResult> {
-  return apiPost<DriveSyncResult>('/drive/sync')
+export async function fetchDriveStatus(): Promise<DriveStatus> {
+  return apiGet<DriveStatus>('/drive/status')
+}
+
+export async function syncDrive(
+  fileIds: string[],
+  target: 'sales' | 'purchase' = 'sales',
+  dedupMode = 'skip',
+): Promise<DriveSyncResult> {
+  return apiPost<DriveSyncResult>('/drive/sync', {
+    file_ids: fileIds,
+    target,
+    dedup_mode: dedupMode,
+  })
 }
 
 export async function streamAIQuery(

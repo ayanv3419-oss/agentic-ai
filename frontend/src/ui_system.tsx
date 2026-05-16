@@ -74,6 +74,7 @@ import {
   disconnectUpload,
   fetchAuthMe,
   fetchDashboard,
+  fetchDriveStatus,
   fetchUploadsList,
   googleLoginUrl,
   logout,
@@ -87,6 +88,7 @@ import type {
   ChartKind,
   ChatMessage,
   DashboardData,
+  DriveFile,
   PeriodTotals,
   RankingItem,
   SalesChart,
@@ -1502,60 +1504,97 @@ export function UploadData() {
   const refreshUploadsList = () => setUploadsRefreshKey((k) => k + 1)
   const [driveNote, setDriveNote] = useState<string | null>(null)
   const [driveError, setDriveError] = useState<string | null>(null)
-  const autoSyncRanRef = useRef(false)
+  const [driveFiles, setDriveFiles] = useState<DriveFile[]>([])
+  const [driveLoading, setDriveLoading] = useState(false)
+  const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(new Set())
+  const [driveTarget, setDriveTarget] = useState<'sales' | 'purchase'>('sales')
+
+  // Load the user's Drive files for the picker (also refreshes connected state).
+  const loadDriveFiles = async () => {
+    setDriveLoading(true)
+    setDriveError(null)
+    try {
+      const status = await fetchDriveStatus()
+      setDriveFiles(status.files)
+      setAuth((prev) => ({ ...(prev ?? {}), authenticated: status.connected }))
+    } catch (e) {
+      setDriveError(e instanceof Error ? e.message : 'Could not list Drive files.')
+    } finally {
+      setDriveLoading(false)
+    }
+  }
 
   // Load Google auth status on mount. Independent of app login.
   useEffect(() => {
     void (async () => {
       try {
-        setAuth(await fetchAuthMe())
+        const me = await fetchAuthMe()
+        setAuth(me)
+        if (me.authenticated) void loadDriveFiles()
       } catch {
         setAuth({ authenticated: false })
       }
     })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Pick up the OAuth-callback signal and auto-sync once.
+  // Pick up the OAuth-callback signal: refresh status + load the file picker.
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
     const status = params.get('drive')
-    const err = params.get('drive_error')
-    if (err) setDriveError(`Google sign-in failed: ${err}`)
-    if (status === 'connected' && !autoSyncRanRef.current) {
-      autoSyncRanRef.current = true
-      void doSync()
+    if (status === 'error') setDriveError('Google sign-in failed. Please try again.')
+    if (status === 'connected') {
+      setDriveNote('Google Drive connected. Pick the files to import below.')
+      void loadDriveFiles()
     }
-    if (err || status) {
+    if (status) {
       params.delete('drive')
-      params.delete('drive_error')
-      params.delete('detail')
       const clean = window.location.pathname + (params.toString() ? `?${params}` : '')
       window.history.replaceState({}, '', clean)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  const toggleFile = (id: string) => {
+    setSelectedFileIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
   const doSync = async () => {
+    const ids = Array.from(selectedFileIds)
+    if (ids.length === 0) {
+      setDriveError('Select at least one file to import.')
+      return
+    }
     setDriveSyncing(true)
     setDriveError(null)
     setDriveNote(null)
     try {
-      const result = await syncDrive()
+      const result = await syncDrive(ids, driveTarget)
+      const ok = result.results.filter((r) => r.ok)
+      const failed = result.results.filter((r) => !r.ok)
       setDriveNote(
-        `Imported ${result.imported} file${result.imported === 1 ? '' : 's'} (${result.rows_inserted.toLocaleString('en-IN')} rows).` +
-          (result.skipped_already ? ` ${result.skipped_already} already in DB.` : '') +
-          (result.failed ? ` ${result.failed} failed.` : ''),
+        `Imported ${ok.length} file${ok.length === 1 ? '' : 's'} ` +
+          `(${result.rows_inserted_total.toLocaleString('en-IN')} rows into ${result.target}).` +
+          (failed.length ? ` ${failed.length} failed.` : ''),
       )
-      const lastImported = result.details.find((d) => d.status === 'imported')
-      if (lastImported && typeof lastImported.rows === 'number') {
+      const lastOk = [...ok].reverse().find((r) => (r.rows_inserted ?? 0) >= 0)
+      if (lastOk) {
         setDataset({
-          name: lastImported.file,
-          rows: lastImported.rows,
+          name: lastOk.filename ?? 'Drive file',
+          rows: lastOk.rows_inserted ?? 0,
           uploadedAt: new Date().toISOString(),
           source: 'drive',
         })
       }
-      setAuth(await fetchAuthMe())
+      if (failed.length) {
+        setDriveError(failed.map((f) => `${f.file_id}: ${f.error}`).join('; '))
+      }
+      setSelectedFileIds(new Set())
       refreshUploadsList()
     } catch (e) {
       if (e instanceof ApiError) {
@@ -1577,6 +1616,8 @@ export function UploadData() {
       await logout()
       setAuth({ authenticated: false })
       setDriveNote(null)
+      setDriveFiles([])
+      setSelectedFileIds(new Set())
     } catch {
       /* noop */
     }
@@ -1699,27 +1740,95 @@ export function UploadData() {
             <h2 className="font-medium text-sm">Connect Google Drive</h2>
           </div>
           <p className="text-xs text-zinc-500 mb-5">
-            Pick a folder; new files in it will be synced automatically.
+            Sign in, pick CSV / Excel / Sheets files from your Drive, and import
+            them straight into your dataset.
           </p>
 
           {!auth?.authenticated ? (
-            <a
-              href={googleLoginUrl()}
-              className="w-full flex items-center justify-center gap-3 bg-white text-zinc-900 hover:bg-zinc-100 font-medium rounded-lg px-4 py-2.5 text-sm transition-colors"
-            >
-              <GoogleGlyph className="w-4 h-4" />
-              <span>Continue with Google</span>
-            </a>
+            <>
+              {auth && auth.google_configured === false ? (
+                <p className="text-[11px] text-amber-400/80 leading-relaxed">
+                  Google Drive is not configured on the server. Set
+                  GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in backend/.env.
+                </p>
+              ) : (
+                <a
+                  href={googleLoginUrl()}
+                  className="w-full flex items-center justify-center gap-3 bg-white text-zinc-900 hover:bg-zinc-100 font-medium rounded-lg px-4 py-2.5 text-sm transition-colors"
+                >
+                  <GoogleGlyph className="w-4 h-4" />
+                  <span>Continue with Google</span>
+                </a>
+              )}
+            </>
           ) : (
-            <button
-              type="button"
-              onClick={doSync}
-              disabled={driveSyncing}
-              className="btn btn-primary w-full"
-            >
-              <RefreshCw className={driveSyncing ? 'w-4 h-4 animate-spin' : 'w-4 h-4'} />
-              {driveSyncing ? 'Syncing…' : 'Sync Drive now'}
-            </button>
+            <>
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-zinc-500">Import into</span>
+                  <select
+                    value={driveTarget}
+                    onChange={(e) =>
+                      setDriveTarget(e.target.value as 'sales' | 'purchase')
+                    }
+                    className="bg-zinc-900 border border-zinc-800 rounded-md text-xs px-2 py-1"
+                  >
+                    <option value="sales">sales</option>
+                    <option value="purchase">purchase</option>
+                  </select>
+                </div>
+                <button
+                  type="button"
+                  onClick={loadDriveFiles}
+                  disabled={driveLoading}
+                  className="text-[11px] text-zinc-400 hover:text-zinc-200 flex items-center gap-1"
+                >
+                  <RefreshCw
+                    className={driveLoading ? 'w-3 h-3 animate-spin' : 'w-3 h-3'}
+                  />
+                  Refresh
+                </button>
+              </div>
+
+              <div className="border border-zinc-800 rounded-lg max-h-56 overflow-y-auto divide-y divide-zinc-800/60">
+                {driveLoading && driveFiles.length === 0 ? (
+                  <p className="text-xs text-zinc-500 px-3 py-4">Loading files…</p>
+                ) : driveFiles.length === 0 ? (
+                  <p className="text-xs text-zinc-500 px-3 py-4">
+                    No CSV / Excel / Sheets files found in your Drive.
+                  </p>
+                ) : (
+                  driveFiles.map((f) => (
+                    <label
+                      key={f.id}
+                      className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-zinc-900/50"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedFileIds.has(f.id)}
+                        onChange={() => toggleFile(f.id)}
+                        className="shrink-0"
+                      />
+                      <span className="text-xs truncate flex-1">{f.name}</span>
+                    </label>
+                  ))
+                )}
+              </div>
+
+              <button
+                type="button"
+                onClick={doSync}
+                disabled={driveSyncing || selectedFileIds.size === 0}
+                className="btn btn-primary w-full mt-4"
+              >
+                <RefreshCw
+                  className={driveSyncing ? 'w-4 h-4 animate-spin' : 'w-4 h-4'}
+                />
+                {driveSyncing
+                  ? 'Importing…'
+                  : `Import ${selectedFileIds.size || ''} selected`}
+              </button>
+            </>
           )}
 
           {driveNote && (
@@ -1728,22 +1837,16 @@ export function UploadData() {
           {driveError && (
             <p className="text-[11px] text-red-400 mt-4 leading-relaxed">{driveError}</p>
           )}
-          {!driveNote && !driveError && (
+          {auth?.authenticated && (
             <p className="text-[11px] text-zinc-500 mt-4 leading-relaxed">
-              {auth?.authenticated ? (
-                <>
-                  Signed in as {auth.email}.{' '}
-                  <button
-                    type="button"
-                    onClick={doLogout}
-                    className="text-zinc-400 hover:text-zinc-200 underline underline-offset-2"
-                  >
-                    Sign out
-                  </button>
-                </>
-              ) : (
-                'Read-only access to drive.readonly. Already-imported files are skipped.'
-              )}
+              {auth.email ? `Signed in as ${auth.email}. ` : ''}
+              <button
+                type="button"
+                onClick={doLogout}
+                className="text-zinc-400 hover:text-zinc-200 underline underline-offset-2"
+              >
+                Sign out
+              </button>
             </p>
           )}
         </section>

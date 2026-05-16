@@ -24,3 +24,9 @@ pyjwt>=2.8.0
 # + tests continue to run without provisioning real services.
 asyncpg>=0.29.0
 redis>=5.0.0
+# --- Google Drive integration + MCP server. The Drive routes / tool stay
+# inert until GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are set in .env.
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+google-api-python-client>=2.100.0
+fastmcp>=2.0.0

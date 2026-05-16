@@ -1,0 +1,25 @@
+{
+  "swiggy": [
+    "swiggy ltd",
+    "bundl technologies",
+    "swiggy app"
+  ],
+  "zomato": [
+    "zomato ltd",
+    "zomato app"
+  ],
+  "groceries": [
+    "grocery",
+    "kirana",
+    "fmcg"
+  ],
+  "electronics": [
+    "consumer electronics",
+    "appliances"
+  ],
+  "fashion": [
+    "apparel",
+    "clothing",
+    "lifestyle"
+  ]
+}

@@ -105,11 +105,26 @@ class Settings(BaseSettings):
     sentry_profiles_sample_rate:   float = Field(default=0.0, alias="SENTRY_PROFILES_SAMPLE_RATE")
     sentry_send_default_pii:       bool = Field(default=False, alias="SENTRY_SEND_DEFAULT_PII")
 
+    # --- Google Drive OAuth (Drive routes/tool stay inert until set) ----
+    google_client_id:     str = Field(default="", alias="GOOGLE_CLIENT_ID")
+    google_client_secret: str = Field(default="", alias="GOOGLE_CLIENT_SECRET")
+    google_redirect_uri:  str = Field(
+        default="http://localhost:8000/auth/google/callback",
+        alias="GOOGLE_REDIRECT_URI",
+    )
+    google_token_path: str = Field(
+        default=str(PROJECT_ROOT / "data" / "google_token.json"),
+        alias="GOOGLE_TOKEN_PATH",
+    )
+    # Where the OAuth callback bounces the browser back to after success.
+    frontend_url: str = Field(default="http://localhost:5173", alias="FRONTEND_URL")
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.financial_db_path = _abs(self.financial_db_path)
         self.response_store_path = _abs(self.response_store_path)
         self.synonyms_path = _abs(self.synonyms_path)
+        self.google_token_path = _abs(self.google_token_path)
 
 
 @lru_cache

@@ -24,7 +24,7 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.analytics_engine import (
@@ -104,6 +104,7 @@ from app.infrastructure import (
     uploads_dir,
 )
 from app.dedup import DEDUP_MODES, DEFAULT_DEDUP_MODE, compute_file_hash
+from app import google_drive
 from app.errors import (
     SEVERITIES,
     error_analytics,
@@ -118,6 +119,12 @@ from app.monitoring import (
     sentry_status,
     set_request_context,
 )
+
+# v2 orchestrator — gated by ORCHESTRATOR_VERSION env / X-Orchestrator-Version
+# header. Imports are unconditional; the package loads cleanly even when v1 is
+# the only path actually exercised at runtime.
+from app.orchestrator_v2 import run_query_turn_v2
+from app.orchestrator_v2.state import RequestContext as V2RequestContext
 
 
 log = logging.getLogger("agentic_ai.api")
@@ -181,54 +188,170 @@ api_router = APIRouter()
 
 
 # ---------------------------------------------------------------------------
-# Google upload / Drive integration stubs
+# Google Drive integration
 #
-# The app itself has no startup login. These routes ONLY exist for the
-# "Connect Google Drive" card on the Upload page. They return clean JSON
-# stubs so the frontend's status check (`/auth/me`) and OAuth/sync calls
-# never 404. Wire real Google OAuth + Drive API logic into these when you
-# implement the integration.
+# Single-user local-first OAuth. The app itself has no startup login — these
+# routes power the "Connect Google Drive" card on the Upload page and let the
+# user sync data files straight from Drive through the same DataCleanAgent
+# ingestion pipeline as manual uploads. All Drive/OAuth logic lives in
+# app/google_drive.py; these routes are thin adapters. The whole feature
+# stays inert (login returns 501) until GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET
+# are set in backend/.env.
 # ---------------------------------------------------------------------------
 
-@api_router.get("/auth/me")
-async def auth_me() -> dict:
-    """Google upload auth status. Single-user MVP — always 'not connected'
-    until real OAuth is wired in."""
-    return {"authenticated": False, "google_configured": False}
+class DriveSyncRequest(BaseModel):
+    file_ids: list[str] = Field(default_factory=list)
+    target: str = "sales"
+    dedup_mode: str = "skip"
 
 
-@api_router.post("/auth/logout")
-async def auth_logout() -> dict:
-    """Clear any Drive OAuth tokens. No-op until OAuth is implemented."""
-    return {"ok": True}
-
-
-def _drive_not_implemented() -> JSONResponse:
+def _drive_not_configured() -> JSONResponse:
     return JSONResponse(
         status_code=501,
         content=envelope(
-            "Google Drive integration not yet implemented",
-            detail="Connect-with-Google + Drive sync are UI scaffolding. "
-                   "Wire OAuth + Drive API in core_system.py to enable.",
+            "Google Drive integration not configured",
+            detail="Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in "
+                   "backend/.env (OAuth client from Google Cloud Console) "
+                   "to enable Drive sync.",
             kind="not_implemented",
         ),
     )
 
 
+@api_router.get("/auth/me")
+async def auth_me() -> dict:
+    """Google Drive auth status for the Upload page card."""
+    try:
+        connected = await asyncio.to_thread(google_drive.is_connected)
+    except Exception:
+        log.warning("drive is_connected check failed", exc_info=True)
+        connected = False
+    return {
+        "authenticated": connected,
+        "google_configured": google_drive.is_configured(),
+    }
+
+
+@api_router.post("/auth/logout")
+async def auth_logout() -> dict:
+    """Disconnect Google Drive — revoke + delete the local OAuth token."""
+    try:
+        await asyncio.to_thread(google_drive.revoke_credentials)
+    except Exception:
+        log.warning("drive revoke failed", exc_info=True)
+    return {"ok": True}
+
+
 @api_router.get("/auth/google/login")
-async def google_login(): return _drive_not_implemented()
+async def google_login():
+    """Redirect the browser to Google's OAuth consent screen."""
+    if not google_drive.is_configured():
+        return _drive_not_configured()
+    try:
+        url, _state = google_drive.get_authorization_url()
+    except Exception as e:
+        log.exception("drive: building auth url failed")
+        return JSONResponse(status_code=500, content=envelope(
+            "Could not start Google sign-in",
+            detail=f"{type(e).__name__}: {e}", kind="internal",
+        ))
+    return RedirectResponse(url)
 
 
 @api_router.get("/auth/google/callback")
-async def google_callback(): return _drive_not_implemented()
-
-
-@api_router.post("/drive/sync")
-async def drive_sync(): return _drive_not_implemented()
+async def google_callback(request: Request):
+    """OAuth callback — exchange the code for credentials, then bounce the
+    browser back to the frontend Upload page."""
+    if not google_drive.is_configured():
+        return _drive_not_configured()
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    error = request.query_params.get("error")
+    if error or not code:
+        return RedirectResponse(f"{settings.frontend_url}/?drive=error")
+    try:
+        await asyncio.to_thread(google_drive.exchange_code, code, state)
+    except Exception as e:
+        log.exception("drive: token exchange failed")
+        return RedirectResponse(f"{settings.frontend_url}/?drive=error")
+    return RedirectResponse(f"{settings.frontend_url}/?drive=connected")
 
 
 @api_router.get("/drive/status")
-async def drive_status(): return _drive_not_implemented()
+async def drive_status():
+    """List the user's ingestible Drive files for the frontend file picker."""
+    if not google_drive.is_configured():
+        return {"connected": False, "configured": False, "files": []}
+    try:
+        creds = await asyncio.to_thread(google_drive.load_credentials)
+    except Exception:
+        creds = None
+    if creds is None:
+        return {"connected": False, "configured": True, "files": []}
+    try:
+        files = await google_drive.list_drive_files(creds)
+    except Exception as e:
+        log.exception("drive: listing files failed")
+        return JSONResponse(status_code=502, content=envelope(
+            "Could not list Google Drive files",
+            detail=f"{type(e).__name__}: {e}", kind="upstream",
+        ))
+    return {"connected": True, "configured": True, "files": files}
+
+
+@api_router.post("/drive/sync")
+async def drive_sync(request: Request, body: DriveSyncRequest):
+    """Ingest the selected Drive files through the DataCleanAgent pipeline."""
+    rl = _rate_limit_check(_client_ip(request), bucket_namespace="drive", limit_per_minute=5)
+    if rl is not None:
+        return JSONResponse(status_code=429, content=rl)
+    if not google_drive.is_configured():
+        return _drive_not_configured()
+
+    target_table = (body.target or "sales").strip().lower()
+    if target_table not in ALLOWED_TABLES:
+        return JSONResponse(status_code=400, content=envelope(
+            "Invalid target",
+            detail=f"target must be one of {list(ALLOWED_TABLES)}",
+            kind="validation",
+        ))
+    if body.dedup_mode not in DEDUP_MODES:
+        return JSONResponse(status_code=400, content=envelope(
+            "Invalid dedup_mode",
+            detail=f"dedup_mode must be one of {list(DEDUP_MODES)}",
+            kind="validation",
+        ))
+    if not body.file_ids:
+        return JSONResponse(status_code=400, content=envelope(
+            "No files selected",
+            detail="file_ids must contain at least one Drive file id.",
+            kind="validation",
+        ))
+
+    creds = await asyncio.to_thread(google_drive.load_credentials)
+    if creds is None:
+        return JSONResponse(status_code=401, content=envelope(
+            "Google Drive not connected",
+            detail="Connect Google Drive on the Upload page first.",
+            kind="auth",
+        ))
+
+    try:
+        results = await google_drive.ingest_drive_files(
+            creds, body.file_ids, target_table, body.dedup_mode,
+        )
+    except Exception as e:
+        log.exception("drive: sync failed")
+        return JSONResponse(status_code=500, content=envelope(
+            "Drive sync failed",
+            detail=f"{type(e).__name__}: {e}", kind="internal",
+        ))
+    return {
+        "target": target_table,
+        "dedup_mode": body.dedup_mode,
+        "results": results,
+        "rows_inserted_total": sum(r.get("rows_inserted", 0) for r in results),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +807,67 @@ async def health() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Shared post-ingest refresh — runs after ANY ingestion path (file upload or
+# Google Drive sync) so derived state stays consistent: data version bump,
+# cache invalidation, product-name backfill, hierarchy v1/v2 sync, inventory
+# + forecast + cost refresh, quantity backfill. Every step is best-effort —
+# a failure in one is logged and the rest still run. Returns the new data
+# version.
+# ---------------------------------------------------------------------------
+
+async def _post_ingest_refresh() -> int:
+    refresh_log = logging.getLogger("agentic_ai.api.ingest")
+    new_version = bump_data_version()
+    invalidate_all()
+    # Invalidate the dataset-relative time cache so the next analytics call
+    # recomputes MAX(Date) against the freshly inserted rows.
+    invalidate_time_cache()
+    # Mock product-name backfill — fill any rows whose Product Name came in
+    # blank with a deterministic footwear name. MUST run before hierarchy
+    # sync so the new names get classified into the v1 + v2 trees this cycle.
+    try:
+        mock_stats = await backfill_missing_product_names()
+        if any(v > 0 for v in mock_stats.values()):
+            refresh_log.info("mock product backfill: %s", mock_stats)
+    except Exception:
+        refresh_log.warning("mock product backfill failed (continuing)", exc_info=True)
+    # Re-sync product hierarchy from the now-updated sales/purchase tables.
+    try:
+        sync_stats = await sync_product_master_from_data()
+        refresh_log.info("product hierarchy v1 synced: %s", sync_stats)
+    except Exception:
+        refresh_log.warning("product hierarchy v1 sync failed (continuing)", exc_info=True)
+    # v2 sync — enterprise 6-level hierarchy. Additive; v1 stays intact.
+    try:
+        v2_stats = await sync_product_sku_master()
+        refresh_log.info("product hierarchy v2 synced: %s", v2_stats)
+    except Exception:
+        refresh_log.warning("product hierarchy v2 sync failed (continuing)", exc_info=True)
+    # Enrichment refresh — inventory + forecast derived from real sales.
+    try:
+        inv_stats = await refresh_inventory()
+        refresh_log.info("inventory refreshed: %s", inv_stats)
+    except Exception:
+        refresh_log.warning("inventory refresh failed (continuing)", exc_info=True)
+    try:
+        fc_stats = await refresh_forecast()
+        refresh_log.info("forecast refreshed: %s", fc_stats)
+    except Exception:
+        refresh_log.warning("forecast refresh failed (continuing)", exc_info=True)
+    # Cost master + quantity backfill — feeds profit / margin / unit velocity
+    # KPIs. Costs depend on product+line classification so this runs AFTER
+    # hierarchy v2 sync.
+    try:
+        cost_stats = await refresh_product_costs()
+        refresh_log.info("product costs refreshed: %s", cost_stats)
+        qty_stats = await backfill_quantities()
+        refresh_log.info("quantity backfill: %s", qty_stats)
+    except Exception:
+        refresh_log.warning("cost/quantity refresh failed (continuing)", exc_info=True)
+    return new_version
+
+
+# ---------------------------------------------------------------------------
 # /upload  (DataCleanAgent)
 # ---------------------------------------------------------------------------
 
@@ -868,55 +1052,7 @@ async def upload(
         except Exception:
             upload_log.warning("could not stamp file_path on uploads row", exc_info=True)
 
-        new_version = bump_data_version()
-        invalidate_all()
-        # Invalidate the dataset-relative time cache so the next analytics
-        # call recomputes MAX(Date) against the freshly inserted rows.
-        invalidate_time_cache()
-        # Mock product-name backfill — fill any rows whose Product Name
-        # came in blank with a deterministic footwear name from the pool.
-        # MUST run before hierarchy sync so the new names get classified
-        # into the v1 + v2 trees in this same upload cycle.
-        try:
-            mock_stats = await backfill_missing_product_names()
-            if any(v > 0 for v in mock_stats.values()):
-                upload_log.info("mock product backfill: %s", mock_stats)
-        except Exception:
-            upload_log.warning("mock product backfill failed (continuing)", exc_info=True)
-        # Re-sync product hierarchy from the now-updated sales/purchase
-        # tables so the AI sees mappings for any new SKUs immediately.
-        try:
-            sync_stats = await sync_product_master_from_data()
-            upload_log.info("product hierarchy v1 synced: %s", sync_stats)
-        except Exception:
-            upload_log.warning("product hierarchy v1 sync failed (continuing)", exc_info=True)
-        # v2 sync — enterprise 6-level hierarchy. Additive; v1 stays intact.
-        try:
-            v2_stats = await sync_product_sku_master()
-            upload_log.info("product hierarchy v2 synced: %s", v2_stats)
-        except Exception:
-            upload_log.warning("product hierarchy v2 sync failed (continuing)", exc_info=True)
-        # Enrichment refresh — inventory + forecast derived from real sales.
-        try:
-            inv_stats = await refresh_inventory()
-            upload_log.info("inventory refreshed: %s", inv_stats)
-        except Exception:
-            upload_log.warning("inventory refresh failed (continuing)", exc_info=True)
-        try:
-            fc_stats = await refresh_forecast()
-            upload_log.info("forecast refreshed: %s", fc_stats)
-        except Exception:
-            upload_log.warning("forecast refresh failed (continuing)", exc_info=True)
-        # Cost master + quantity backfill — feeds profit / margin / unit
-        # velocity KPIs. Costs depend on the product+line classification
-        # so this runs AFTER hierarchy v2 sync.
-        try:
-            cost_stats = await refresh_product_costs()
-            upload_log.info("product costs refreshed: %s", cost_stats)
-            qty_stats = await backfill_quantities()
-            upload_log.info("quantity backfill: %s", qty_stats)
-        except Exception:
-            upload_log.warning("cost/quantity refresh failed (continuing)", exc_info=True)
+        new_version = await _post_ingest_refresh()
         upload_log.info(
             "upload ok rows=%d batch=%s file=%s data_version=%d",
             result["rows_inserted"], batch_id, persistent_path.name, new_version,
@@ -1380,6 +1516,149 @@ class PresentationEmitter:
         return self._inner.stream()
 
 
+# ---------------------------------------------------------------------------
+# Orchestrator version resolution (v1 / v2)
+# ---------------------------------------------------------------------------
+# v2 is the reflective Worker/Critic/Validator pipeline under
+# ``app.orchestrator_v2``. During the parallel-flag rollout (plan Q1), v1
+# stays the default and v2 is opt-in per-deployment or per-request.
+
+_VALID_ORCHESTRATOR_VERSIONS = {"v1", "v2"}
+
+
+def _resolve_orchestrator_version(request: Request) -> str:
+    """
+    Pick which orchestrator handles this turn.
+
+    Resolution order (later items override earlier ones):
+      1. Default: ``"v2"`` (post-P8 flip).
+      2. ``ORCHESTRATOR_VERSION`` environment variable.
+      3. ``FORCE_V1`` env var truthy → pins to v1 (emergency rollback).
+      4. ``X-Orchestrator-Version`` request header (per-request override).
+
+    Unknown values are ignored and the lower-precedence value is kept.
+    The ``FORCE_V1`` lever exists so a deployment can pin back to v1
+    without a code change if v2 misbehaves in production.
+    """
+    chosen = "v2"   # P8: default flipped from v1 → v2.
+
+    env_val = (os.environ.get("ORCHESTRATOR_VERSION") or "").strip().lower()
+    if env_val in _VALID_ORCHESTRATOR_VERSIONS:
+        chosen = env_val
+    elif env_val:
+        log.warning("unknown ORCHESTRATOR_VERSION env=%r — keeping %s", env_val, chosen)
+
+    if (os.environ.get("FORCE_V1") or "").strip().lower() in ("1", "true", "yes"):
+        chosen = "v1"
+
+    header_val = (request.headers.get("X-Orchestrator-Version") or "").strip().lower()
+    if header_val in _VALID_ORCHESTRATOR_VERSIONS:
+        chosen = header_val
+    elif header_val:
+        log.warning("unknown X-Orchestrator-Version=%r — keeping %s", header_val, chosen)
+
+    return chosen
+
+
+def _shadow_v2_enabled(request: Request) -> bool:
+    """
+    Shadow mode: when on, every v1 request also runs v2 in parallel
+    (silently) so we can quantify v2's divergence pre-flag-flip.
+    Controlled by ``SHADOW_V2`` env or ``X-Shadow-V2`` header. Off by
+    default. Mutually exclusive with the user actually opting into v2
+    (then there's no v1 to shadow against).
+    """
+    if (request.headers.get("X-Shadow-V2") or "").strip().lower() in ("1", "true", "yes"):
+        return True
+    return (os.environ.get("SHADOW_V2") or "").strip().lower() in ("1", "true", "yes")
+
+
+async def _runner_v2_shadow(
+    ctx: V2RequestContext,
+    v1_question: str,
+) -> None:
+    """
+    Background-task runner for shadow mode. Runs v2 against a silent
+    emitter, computes a diff against the (already-streamed-to-user) v1
+    answer, and writes one row to ``v2_shadow_log``. Never raises.
+    """
+    import time as _time
+
+    from app.orchestrator_v2.monitoring.shadow import (
+        SilentEventEmitter,
+        compute_diff,
+        record_shadow_run,
+    )
+    from app.orchestrator_v2 import run_query_turn_v2
+
+    started = _time.perf_counter()
+    silent = SilentEventEmitter()
+    final_state = None
+    try:
+        final_state = await run_query_turn_v2(ctx, silent)
+    except Exception:
+        log.exception("shadow runner crashed")
+    duration_v2_ms = (_time.perf_counter() - started) * 1000.0
+
+    v2_final = silent.final_event() or {}
+    v2_answer = v2_final.get("answer")
+    v2_mode = v2_final.get("mode") or "v2"
+
+    # We don't have v1's answer here — it streamed to the user. The diff
+    # job below records v2-side only; an offline join (by request_id +
+    # timestamp) lines it up with the v1 record persisted in
+    # response_store.json or the existing audit infrastructure.
+    diff = compute_diff(
+        v1_answer=None,
+        v2_answer=v2_answer,
+        v2_state=final_state,
+    )
+    await record_shadow_run(
+        request_id=ctx.request_id,
+        conversation_id=ctx.conversation_id,
+        question=v1_question,
+        v1_mode="v1",
+        v1_answer=None,
+        v2_mode=v2_mode,
+        v2_answer=v2_answer,
+        v2_outcome=(final_state.outcome if final_state else "crashed"),
+        diff=diff,
+        duration_v1_ms=0.0,  # filled in by the offline join job
+        duration_v2_ms=duration_v2_ms,
+    )
+
+
+async def _runner_v2(
+    ctx: V2RequestContext,
+    emitter: EventEmitter,
+) -> None:
+    """
+    v2 turn runner. Symmetric to ``_runner`` but takes a ``RequestContext``
+    instead of a ``TurnState`` — v2 owns its own state model
+    (``ExecutionState``). Cleanup semantics (PresentationEmitter wrap,
+    safe-error envelope, emitter.close()) mirror the v1 runner exactly so
+    the SSE wire format stays compatible.
+    """
+    user_emitter = PresentationEmitter(emitter)
+    try:
+        await run_query_turn_v2(ctx, user_emitter)
+    except Exception:
+        log.exception("orchestrator_v2 crashed for request %s", ctx.request_id)
+        # User-safe error: never leak the exception class or message.
+        await user_emitter.emit("agent.result", envelope(
+            "We hit an issue answering your question.",
+            detail="The v2 analytics pipeline encountered an error. Try again or rephrase.",
+            kind="internal",
+        ))
+        await user_emitter.emit("turn.end", {
+            "turn_id": f"v2-{ctx.request_id}",
+            "errors": ["pipeline_error_v2"],
+            "final_answer": None,
+        })
+    finally:
+        await emitter.close()
+
+
 async def _runner(initial: TurnState, emitter: EventEmitter, api_key: str) -> None:
     client = GroqClient(api_key=api_key)
     token = set_request_groq(client)
@@ -1492,12 +1771,46 @@ async def query_stream(req: QueryRequest, request: Request):
         question_chars=len(req.question),
     )
 
-    initial = TurnState(
-        question=req.question,
-        conversation_id=req.conversation_id,
-    )
-    runner_task = _safe_create_task(_runner(initial, emitter, api_key))
+    orchestrator_version = _resolve_orchestrator_version(request)
+    shadow_v2 = _shadow_v2_enabled(request) and orchestrator_version == "v1"
+    shadow_task = None
+
+    if orchestrator_version == "v2":
+        # v2 reflective pipeline. State stays inside v2 — RequestContext
+        # is the minimal handoff.
+        ctx = V2RequestContext(
+            request_id=uuid4().hex,
+            question=req.question,
+            conversation_id=req.conversation_id,
+            groq_api_key=api_key,
+        )
+        runner_task = _safe_create_task(_runner_v2(ctx, emitter))
+    else:
+        # v1 path — original engine.
+        initial = TurnState(
+            question=req.question,
+            conversation_id=req.conversation_id,
+        )
+        runner_task = _safe_create_task(_runner(initial, emitter, api_key))
+
+        # Shadow mode: spawn a parallel v2 run that won't stream to the
+        # user. Logs to v2_shadow_log for offline diffing.
+        if shadow_v2:
+            shadow_ctx = V2RequestContext(
+                request_id=uuid4().hex,
+                question=req.question,
+                conversation_id=req.conversation_id,
+                groq_api_key=api_key,
+            )
+            shadow_task = _safe_create_task(
+                _runner_v2_shadow(shadow_ctx, req.question)
+            )
+
     heartbeat_task = _safe_create_task(_heartbeat(emitter))
+    # ``shadow_task`` is INTENTIONALLY excluded from the stream cleanup
+    # tuple — it must run to completion regardless of whether the user's
+    # SSE stream finishes first (it would otherwise be cancelled the
+    # moment v1's ``turn.end`` arrives, before its DB write).
     return _stream_response(emitter, runner_task, heartbeat_task)
 
 
@@ -1521,8 +1834,11 @@ init_sentry()
 
 app = FastAPI(
     title="Agentic AI",
-    description="Local-first single-user analytics — no authentication.",
-    version="3.1.0-no-auth",
+    description=(
+        "Local-first single-user analytics. v2 reflective orchestrator is "
+        "the default; set FORCE_V1=1 to pin back to v1."
+    ),
+    version="4.0.0-v2",
 )
 
 _raw_origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
@@ -1539,6 +1855,23 @@ app.add_middleware(
 )
 
 app.include_router(api_router)
+
+# Mount the FastMCP server at /mcp so external MCP clients (Claude Desktop,
+# the MCP inspector, other agents) can list + ingest Google Drive files.
+# Guarded: if `fastmcp` is not installed the rest of the app still boots.
+# The mounted ASGI app has its own lifespan (the streamable-HTTP session
+# manager) which Starlette does NOT auto-run for mounted sub-apps — the
+# _startup / _shutdown hooks below drive it manually.
+_mcp_sub_app = None
+_mcp_lifespan_cm = None
+try:
+    from app.mcp_server import mcp_app
+
+    _mcp_sub_app = mcp_app()
+    app.mount("/mcp", _mcp_sub_app)
+    log.info("FastMCP server mounted at /mcp")
+except Exception:
+    log.warning("FastMCP server not mounted (fastmcp unavailable?)", exc_info=True)
 
 instrument_fastapi(app)
 
@@ -1738,7 +2071,28 @@ async def _startup() -> None:
     _app_log.info("sentry: %s", sentry_status())
     _app_log.info("auth: DISABLED — all routes public")
 
+    # Drive the mounted FastMCP sub-app's lifespan — Starlette does not run
+    # lifespans of mounted ASGI apps, so the streamable-HTTP session manager
+    # would otherwise never start. Best-effort: a failure here only disables
+    # /mcp, the rest of the app stays up.
+    global _mcp_lifespan_cm
+    if _mcp_sub_app is not None:
+        try:
+            _mcp_lifespan_cm = _mcp_sub_app.router.lifespan_context(_mcp_sub_app)
+            await _mcp_lifespan_cm.__aenter__()
+            _app_log.info("FastMCP /mcp lifespan started")
+        except Exception:
+            _mcp_lifespan_cm = None
+            _app_log.exception("FastMCP /mcp lifespan failed to start (continuing)")
+
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    return
+    global _mcp_lifespan_cm
+    if _mcp_lifespan_cm is not None:
+        try:
+            await _mcp_lifespan_cm.__aexit__(None, None, None)
+        except Exception:
+            _app_log.warning("FastMCP /mcp lifespan shutdown error", exc_info=True)
+        finally:
+            _mcp_lifespan_cm = None
