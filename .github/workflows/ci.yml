@@ -74,6 +74,18 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: Seed v2 test DB (schema + KPI catalog + hierarchy defaults)
+        env:
+          FINANCIAL_DB_PATH: /tmp/_ci_v2_test.db
+          PYTHONPATH: backend
+        working-directory: backend
+        # v2 tests don't go through core_system._startup. compute_kpi
+        # (used by test_p2 + test_p4) needs the kpi_registry table to
+        # exist. This step mirrors the startup boot sequence onto the
+        # fresh CI DB. Idempotent.
+        run: |
+          python -m app.orchestrator_v2.tests._db_bootstrap
+
       - name: Run v2 reflective-orchestrator suites
         env:
           FINANCIAL_DB_PATH: /tmp/_ci_v2_test.db
