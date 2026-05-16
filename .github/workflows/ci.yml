@@ -102,7 +102,8 @@ jobs:
             test_p2_pipeline \
             test_p3_validators \
             test_p4_reflection \
-            test_p5_memory
+            test_p5_memory \
+            test_p6_drive_capabilities
           do
             echo "::group::app.orchestrator_v2.tests.$t"
             if python -m "app.orchestrator_v2.tests.$t"; then

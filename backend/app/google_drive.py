@@ -359,3 +359,177 @@ def _cleanup(path: Path | None) -> None:
             path.unlink()
     except Exception:
         log.warning("could not clean up partial drive file %s", path, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase B — Granular drive tools: preview, infer_schema, search
+# ---------------------------------------------------------------------------
+# These let an MCP client (Claude Desktop, Cursor) or the v2 Worker
+# planner peek at a Drive file BEFORE deciding whether to ingest it.
+# All three are read-only (drive.readonly scope) and reuse the existing
+# OAuth credential storage.
+
+def _bytes_for_inspection_sync(creds, file_id: str) -> tuple[str, str, bytes]:
+    """Fetch a Drive file's bytes for inspection (preview/schema-infer).
+    Returns ``(name, mime_type, raw_bytes)``. Google Sheets export to CSV
+    so the downstream parser can read them with the CSV path. Never
+    writes to disk — inspection never lands in data/uploads/.
+    """
+    service = _drive_service(creds)
+    meta = service.files().get(
+        fileId=file_id, fields="id,name,mimeType,size",
+    ).execute()
+    mime_type = meta.get("mimeType", "")
+    name = meta.get("name", file_id)
+    if mime_type == _MIME_GSHEET:
+        data = service.files().export_media(fileId=file_id, mimeType=_MIME_CSV).execute()
+        if not name.lower().endswith(".csv"):
+            name = f"{name}.csv"
+    elif mime_type in (_MIME_CSV, _MIME_XLSX):
+        data = service.files().get_media(fileId=file_id).execute()
+    else:
+        raise ValueError(f"unsupported Drive mime type: {mime_type!r}")
+    raw = data if isinstance(data, bytes) else bytes(data)
+    return name, mime_type, raw
+
+
+async def preview_file(
+    creds,
+    file_id: str,
+    *,
+    rows: int = 20,
+) -> dict[str, Any]:
+    """Preview the first N rows of a Drive file without ingesting it.
+
+    Returns ``{name, mime_type, columns, rows, total_rows_in_file}``.
+    Useful for the AI Assistant + external MCP clients to confirm a
+    file is the one the user means before committing to an ingest.
+    """
+    from app.infrastructure import parse_file
+
+    rows = max(1, min(int(rows or 20), 200))   # clamp 1..200
+    name, mime_type, raw = await asyncio.to_thread(
+        _bytes_for_inspection_sync, creds, file_id,
+    )
+    # parse_file returns (canonical_columns, alias_map, rows[]) — the
+    # alias map describes the header normalization the importer would
+    # apply. For previewing we only surface columns + rows.
+    canonical_columns, _alias_map, all_rows = await asyncio.to_thread(
+        parse_file, name, raw,
+    )
+    return {
+        "file_id":             file_id,
+        "name":                name,
+        "mime_type":           mime_type,
+        "columns":             list(canonical_columns),
+        "rows":                all_rows[:rows],
+        "total_rows_in_file":  len(all_rows),
+        "preview_row_count":   min(rows, len(all_rows)),
+    }
+
+
+def _infer_column_type(values: list[Any]) -> str:
+    """Coarse type inference from a sample of column values.
+    Returns one of: 'date', 'number', 'integer', 'boolean', 'string', 'empty'.
+    """
+    non_null = [v for v in values if v not in (None, "")]
+    if not non_null:
+        return "empty"
+    # Boolean check first — strict literal match.
+    bool_like = {"true", "false", "yes", "no", "0", "1"}
+    if all(str(v).strip().lower() in bool_like for v in non_null):
+        return "boolean"
+    # Date check — ISO YYYY-MM-DD is the canonical form used elsewhere.
+    import re
+    if all(re.match(r"^\d{4}-\d{2}-\d{2}", str(v).strip()) for v in non_null):
+        return "date"
+    # Numeric check.
+    all_int = True
+    all_num = True
+    for v in non_null:
+        s = str(v).strip().replace(",", "")
+        try:
+            f = float(s)
+        except (ValueError, TypeError):
+            all_num = False
+            all_int = False
+            break
+        if f != int(f):
+            all_int = False
+    if all_int:
+        return "integer"
+    if all_num:
+        return "number"
+    return "string"
+
+
+async def infer_schema(
+    creds,
+    file_id: str,
+    *,
+    sample_rows: int = 50,
+) -> dict[str, Any]:
+    """Infer column names + types + sample values from a Drive file.
+
+    Lighter than preview_file when the caller only cares about schema
+    (e.g., "is this ingestible?" / "which column is the amount?").
+    """
+    from app.infrastructure import parse_file
+
+    sample_rows = max(5, min(int(sample_rows or 50), 200))
+    name, mime_type, raw = await asyncio.to_thread(
+        _bytes_for_inspection_sync, creds, file_id,
+    )
+    canonical_columns, _alias_map, all_rows = await asyncio.to_thread(
+        parse_file, name, raw,
+    )
+    sample = all_rows[:sample_rows]
+    columns_meta: list[dict[str, Any]] = []
+    for col in canonical_columns:
+        values = [r.get(col) for r in sample]
+        non_null_count = sum(1 for v in values if v not in (None, ""))
+        columns_meta.append({
+            "name":            col,
+            "inferred_type":   _infer_column_type(values),
+            "non_null_count":  non_null_count,
+            "sample_values":   [v for v in values if v not in (None, "")][:5],
+        })
+    return {
+        "file_id":            file_id,
+        "name":               name,
+        "mime_type":          mime_type,
+        "columns":            columns_meta,
+        "sample_size":        len(sample),
+        "total_rows_in_file": len(all_rows),
+    }
+
+
+def _search_drive_sync(creds, query: str, limit: int) -> list[dict[str, Any]]:
+    """Drive `q=` search across the user's files. Restricted to
+    ingestible MIME types so results match what ingest_drive_files can
+    consume."""
+    service = _drive_service(creds)
+    mime_q = " or ".join(f"mimeType='{m}'" for m in INGESTIBLE_MIME_TYPES)
+    # Escape single quotes in user query (Drive q-syntax uses '...').
+    safe = (query or "").replace("'", "\\'")
+    full_q = f"({mime_q}) and trashed=false and (name contains '{safe}' or fullText contains '{safe}')"
+    resp = service.files().list(
+        q=full_q,
+        pageSize=max(1, min(int(limit), 100)),
+        orderBy="modifiedTime desc",
+        fields="files(id,name,mimeType,modifiedTime,size)",
+    ).execute()
+    return resp.get("files", [])
+
+
+async def search_drive(
+    creds,
+    query: str,
+    *,
+    limit: int = 25,
+) -> list[dict[str, Any]]:
+    """Search the user's Drive by name + content. Returns up to `limit`
+    ingestible files (CSV / XLSX / Google Sheets), newest first."""
+    if not query or not query.strip():
+        return []
+    return await asyncio.to_thread(_search_drive_sync, creds, query.strip(), limit)

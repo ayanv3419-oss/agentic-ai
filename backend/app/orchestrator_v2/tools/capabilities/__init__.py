@@ -13,6 +13,9 @@ from app.orchestrator_v2.tools.capabilities import (  # noqa: F401
     breakdown_by_hierarchy,
     compare_periods,
     compute_kpi,
+    drive_infer_schema,
+    drive_preview,
+    drive_search,
     format_response,
     narrate,
     resolve_entities,
@@ -29,4 +32,8 @@ CAPABILITY_MODULES: tuple[str, ...] = (
     "breakdown_by_hierarchy",
     "narrate",
     "format_response",
+    # Phase B — Drive granular tools (read-only, drive.readonly scope).
+    "drive_preview",
+    "drive_infer_schema",
+    "drive_search",
 )

@@ -33,6 +33,9 @@ EXPECTED_CAPABILITIES = (
     "breakdown_by_hierarchy",
     "compare_periods",
     "compute_kpi",
+    "drive_infer_schema",
+    "drive_preview",
+    "drive_search",
     "format_response",
     "narrate",
     "resolve_entities",
@@ -47,8 +50,8 @@ def _heading(title: str) -> None:
     print("=" * 70)
 
 
-def test_registry_has_all_eight() -> None:
-    _heading("test_registry_has_all_eight")
+def test_registry_has_all_capabilities() -> None:
+    _heading("test_registry_has_all_capabilities")
     reg = get_capability_registry()
     assert sorted(reg.names) == sorted(EXPECTED_CAPABILITIES), (
         f"expected {EXPECTED_CAPABILITIES}, got {reg.names}"
@@ -139,6 +142,13 @@ def test_capability_bodies_status() -> None:
             "narrative": "Total revenue is 100.",
             "aggregates": {"total": 100},
         },
+        # Phase B — Drive granular tools. Each returns a typed output with
+        # error="Google Drive is not configured..." when no env / OAuth is
+        # set (CI case). The capability `ok` flag is True because the
+        # capability ran cleanly; the inner error is the operational result.
+        "drive_preview":           {"file_id": "fake_id"},
+        "drive_infer_schema":      {"file_id": "fake_id"},
+        "drive_search":            {"query": "revenue"},
     }
 
     # After the full P2-P6 build-out + "finish pending work" sweep, all
@@ -213,7 +223,7 @@ def test_primitive_reexports_resolve() -> None:
 
 def main() -> int:
     tests = [
-        test_registry_has_all_eight,
+        test_registry_has_all_capabilities,
         test_each_capability_has_valid_schema,
         test_subclasses_declare_models,
         test_capability_bodies_status,

@@ -103,6 +103,106 @@ async def ingest_drive_files(
     }
 
 
+@mcp.tool
+async def preview_file(file_id: str, rows: int = 20) -> dict:
+    """Preview the first N rows of a Drive file without ingesting it.
+
+    Use this to check that a file is the one you mean BEFORE calling
+    ``ingest_drive_files`` — peeks at column names + sample values
+    without changing the database.
+
+    Parameters
+    ----------
+    file_id : str
+        Drive file id (from ``list_drive_files`` or ``search_drive``).
+    rows : int
+        How many rows to return (1..200, default 20).
+
+    Returns ``{ok, file_id, name, mime_type, columns, rows, total_rows_in_file}``.
+    """
+    if not google_drive.is_configured():
+        return {"ok": False, "error": "Google Drive is not configured on the server."}
+    creds = await asyncio.to_thread(google_drive.load_credentials)
+    if creds is None:
+        return {
+            "ok": False,
+            "error": "Google Drive not connected. Connect it once via the "
+                     "app's Upload page, then retry.",
+        }
+    try:
+        result = await google_drive.preview_file(creds, file_id, rows=rows)
+    except Exception as e:
+        log.exception("mcp preview_file failed")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return {"ok": True, **result}
+
+
+@mcp.tool
+async def infer_schema(file_id: str, sample_rows: int = 50) -> dict:
+    """Infer column names + types + sample values from a Drive file.
+
+    Lighter than ``preview_file`` when you only care about "is this
+    ingestible?" or "what does the schema look like?". Returns per-column
+    metadata (name, inferred type, non-null count, sample values).
+
+    Parameters
+    ----------
+    file_id : str
+        Drive file id.
+    sample_rows : int
+        Rows to sample for type inference (5..200, default 50).
+    """
+    if not google_drive.is_configured():
+        return {"ok": False, "error": "Google Drive is not configured on the server."}
+    creds = await asyncio.to_thread(google_drive.load_credentials)
+    if creds is None:
+        return {
+            "ok": False,
+            "error": "Google Drive not connected. Connect it once via the "
+                     "app's Upload page, then retry.",
+        }
+    try:
+        result = await google_drive.infer_schema(creds, file_id, sample_rows=sample_rows)
+    except Exception as e:
+        log.exception("mcp infer_schema failed")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return {"ok": True, **result}
+
+
+@mcp.tool
+async def search_drive(query: str, limit: int = 25) -> dict:
+    """Search the user's Drive for ingestible files matching ``query``.
+
+    Searches both filenames and file content. Results are restricted to
+    CSV / XLSX / Google Sheets (the MIME types ``ingest_drive_files``
+    can consume), newest first.
+
+    Parameters
+    ----------
+    query : str
+        Free-text search query, e.g. "revenue 2025" or "march sales".
+    limit : int
+        Max results to return (1..100, default 25).
+    """
+    if not google_drive.is_configured():
+        return {"ok": False, "error": "Google Drive is not configured on the server."}
+    if not query or not query.strip():
+        return {"ok": False, "error": "query must be a non-empty string"}
+    creds = await asyncio.to_thread(google_drive.load_credentials)
+    if creds is None:
+        return {
+            "ok": False,
+            "error": "Google Drive not connected. Connect it once via the "
+                     "app's Upload page, then retry.",
+        }
+    try:
+        files = await google_drive.search_drive(creds, query, limit=limit)
+    except Exception as e:
+        log.exception("mcp search_drive failed")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return {"ok": True, "query": query, "count": len(files), "files": files}
+
+
 def mcp_app():
     """ASGI app for mounting at /mcp (streamable HTTP transport).
 
