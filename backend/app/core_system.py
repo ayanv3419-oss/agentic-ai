@@ -878,7 +878,10 @@ async def errors_report(req: FrontendErrorReport):
 async def health() -> dict:
     return {
         "status": "ok",
-        "version": "3.1.0-no-auth",
+        # Pull from the FastAPI app so a version bump in one place
+        # (the FastAPI(...) constructor) propagates here automatically
+        # instead of drifting like the previous hardcoded string did.
+        "version": app.version,
         "data_version": get_data_version(),
         "cache": {
             "kind": "json_file",
