@@ -25,7 +25,7 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.analytics_engine import (
     DashboardAgent,
@@ -216,6 +216,91 @@ def _drive_not_configured() -> JSONResponse:
             kind="not_implemented",
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# App-login gate (matches the frontend's LoginGate component)
+# ---------------------------------------------------------------------------
+# This is NOT real auth — the platform is single-user local-first. The
+# endpoint exists so the frontend's POST /auth/login resolves with a 2xx
+# instead of a 404. Credentials are env-overridable; defaults match what
+# the frontend ships with so a fresh deploy works without env edits.
+
+_APP_LOGIN_USER = os.environ.get("APP_LOGIN_USER", "Mansuri").strip()
+_APP_LOGIN_PASSWORD = os.environ.get("APP_LOGIN_PASSWORD", "182012")
+
+
+class LoginRequest(BaseModel):
+    """Permissive login body — accepts a couple of common field names so
+    different frontend builds slot in cleanly without a backend redeploy."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    username: str | None = Field(default=None, max_length=120)
+    user:     str | None = Field(default=None, max_length=120)
+    password: str | None = Field(default=None, max_length=200)
+    pass_:    str | None = Field(default=None, alias="pass", max_length=200)
+
+
+@api_router.post("/auth/login")
+async def auth_login(req: LoginRequest, request: Request) -> dict:
+    """
+    App-level login endpoint. Accepts ``{username, password}`` (also
+    accepts ``{user, pass}`` as aliases for tolerance). Validates against
+    ``APP_LOGIN_USER`` / ``APP_LOGIN_PASSWORD`` env vars (defaults:
+    ``Mansuri`` / ``182012``).
+
+    On success returns ``{ok, username, token}``. The token is a short
+    opaque string the frontend may forward as ``Authorization: Bearer``
+    if it wants — the backend doesn't currently enforce it (single-user
+    local-first), but having a token-shaped response keeps the wire
+    contract future-compatible.
+
+    Rate-limited per client IP to mitigate brute force.
+    """
+    rate_error = _rate_limit_check(_client_ip(request))
+    if rate_error is not None:
+        return JSONResponse(status_code=429, content=rate_error)
+
+    username = (req.username or req.user or "").strip()
+    password = req.password or req.pass_ or ""
+
+    if not username or not password:
+        return JSONResponse(
+            status_code=400,
+            content=envelope(
+                "Missing credentials",
+                detail="Both `username` and `password` are required.",
+                kind="validation",
+            ),
+        )
+
+    # Username is case-insensitive; password is exact.
+    if (
+        username.lower() != _APP_LOGIN_USER.lower()
+        or password != _APP_LOGIN_PASSWORD
+    ):
+        log.info("auth/login: rejected attempt for user=%r", username[:40])
+        return JSONResponse(
+            status_code=401,
+            content=envelope(
+                "Invalid credentials",
+                detail="Username or password is incorrect.",
+                kind="auth",
+            ),
+        )
+
+    # Mint a short opaque token. Not enforced server-side today; the
+    # frontend may store it and echo it back as Authorization for future
+    # multi-tenant work.
+    token = uuid4().hex
+    log.info("auth/login: success for user=%r", username[:40])
+    return {
+        "ok": True,
+        "authenticated": True,
+        "username": _APP_LOGIN_USER,
+        "token": token,
+    }
 
 
 @api_router.get("/auth/me")
