@@ -79,8 +79,12 @@ jobs:
           FINANCIAL_DB_PATH: /tmp/_ci_v2_test.db
           PYTHONPATH: backend
         working-directory: backend
+        # Note: NO `set -e` here — we want every suite to run so the
+        # logs show exactly which one fails instead of bailing at the
+        # first. ``failed`` is accumulated and the step exits non-zero
+        # at the end if any suite returned non-zero.
         run: |
-          set -e
+          failed=0
           for t in \
             test_p1_capability_layer \
             test_p2_pipeline \
@@ -89,9 +93,17 @@ jobs:
             test_p5_memory
           do
             echo "::group::app.orchestrator_v2.tests.$t"
-            python -m "app.orchestrator_v2.tests.$t"
-            echo "::endgroup::"
+            if python -m "app.orchestrator_v2.tests.$t"; then
+              echo "::endgroup::"
+              echo "[PASS] $t"
+            else
+              code=$?
+              echo "::endgroup::"
+              echo "::error title=v2 test failure::${t} exited with code ${code}"
+              failed=1
+            fi
           done
+          exit $failed
 
   frontend-build:
     runs-on: ubuntu-latest
