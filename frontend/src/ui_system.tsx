@@ -339,6 +339,10 @@ function shiftMonth(month: string, delta: number): string {
 export function Dashboard() {
   const filters = useAppStore((s) => s.filters)
   const setFilters = useAppStore((s) => s.setFilters)
+  // Subscribe to the global serverDataVersion so an upload (or any other
+  // server-side mutation) triggers an auto-reload without the user having
+  // to click Refresh.
+  const serverDataVersion = useAppStore((s) => s.serverDataVersion)
 
   const [data, setData] = useState<DashboardData | null>(null)
   const [loading, setLoading] = useState(false)
@@ -367,6 +371,24 @@ export function Dashboard() {
 
   useEffect(() => {
     void load(filters.month)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters.month])
+
+  // Auto-reload when serverDataVersion bumps (after upload, unarchive,
+  // KPI toggle, etc.). The initial mount-time load above already covers
+  // the very first render, so this fires only when the version moves.
+  useEffect(() => {
+    if (serverDataVersion === null) return
+    void load(filters.month)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serverDataVersion])
+
+  // Re-fetch when the user returns to this tab. Handles the "I uploaded
+  // in another tab and switched back" case without needing SSE push.
+  useEffect(() => {
+    const onFocus = () => { void load(filters.month) }
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filters.month])
 
@@ -774,6 +796,21 @@ export function AiAssistant() {
   const clearChat = useAppStore((s) => s.clearChat)
   const setStreaming = useAppStore((s) => s.setStreaming)
   const apiKeySet = useAppStore((s) => Boolean(s.shop.groqApiKey))
+  // Banner inputs: when serverDataVersion advances past the version
+  // captured at conversation-start, the next reply uses fresher data
+  // than the answers already on screen. We surface that explicitly so
+  // the user isn't confused if numbers shift between turns.
+  const serverDataVersion = useAppStore((s) => s.serverDataVersion)
+  const conversationStartVersion = useAppStore((s) => s.conversationStartVersion)
+  const dataChangedMidConversation =
+    serverDataVersion !== null
+    && conversationStartVersion !== null
+    && serverDataVersion > conversationStartVersion
+    && messages.length > 0
+  const [bannerDismissed, setBannerDismissed] = useState(false)
+  // A new conversation always resets the dismiss state so the banner can
+  // legitimately surface on the next mid-conversation change.
+  useEffect(() => { setBannerDismissed(false) }, [conversationStartVersion])
 
   const [input, setInput] = useState('')
   const abortRef = useRef<AbortController | null>(null)
@@ -968,6 +1005,22 @@ export function AiAssistant() {
 
       <div className="border-t border-zinc-800 bg-zinc-950">
         <div className="max-w-3xl mx-auto px-6 md:px-10 py-4">
+          {dataChangedMidConversation && !bannerDismissed && (
+            <div className="mb-3 flex items-start gap-2 text-xs text-emerald-300/90 bg-emerald-950/30 border border-emerald-900/40 rounded-md px-3 py-2">
+              <span className="mt-0.5">📊</span>
+              <span className="flex-1">
+                Data updated since this conversation started — new replies will use the latest data.
+              </span>
+              <button
+                type="button"
+                onClick={() => setBannerDismissed(true)}
+                className="text-emerald-400/60 hover:text-emerald-200 text-[10px] uppercase tracking-wide"
+                aria-label="Dismiss banner"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
           {!apiKeySet && (
             <div className="mb-3 flex items-center gap-2 text-xs text-amber-400/80">
               <AlertTriangle className="w-3.5 h-3.5" />

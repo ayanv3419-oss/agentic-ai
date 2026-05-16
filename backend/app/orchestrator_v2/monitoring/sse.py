@@ -54,7 +54,23 @@ class EventEmitter:
     async def emit(self, event: str, data: Any = None) -> None:
         if self._closed:
             return
-        await self.queue.put((event, data if data is not None else {}))
+        payload = data if data is not None else {}
+        # Stamp `data_version` on every turn.end and final event so the
+        # frontend can detect "data changed since this conversation
+        # started" without polling. Done at the emit boundary so all 17
+        # call sites (v1 + v2 + front_door) benefit without per-site edits.
+        if (
+            event in ("turn.end", "final")
+            and isinstance(payload, dict)
+            and "data_version" not in payload
+        ):
+            try:
+                from app.infrastructure import get_data_version
+                payload = {**payload, "data_version": get_data_version()}
+            except Exception:
+                # Never let an observability concern break the SSE stream.
+                pass
+        await self.queue.put((event, payload))
 
     async def comment(self, text: str = "ping") -> None:
         if self._closed:

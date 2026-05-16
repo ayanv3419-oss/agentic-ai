@@ -387,7 +387,14 @@ export async function streamQuery(
       }
       if (!data) continue
       try {
-        onEvent({ event, data: JSON.parse(data) })
+        const parsed = JSON.parse(data)
+        // Stamp serverDataVersion from any SSE payload that carries it
+        // (turn.end + final from the backend's emit boundary). Powers the
+        // Dashboard auto-refetch and the chat "data updated" banner.
+        if (parsed && typeof parsed === 'object' && 'data_version' in parsed) {
+          useAppStore.getState().observeServerDataVersion(parsed.data_version)
+        }
+        onEvent({ event, data: parsed })
       } catch {
         onEvent({ event, data })
       }
@@ -403,7 +410,14 @@ export async function uploadSales(
   file: File,
   target: 'sales' | 'purchase' = 'sales',
 ): Promise<UploadResponse> {
-  return uploadFile<UploadResponse>('/upload', file, { target })
+  const result = await uploadFile<UploadResponse>('/upload', file, { target })
+  // Backend stamps `data_version` on the upload response (Phase A wiring).
+  // Pulling it into the store here means a successful upload flows
+  // through to the Dashboard's version-watching effect with no extra
+  // glue in the UploadData component.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  useAppStore.getState().observeServerDataVersion((result as any)?.data_version)
+  return result
 }
 
 export async function fetchUploadsList(): Promise<UploadsListResponse> {
@@ -411,12 +425,32 @@ export async function fetchUploadsList(): Promise<UploadsListResponse> {
 }
 
 export async function disconnectUpload(batchId: string): Promise<DisconnectResponse> {
-  return apiPost<DisconnectResponse>(`/uploads/${encodeURIComponent(batchId)}/disconnect`)
+  const result = await apiPost<DisconnectResponse>(`/uploads/${encodeURIComponent(batchId)}/disconnect`)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  useAppStore.getState().observeServerDataVersion((result as any)?.data_version)
+  return result
 }
 
 export async function fetchDashboard(month?: string): Promise<DashboardData> {
   const q = month ? `?month=${encodeURIComponent(month)}` : ''
-  return apiGet<DashboardData>(`/dashboard${q}`)
+  const result = await apiGet<DashboardData>(`/dashboard${q}`)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  useAppStore.getState().observeServerDataVersion((result as any)?.data_version)
+  return result
+}
+
+/**
+ * Helper invoked after any client-initiated change that mutates server
+ * data (upload, unarchive, ...) so the Dashboard + Uploads list reload
+ * without each call site having to remember both refetches. Runs both
+ * fetches in parallel and swallows individual failures so a slow
+ * /uploads doesn't block the dashboard reload (or vice-versa).
+ */
+export async function refreshAfterChange(month?: string): Promise<void> {
+  await Promise.allSettled([
+    fetchDashboard(month),
+    fetchUploadsList(),
+  ])
 }
 
 // Google upload/Drive helpers — only used by the Upload page's "Connect
@@ -512,6 +546,16 @@ interface AppState {
   isStreaming: boolean
   conversationId: string
 
+  // Latest `data_version` observed from any server response. Used by the
+  // Dashboard to auto-reload when the server's data has changed.
+  serverDataVersion: number | null
+
+  // Snapshot of `serverDataVersion` at the moment the current conversation
+  // began. Used by the chat UI to show a "data updated since this
+  // conversation started" banner when serverDataVersion has since moved
+  // past it.
+  conversationStartVersion: number | null
+
   setShop: (info: Partial<ShopInfo>) => void
   setDataset: (d: DatasetMeta | null) => void
   setFilters: (f: Partial<DashboardFilters>) => void
@@ -522,6 +566,10 @@ interface AppState {
   clearChat: () => void
   setStreaming: (b: boolean) => void
   rotateConversation: () => void
+
+  // Monotonically updates serverDataVersion (ignores stale lower values).
+  // First call within a conversation also stamps conversationStartVersion.
+  observeServerDataVersion: (v: number | null | undefined) => void
 }
 
 const emptyShop: ShopInfo = {
@@ -552,6 +600,9 @@ export const useAppStore = create<AppState>()(
       isStreaming: false,
       conversationId: newConversationId(),
 
+      serverDataVersion: null,
+      conversationStartVersion: null,
+
       setShop: (info) => set((s) => ({ shop: { ...s.shop, ...info } })),
       setDataset: (d) => set({ dataset: d }),
       setFilters: (f) => set((s) => ({ filters: { ...s.filters, ...f } })),
@@ -570,9 +621,32 @@ export const useAppStore = create<AppState>()(
           chatHistory: [],
           isStreaming: false,
           conversationId: newConversationId(),
+          // Re-anchor the chat banner to "right now" so a stale conversation
+          // doesn't carry a leftover "data updated" indicator into the new one.
+          conversationStartVersion: null,
         }),
       setStreaming: (b) => set({ isStreaming: b }),
-      rotateConversation: () => set({ conversationId: newConversationId() }),
+      rotateConversation: () =>
+        set({
+          conversationId: newConversationId(),
+          conversationStartVersion: null,
+        }),
+
+      observeServerDataVersion: (v) => {
+        if (v === null || v === undefined) return
+        const n = typeof v === 'number' ? v : Number(v)
+        if (!Number.isFinite(n)) return
+        set((s) => {
+          // Only move forward — late-arriving responses from before a bump
+          // must not roll the known version backwards.
+          const next = s.serverDataVersion === null || n > s.serverDataVersion
+            ? n
+            : s.serverDataVersion
+          // First server response in a conversation anchors the chat banner.
+          const start = s.conversationStartVersion === null ? next : s.conversationStartVersion
+          return { serverDataVersion: next, conversationStartVersion: start }
+        })
+      },
     }),
     {
       name: 'agentic-ai:v1',

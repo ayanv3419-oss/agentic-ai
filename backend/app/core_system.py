@@ -529,6 +529,10 @@ async def kpi_disable_route(kpi_id: str):
         return JSONResponse(status_code=404, content=envelope(
             "KPI not found", detail=f"unknown id: {kpi_id!r}", kind="validation",
         ))
+    # KPI definition changed -> any cached chat answer that resolved this
+    # KPI is now stale. Bump version + drop the response cache.
+    bump_data_version()
+    invalidate_all()
     return {"ok": True, "kpi_id": kpi_id, "enabled": False}
 
 
@@ -539,6 +543,8 @@ async def kpi_enable_route(kpi_id: str):
         return JSONResponse(status_code=404, content=envelope(
             "KPI not found", detail=f"unknown id: {kpi_id!r}", kind="validation",
         ))
+    bump_data_version()
+    invalidate_all()
     return {"ok": True, "kpi_id": kpi_id, "enabled": True}
 
 
@@ -568,6 +574,10 @@ async def hierarchy_products():
 async def hierarchy_products_sync():
     """Rebuild product_master by scanning distinct Product Name values."""
     stats = await sync_product_master_from_data()
+    # Hierarchy was rebuilt -> any cached drill-down / category answer
+    # is stale. Bump version + drop the response cache.
+    bump_data_version()
+    invalidate_all()
     return {"ok": True, **stats}
 
 
@@ -591,6 +601,10 @@ async def enrichment_costs_refresh():
     User-supplied (source='manual') cost rows are preserved."""
     cost_stats = await refresh_product_costs()
     qty_stats  = await backfill_quantities()
+    # Cost / margin computations referenced by cached chat answers are
+    # now stale -> bump version + drop cache.
+    bump_data_version()
+    invalidate_all()
     return {"ok": True, "costs": cost_stats, "quantities": qty_stats}
 
 
@@ -640,7 +654,12 @@ async def inventory_list(status: str | None = None):
 @api_router.post("/inventory/refresh")
 async def inventory_refresh_route():
     """Force-recompute the inventory snapshot from real sales velocity."""
-    return {"ok": True, **(await refresh_inventory())}
+    result = await refresh_inventory()
+    # Inventory rows changed -> any cached inventory / "what's low?"
+    # answer is stale. Bump version + drop the response cache.
+    bump_data_version()
+    invalidate_all()
+    return {"ok": True, **result}
 
 
 @api_router.get("/forecast/summary")
@@ -659,7 +678,11 @@ async def forecast_sku_route(sku_code: str):
 @api_router.post("/forecast/refresh")
 async def forecast_refresh_route():
     """Force-recompute the 14-day per-SKU forecast."""
-    return {"ok": True, **(await refresh_forecast())}
+    result = await refresh_forecast()
+    # Forecast rows changed -> any cached forecast answer is stale.
+    bump_data_version()
+    invalidate_all()
+    return {"ok": True, **result}
 
 
 @api_router.get("/hierarchy/v2/tree")
@@ -677,7 +700,11 @@ async def hierarchy_v2_tree():
 async def hierarchy_v2_sync():
     """Rebuild product_sku_master + product_hierarchy_v2 from the current
     sales/purchase rows. Idempotent: existing SKU codes stay stable."""
-    return {"ok": True, **(await sync_product_sku_master())}
+    result = await sync_product_sku_master()
+    # Hierarchy v2 changed -> cached drill-down answers are stale.
+    bump_data_version()
+    invalidate_all()
+    return {"ok": True, **result}
 
 
 @api_router.get("/hierarchy/v2/drilldown")
@@ -1166,6 +1193,10 @@ async def upload(
             "table_total":       await count_rows(target_table),
             "file_path":         str(persistent_path),
             "file_hash":         file_hash,
+            # Stamp the post-ingest data_version so the frontend can
+            # mark its cached Dashboard / Uploads list as stale and
+            # auto-refetch without polling.
+            "data_version":      new_version,
         }
     except Exception as e:
         upload_log.exception("upload: unhandled crash")
@@ -1328,7 +1359,7 @@ async def dashboard(month: str | None = None):
             kind="validation",
         ))
     try:
-        return await DashboardAgent().run(month=month)
+        result = await DashboardAgent().run(month=month)
     except ValueError as e:
         return JSONResponse(status_code=400, content=envelope(
             "Invalid dashboard query", detail=str(e), kind="validation",
@@ -1340,6 +1371,11 @@ async def dashboard(month: str | None = None):
             detail=f"{type(e).__name__}: {e}",
             kind="internal",
         ))
+    # Stamp data_version so the frontend can detect server-side changes
+    # since its last fetch and short-circuit redundant reloads.
+    if isinstance(result, dict) and "data_version" not in result:
+        result = {**result, "data_version": get_data_version()}
+    return result
 
 
 # ---------------------------------------------------------------------------
