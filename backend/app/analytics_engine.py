@@ -2363,6 +2363,18 @@ class ResolveTimeWindowTool(Tool):
     args_model = ResolveTimeWindowArgs
 
     async def run(self, state: TurnState, args: ResolveTimeWindowArgs) -> ToolResult:
+        from app.dynamic_ingest import list_dynamic_tables as _ldt_tw
+        if _ldt_tw():
+            # Dynamic tables present — time window is encoded in the date columns
+            # of the user-uploaded tables.  Tell the LLM to handle dates directly
+            # in its SQL (e.g. WHERE transaction_date >= '2026-01-01').
+            return ToolResult(ok=True, output={
+                "note": (
+                    "Dynamic tables are active. Do not use this tool. "
+                    "Handle time filters directly in your query_user_table SQL using "
+                    "WHERE on the relevant date column (e.g. transaction_date, date)."
+                )
+            })
         work, fail = await _run_internal(state, [("TimeKPI", {})])
         if fail is not None:
             return ToolResult(ok=False, error=f"TimeKPI: {fail.error}")
@@ -2597,11 +2609,322 @@ class GoogleDriveTool(Tool):
         )
 
 
+# ---------------------------------------------------------------------------
+# 6.7 query_user_table — LLM-callable raw SQL on user-uploaded dynamic tables
+# ---------------------------------------------------------------------------
+# When the question is about data that lives in a user-uploaded sheet
+# (inventory, product hierarchy, store transactions, etc. — anything outside
+# the legacy sales/purchase schema), the LLM writes a SELECT against the
+# relevant `u_<sheet>` table directly. The tool validates + executes + auto-
+# builds a chart from the result.
+#
+# Hard constraints enforced by the tool:
+#   • Only SELECT statements
+#   • Only identifiers (tables/columns) present in the dynamic registry
+#     plus the four metadata columns (_id, _batch_id, _source_sheet,
+#     _inserted_at) and the SQL aliases the LLM declares for chart axes.
+#   • A single statement (no `;` chains, no CTEs that span statements)
+#   • Row limit defaulted + capped to 500 — prevents accidental table scans
+#   • Scan estimate counted toward the cost guard
+
+_raw_sql_log = logging.getLogger("agentic_ai.raw_sql_tool")
+
+_RAW_SQL_DANGEROUS = re.compile(
+    r"\b(insert|update|delete|drop|alter|create|attach|pragma|vacuum|"
+    r"replace|truncate|rename|reindex)\b",
+    re.IGNORECASE,
+)
+_RAW_SQL_SELECT = re.compile(r"^\s*select\b", re.IGNORECASE | re.DOTALL)
+_RAW_SQL_QUOTED_IDENT = re.compile(r'"([^"]+)"')
+_RAW_SQL_BACKTICK_IDENT = re.compile(r"`([^`]+)`")
+_RAW_SQL_BARE_IDENT = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b")
+_RAW_SQL_MAX_LIMIT = 500
+
+
+class RawSqlQueryArgs(BaseModel):
+    sql: str = Field(
+        ...,
+        description=(
+            "A complete SELECT statement against one of the user-uploaded "
+            "u_* tables listed in the schema. Quote identifiers with double "
+            'quotes when they contain underscores ("u_inventory_master"). '
+            "Single statement only — no semicolons. Add a LIMIT clause for "
+            "result-set queries (max 500 rows enforced)."
+        ),
+    )
+    chart_x_column: str | None = Field(
+        default=None,
+        description=(
+            "Column name (or SQL alias) from the SELECT list to use as the "
+            "chart X-axis (the category/bucket/label). Required when the "
+            "result has more than 1 row. Match the alias in the SQL exactly."
+        ),
+    )
+    chart_y_column: str | None = Field(
+        default=None,
+        description=(
+            "Numeric column / SQL alias from the SELECT list to use as the "
+            "chart Y-axis (the value). Match the alias in the SQL exactly."
+        ),
+    )
+    chart_kind: str = Field(
+        default="ranking",
+        description=(
+            "Chart shape. 'ranking' (bar — top-N items), 'trend' (area — "
+            "values over time), 'summary' (single-value KPI). Pick based on "
+            "what the user asked for."
+        ),
+    )
+
+
+def _build_dynamic_chart(
+    *,
+    rows: list[dict[str, Any]],
+    x_col: str | None,
+    y_col: str | None,
+    kind: str,
+    question: str,
+) -> dict[str, Any]:
+    """Convert raw SQL rows into the SalesChart-shaped chart_data dict the
+    frontend ChatChart already understands.
+
+    Returns the same {kind, totals, series, items} structure produced by the
+    legacy ResultAggregator, populated from whatever the LLM aliased.
+    """
+    if not rows:
+        return {
+            "kind":        kind if kind in ("ranking", "trend", "summary") else "summary",
+            "intent_type": "user_table_query",
+            "granularity": "daily",
+            "totals":      {"total_sales": 0.0, "orders": 0, "customers": 0},
+            "series":      [],
+            "items":       [],
+            "empty":       True,
+        }
+
+    available_cols = list(rows[0].keys())
+
+    # Auto-pick X/Y columns if the LLM didn't specify them.
+    if x_col is None or x_col not in available_cols:
+        # First non-numeric column is the natural X.
+        for c in available_cols:
+            v = rows[0].get(c)
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                x_col = c
+                break
+        else:
+            x_col = available_cols[0]
+    if y_col is None or y_col not in available_cols:
+        # First numeric column is the natural Y.
+        for c in available_cols:
+            v = rows[0].get(c)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                y_col = c
+                break
+        else:
+            # No numeric — pick the last column as a count placeholder.
+            y_col = available_cols[-1] if len(available_cols) > 1 else available_cols[0]
+
+    def _y_value(r: dict) -> float:
+        v = r.get(y_col)
+        if v is None:
+            return 0.0
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    total_value = sum(_y_value(r) for r in rows)
+    row_count = len(rows)
+
+    # Pick chart kind from caller, but verify it's reasonable.
+    if kind not in ("ranking", "trend", "summary", "comparison"):
+        kind = "ranking" if row_count > 1 else "summary"
+
+    if kind == "trend":
+        # Time-series: series of {bucket, sales, orders}
+        series = [
+            {
+                "bucket": str(r.get(x_col, "")),
+                "sales":  round(_y_value(r), 2),
+                "orders": 1,
+            }
+            for r in rows
+        ]
+        return {
+            "kind":        "trend",
+            "intent_type": "user_table_query",
+            "granularity": "daily",
+            "totals":      {
+                "total_sales": round(total_value, 2),
+                "orders":      row_count,
+                "customers":   0,
+            },
+            "series":      series,
+            "items":       [],
+        }
+
+    if kind == "ranking":
+        items = [
+            {
+                "name":   str(r.get(x_col, ""))[:80],
+                "sales":  round(_y_value(r), 2),
+                "orders": 1,
+            }
+            for r in rows[:_RAW_SQL_MAX_LIMIT]
+        ]
+        return {
+            "kind":             "ranking",
+            "intent_type":      "user_table_query",
+            "granularity":      "daily",
+            "ranking_subject":  "item",
+            "totals":           {
+                "total_sales": round(total_value, 2),
+                "orders":      row_count,
+                "customers":   0,
+            },
+            "series":           [],
+            "items":            items,
+        }
+
+    # summary — single value with a token series so the chart still renders.
+    return {
+        "kind":        "summary",
+        "intent_type": "user_table_query",
+        "granularity": "daily",
+        "totals":      {
+            "total_sales": round(total_value, 2),
+            "orders":      row_count,
+            "customers":   0,
+        },
+        "series":      [
+            {"bucket": str(r.get(x_col, "")), "sales": round(_y_value(r), 2), "orders": 1}
+            for r in rows[:50]
+        ],
+        "items":       [],
+    }
+
+
+class RawSqlQueryTool(Tool):
+    name = "query_user_table"
+    description = (
+        "Run a SELECT statement directly against one of the user-uploaded "
+        "u_* tables. Use this for ANY question about data that lives in a "
+        "user-uploaded sheet — inventory, store transactions, product "
+        "hierarchy, item details, etc. (use run_data_query only for the "
+        "legacy sales/purchase tables). The tool validates the SQL, executes "
+        "it, and AUTOMATICALLY builds a chart from the result — pass "
+        "chart_x_column / chart_y_column with the SELECT aliases you used "
+        "so the chart axes match. Always include a LIMIT (max 500). "
+        "Use this whenever the answer needs data from u_inventory_master, "
+        "u_sales_transactions, u_product_hierarchy, u_sale_report, "
+        "u_item_details, or u_transaction_hierarchy."
+    )
+    args_model = RawSqlQueryArgs
+    independent = False
+
+    async def run(self, state: TurnState, args: RawSqlQueryArgs) -> ToolResult:
+        from app.dynamic_ingest import known_dynamic_identifiers, list_dynamic_tables
+
+        sql = (args.sql or "").strip().rstrip(";").strip()
+        if not sql:
+            return ToolResult(ok=False, error="empty SQL")
+        if not _RAW_SQL_SELECT.search(sql):
+            return ToolResult(ok=False, error="SQL must be a SELECT statement")
+        if _RAW_SQL_DANGEROUS.search(sql):
+            return ToolResult(ok=False, error="dangerous SQL keyword detected (insert/update/delete/...)")
+        if ";" in sql:
+            return ToolResult(ok=False, error="only one SQL statement allowed")
+        # Safety limit: add LIMIT 50 if not present to prevent huge results
+        # filling the 8K context window of small models.
+        if not re.search(r"\bLIMIT\b", sql, re.IGNORECASE):
+            sql = sql + " LIMIT 50"
+
+        # Identifier whitelist: every quoted/backticked identifier must be
+        # in the dynamic registry. Bare identifiers can be SQL aliases the
+        # LLM declares — we don't whitelist those (validator below uses the
+        # quoted-identifier check only).
+        whitelist = known_dynamic_identifiers() | {
+            "u_sales", "u_purchase",  # safety for forward-compat
+        }
+        unknown: list[str] = []
+        for ident in _RAW_SQL_QUOTED_IDENT.findall(sql):
+            if ident in whitelist:
+                continue
+            unknown.append(ident)
+        for ident in _RAW_SQL_BACKTICK_IDENT.findall(sql):
+            if ident in whitelist:
+                continue
+            unknown.append(ident)
+        if unknown:
+            # Allow the LLM to retry with a hint about what IS available.
+            tables = [t["table"] for t in list_dynamic_tables()]
+            return ToolResult(
+                ok=False,
+                error=(
+                    f"unknown identifier(s) in SQL: {sorted(set(unknown))!r}. "
+                    f"Available user tables: {tables}. "
+                    f"Use the exact column names from the schema in the system prompt."
+                ),
+            )
+
+        # Cost guard
+        estimated_bytes = max(len(sql) * 10_000, 5_000_000)  # rough heuristic
+        try:
+            check_sql_scan_estimate(estimated_bytes)
+        except Exception as e:
+            return ToolResult(ok=False, error=str(e))
+
+        # Execute
+        _raw_sql_log.info("RAW SQL: %s", sql)
+        try:
+            rows = await fetch_all(sql, ())
+        except sqlite3.Error as e:
+            return ToolResult(ok=False, error=f"SQL exec failed: {e}")
+        except Exception as e:
+            return ToolResult(ok=False, error=f"DB error: {type(e).__name__}: {e}")
+
+        # Enforce max-row safety net (in case LLM forgot LIMIT)
+        if len(rows) > _RAW_SQL_MAX_LIMIT:
+            rows = rows[:_RAW_SQL_MAX_LIMIT]
+
+        # Build the chart payload
+        chart_data = _build_dynamic_chart(
+            rows=rows,
+            x_col=args.chart_x_column,
+            y_col=args.chart_y_column,
+            kind=(args.chart_kind or "ranking").strip().lower(),
+            question=state.question,
+        )
+
+        _raw_sql_log.info(
+            "RAW SQL OK: rows=%d chart_kind=%s totals=%s",
+            len(rows), chart_data.get("kind"), chart_data.get("totals"),
+        )
+
+        # Stash on state so ResponseFormatter / final emit pick it up.
+        return ToolResult(
+            ok=True,
+            output={
+                "row_count": len(rows),
+                "rows":      rows[:50],  # capped echo for LLM context
+                "chart":     {k: v for k, v in chart_data.items() if k != "series" or len(v) <= 30},
+            },
+            state_updates={
+                "rows":        rows,
+                "aggregates":  chart_data,
+                "chart_data":  chart_data,
+                "bytes_scanned": state.bytes_scanned + estimated_bytes,
+            },
+        )
+
+
 # Capabilities the agentic loop exposes to the LLM, in no particular order.
 QUERY_CAPABILITIES: tuple[str, ...] = (
     "resolve_time_window",
     "resolve_entities",
     "run_data_query",
+    "query_user_table",
     "generate_narrative",
     "google_drive",
 )
@@ -2632,6 +2955,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "resolve_time_window",
     "resolve_entities",
     "run_data_query",
+    "query_user_table",
     "generate_narrative",
     "google_drive",
 )
@@ -2715,6 +3039,7 @@ def _bootstrap(registry: ToolRegistry) -> None:
         ResolveTimeWindowTool,
         ResolveEntitiesTool,
         RunDataQueryTool,
+        RawSqlQueryTool,
         GenerateNarrativeTool,
         GoogleDriveTool,
     ]
@@ -2878,8 +3203,19 @@ _KNOWLEDGE_VERB_RE = re.compile(
     r"how\s+(?:does|do)\s+\w+(?:\s+\w+){0,3}\s+work|"
     # "what is/are/does X" — exclude data-lookup ("my/our") and the chat
     # pattern "what is your name" (the chat-pattern check below handles it,
-    # but adding `your` here makes the gate explicit).
-    r"what(?:\s+is|\s+are|\s+does|'s)\s+(?:a\s+|an\s+|the\s+)?(?!my\b|our\b|your\b)\w+|"
+    # but adding `your` here makes the gate explicit). Also exclude ranking
+    # phrasings ("what are the top 10", "what are the best/highest/...")
+    # which are data lookups despite the "what are the" lead-in.
+    # Note: the article alternation below is REQUIRED-not-optional (no `?`),
+    # and articles themselves are blocked from being the content word, so
+    # the regex can't backtrack into accepting "the/a/an" as the X.
+    r"what(?:\s+is|\s+are|\s+does|'s)\s+(?:a\s+|an\s+|the\s+)?"
+    r"(?!my\b|our\b|your\b|the\b|a\b|an\b|"
+    r"top\b|bottom\b|best\b|worst\b|highest\b|lowest\b|"
+    r"peak\b|busiest\b|main\b|biggest\b|largest\b|smallest\b|fastest\b|"
+    r"slowest\b|most\b|least\b|leading\b|key\b|primary\b|"
+    r"daily\b|weekly\b|monthly\b|yearly\b|total\b|average\b|avg\b|"
+    r"repeat\b|seasonal\b)\w+|"
     # "explain X", "define X", "describe X", "tell me about X" — all reject
     # data-lookup phrasings ("my", "our", "last X", "this X", "the X").
     # That single change fixes the previous bug where "tell me about my sales"
@@ -2896,11 +3232,37 @@ _KNOWLEDGE_VERB_RE = re.compile(
 )
 
 
+# Labels that ARE answerable from user-uploaded dynamic tables. When the
+# user has any u_* table loaded, these missing-data flags are suppressed —
+# the agentic loop + query_user_table will figure out whether the relevant
+# u_* table actually has the column, far better than a static keyword list
+# can. Kept narrow on purpose: employee_salary / demographics / marketing
+# / returns stay as missing-data triggers because they're rarely covered
+# by upload sheets even when dynamic tables exist.
+_DYNAMIC_COVERABLE_LABELS: frozenset[str] = frozenset({
+    "inventory", "location", "category", "cost_profit", "supplier_cost",
+})
+
+
 def _check_missing_dimension(question_lower: str) -> dict[str, Any] | None:
     """Return a hints dict if the question explicitly references an
-    out-of-scope dimension, otherwise None."""
+    out-of-scope dimension, otherwise None.
+
+    When dynamic tables exist, labels in _DYNAMIC_COVERABLE_LABELS are
+    suppressed — the LLM with the u_* schema will judge feasibility on its
+    own.
+    """
+    has_dynamic = False
+    try:
+        from app.dynamic_ingest import list_dynamic_tables
+        has_dynamic = bool(list_dynamic_tables())
+    except Exception:
+        has_dynamic = False
+
     padded = " " + question_lower + " "
     for label, kws, friendly in _MISSING_DIMENSIONS:
+        if has_dynamic and label in _DYNAMIC_COVERABLE_LABELS:
+            continue
         for kw in kws:
             needle = kw if len(kw) >= 5 else f" {kw.strip()} "
             if needle in padded:
@@ -2913,13 +3275,21 @@ def _check_missing_dimension(question_lower: str) -> dict[str, Any] | None:
 
 
 async def _has_any_uploaded_data() -> bool:
-    """Quick probe: does the user have any sales/purchase rows on file?
+    """Quick probe: does the user have any data on file (legacy
+    sales/purchase OR any dynamic u_* table)?
 
     Used by the intent classifier to bias ambiguous business-flavored
     questions toward agentic mode when data exists. Fails open: any DB
     error is treated as "data exists" so we never silently downgrade a
     real analytics question to chat just because the probe failed.
     """
+    # Dynamic tables count as data too.
+    try:
+        from app.dynamic_ingest import list_dynamic_tables
+        if list_dynamic_tables():
+            return True
+    except Exception:
+        pass
     try:
         row = await fetch_one(
             f'SELECT '
@@ -3993,6 +4363,109 @@ def _build_intent_diagnostics(
     }
 
 
+def _build_kpi_fast_path_chart(kpi_result: Any) -> dict[str, Any]:
+    """Synthesize a chart payload for the KPI fast-path response.
+
+    The KPI engine returns either:
+      • a single value (e.g. 'total revenue: ₹X')
+      • a value + a series breakdown (e.g. daily totals over the KPI window)
+
+    Either way we produce the same SalesChart-compatible shape the frontend
+    already renders, so the user gets a visualization for every KPI hit.
+    """
+    try:
+        user_dict = kpi_result.to_user_dict()
+    except Exception:
+        user_dict = {}
+
+    value = user_dict.get("value")
+    try:
+        value_f = float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        value_f = 0.0
+
+    label = user_dict.get("label") or user_dict.get("name") or "Metric"
+    series_in = user_dict.get("series") or user_dict.get("breakdown") or []
+
+    if isinstance(series_in, list) and series_in:
+        # Best case — KPI carries a breakdown we can plot as a time series.
+        series = []
+        for pt in series_in:
+            if isinstance(pt, dict):
+                bucket = pt.get("bucket") or pt.get("date") or pt.get("x") or ""
+                v = pt.get("value") or pt.get("y") or pt.get("sales") or 0
+                try:
+                    v_f = float(v)
+                except (TypeError, ValueError):
+                    v_f = 0.0
+                series.append({
+                    "bucket": str(bucket),
+                    "sales":  round(v_f, 2),
+                    "orders": 1,
+                })
+        if series:
+            return {
+                "kind":        "trend",
+                "intent_type": "kpi_fast_path",
+                "granularity": "daily",
+                "totals":      {
+                    "total_sales": round(sum(p["sales"] for p in series), 2),
+                    "orders":      len(series),
+                    "customers":   0,
+                },
+                "series":      series,
+                "items":       [],
+            }
+
+    # Single-value fallback — one bar so the user sees SOMETHING.
+    return {
+        "kind":             "ranking",
+        "intent_type":      "kpi_fast_path",
+        "granularity":      "daily",
+        "ranking_subject":  "metric",
+        "totals":           {
+            "total_sales": round(value_f, 2),
+            "orders":      1,
+            "customers":   0,
+        },
+        "series":           [],
+        "items":            [{
+            "name":   str(label)[:80],
+            "sales":  round(value_f, 2),
+            "orders": 1,
+        }],
+    }
+
+
+def _fallback_chart_from_state(state: TurnState) -> dict[str, Any] | None:
+    """Last-resort chart builder for the agentic loop's final emit.
+
+    If the agentic LLM finished without populating chart_data (e.g. it
+    answered straight from prior context without running query_user_table),
+    derive a minimal chart from state.rows or state.aggregates so the user
+    still sees a visualization. Returns None when there's nothing plottable
+    (no rows, no aggregates).
+    """
+    if state.chart_data:
+        return state.chart_data
+    if state.aggregates:
+        return state.aggregates
+    rows = state.rows or []
+    if not rows:
+        return None
+    # rows is a list of dicts — fall back to the dynamic chart builder.
+    try:
+        return _build_dynamic_chart(
+            rows=rows,
+            x_col=None,
+            y_col=None,
+            kind="ranking" if len(rows) > 1 else "summary",
+            question=state.question,
+        )
+    except Exception:
+        return None
+
+
 async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
     """Drive a single /query_stream turn end-to-end.
 
@@ -4090,9 +4563,21 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
     # If the question matches a registered KPI alias at high confidence we
     # short-circuit the whole pipeline and return the exact pre-defined
     # formula result. Falls through silently on no match or low confidence.
+    #
+    # ADR-0005: skip the KPI fast-path entirely when the user has uploaded
+    # dynamic tables. The shipped KPI registry only knows about the legacy
+    # sales/purchase + enrichment tables; bypassing the agentic loop would
+    # return stale/empty answers when the real data lives in u_* tables.
+    # The LLM in the agentic loop can still answer KPI questions correctly
+    # via query_user_table — it just costs one LLM call instead of zero.
+    try:
+        from app.dynamic_ingest import list_dynamic_tables
+        _skip_kpi_fast_path = bool(list_dynamic_tables())
+    except Exception:
+        _skip_kpi_fast_path = False
     try:
         from app.kpi import match_kpi, execute_kpi
-        kpi_match = await match_kpi(state.question)
+        kpi_match = await match_kpi(state.question) if not _skip_kpi_fast_path else None
     except Exception:
         kpi_match = None
     if kpi_match is not None and kpi_match.confidence >= 0.85:
@@ -4104,9 +4589,15 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
         # Executive-style narrative + user-safe payload.
         answer = _narrate_kpi(kpi_result)
 
+        # ADR-0005: build a chart even on KPI fast-path so the user always
+        # gets a visualization. The single KPI value becomes a one-bar
+        # ranking chart; if the user-safe dict carries any series we use
+        # that as a time-series instead.
+        kpi_chart = _build_kpi_fast_path_chart(kpi_result)
+
         await emit.emit("final", {
             "answer":     answer,
-            "chart":      None,
+            "chart":      kpi_chart,
             "from_cache": False,
             "mode":       "kpi",
             "metric":     kpi_result.to_user_dict(),   # USER-SAFE — no formula/SQL
@@ -4126,7 +4617,7 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
                 "mode":         "kpi",
                 "sub_agent":    "KPIEngine",
                 "final_answer": answer,
-                "chart":        None,
+                "chart":        kpi_chart,
                 "aggregates":   kpi_result.to_user_dict(),
                 "_internal":    kpi_result.to_dict(),    # developer-only, not streamed
             })
@@ -4135,6 +4626,7 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
         return state.apply(
             sub_agent="KPIEngine",
             final_answer=answer,
+            chart_data=kpi_chart,
             response_record=kpi_result.to_dict(),       # state record is server-side
         )
 
@@ -4279,10 +4771,15 @@ async def run_query_turn(state: TurnState, emit: EventEmitter) -> TurnState:
         })
         return state
 
-    # Success — emit final.
+    # Success — emit final. ADR-0005: always emit a chart when ANY tabular
+    # data is available, falling back to a chart derived from state.rows or
+    # state.aggregates when the loop didn't compute chart_data itself.
+    final_chart = state.chart_data or _fallback_chart_from_state(state)
+    if final_chart is not None and final_chart is not state.chart_data:
+        state = state.apply(chart_data=final_chart)
     await emit.emit("final", {
         "answer":     state.final_answer or "",
-        "chart":      state.chart_data,
+        "chart":      final_chart,
         "from_cache": False,
         "mode":       "agentic",
     })
@@ -4351,7 +4848,14 @@ def _project_forecast(series: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _schema_summary_text() -> str:
-    """Compact dataset description injected into the loop's system prompt."""
+    """Compact dataset description injected into the loop's system prompt.
+
+    Lists the legacy sales/purchase tables AND every dynamic ``u_*`` table
+    the user has uploaded (one per sheet of their workbook). The LLM uses
+    run_data_query for the legacy tables and query_user_table for the u_*
+    tables.
+    """
+    parts: list[str] = []
     try:
         sd = schema_dict()
         lines = []
@@ -4359,17 +4863,42 @@ def _schema_summary_text() -> str:
             cols = ", ".join(c["name"] for c in tinfo.get("columns", []))
             lines.append(f"  - {tname}: {tinfo.get('description', '')}. Columns: {cols}")
         notes = "\n".join(f"  * {n}" for n in sd.get("notes", []))
-        body = "Tables:\n" + "\n".join(lines)
-        return body + ("\nNotes:\n" + notes if notes else "")
+        body = "Legacy tables (use run_data_query):\n" + "\n".join(lines)
+        if notes:
+            body += "\nNotes:\n" + notes
+        parts.append(body)
     except Exception:
-        return ('Tables: sales, purchase (identical shape). Key columns: '
-                'Date, "Total Amount", "Party Name", "Product Name".')
+        parts.append(
+            'Legacy tables: sales, purchase (identical shape). Key columns: '
+            'Date, "Total Amount", "Party Name", "Product Name".'
+        )
+
+    # Dynamic tables — added inline so the LLM can write raw SELECTs against
+    # them via the query_user_table capability. Compact format: column names
+    # only, no types (LLM infers from the data and we're on a TPM budget).
+    try:
+        from app.dynamic_ingest import list_dynamic_tables
+        dyn_tables = list_dynamic_tables()
+        if dyn_tables:
+            dyn_lines = ["User-uploaded tables (use query_user_table for these):"]
+            for t in dyn_tables:
+                cols = ", ".join(c["name"] for c in t.get("columns", []))
+                dyn_lines.append(
+                    f'  - {t["table"]} ({t["row_count"]} rows): {cols}'
+                )
+            parts.append("\n".join(dyn_lines))
+    except Exception:
+        pass
+
+    return "\n\n".join(parts)
 
 
 AGENTIC_LOOP_SYSTEM = """You are the orchestrator for Agentic AI, a business
-analytics assistant. A user has asked a question about their uploaded sales /
-purchase data. Decide which capabilities to call, in what order, inspect each
-result, call more if needed — then write the final answer yourself.
+analytics assistant. A user has asked a question about their uploaded business
+data (sales transactions, inventory, product catalog, store transactions,
+hierarchy — whichever sheets they've uploaded). Decide which capabilities to
+call, in what order, inspect each result, call more if needed — then write the
+final answer yourself.
 
 Dataset schema:
 {schema}
@@ -4380,26 +4909,52 @@ Available capabilities (call them as tools):
     date, not today.
   - resolve_entities: map named merchants / customers / products to canonical
     DB values. Call only when the question names a specific entity.
-  - run_data_query: the core capability — runs SQL and aggregates the rows.
-    Pick query_type to match the question. Resolve the time window first.
+  - run_data_query: pre-built sales analytics over the LEGACY sales /
+    purchase tables only. Pick query_type to match the question. Resolve the
+    time window first. Use this when the question is about sales/purchase
+    activity in the legacy schema.
+  - query_user_table: write a raw SELECT against a user-uploaded u_* table
+    (u_inventory_master, u_sales_transactions, u_product_hierarchy,
+    u_sale_report, u_item_details, u_transaction_hierarchy, etc.). Use this
+    for ANY question about inventory, store transactions, product catalog,
+    or hierarchy. ALWAYS include a LIMIT and pass chart_x_column +
+    chart_y_column matching your SELECT aliases so the chart renders.
   - generate_narrative: write an analyst paragraph over the most recent
-    run_data_query result. Call only when the user wants explanation/insight,
-    not a bare number.
-  - google_drive: access the user's Google Drive. action='list' shows their
-    available data files; action='ingest' loads selected file_ids into the
-    sales/purchase table. Use it only when the user asks to pull data from
-    their Drive — list first, confirm which files, then ingest. After an
-    ingest the new rows are live for subsequent run_data_query calls.
+    query result. Call only when the user wants explanation/insight, not a
+    bare number.
+  - google_drive: access the user's Google Drive (action='list' /
+    'ingest'). Use only if the user asks to pull from Drive.
+
+Picking the right capability:
+  - "low stock", "overstocked", "inventory turnover", "dead stock" →
+      query_user_table on u_inventory_master.
+  - "top brand", "best category", "subcategory growth", "product hierarchy"
+      → query_user_table on u_product_hierarchy or u_sales_transactions.
+  - "transactions by region/state/store", "payment method", "peak hours"
+      → query_user_table on u_sales_transactions.
+  - "Sales last month / total / by Party" on the legacy data →
+      run_data_query (sales_summary, product_performance, etc.)
+
+CRITICAL — always produce a chart:
+  - run_data_query already builds a chart for sales aggregates.
+  - query_user_table builds a chart from your SELECT — but you MUST pass
+    chart_x_column (the category/date column) and chart_y_column (the
+    numeric value), matching the aliases you used in the SQL exactly. If
+    the answer is a single number, write the SQL so it ALSO returns the
+    underlying breakdown (e.g. SUM grouped by month) so the chart has
+    something to plot.
+  - If you find yourself about to answer without having called any data
+    capability that produced a chart, call query_user_table FIRST.
 
 Discipline:
-  - Call only the capabilities you actually need. A plain "total sales last
-    month" needs resolve_time_window then run_data_query — nothing else.
-  - Always inspect each tool result. If run_data_query reports empty_reason
-    or fails, decide whether to retry with a different query_type / window or
-    explain the gap to the user.
+  - Call only the capabilities you actually need. A plain "low stock items"
+    query needs only one query_user_table call.
+  - Always inspect each tool result. If a query reports empty/zero rows,
+    decide whether to retry with a different filter or explain the gap.
   - When you have enough to answer, STOP calling tools and reply with the
-    final answer as plain text — 2-4 sentences, grounded only in the numbers
-    returned. Never invent values. Use the rupee sign for currency.
+    final answer as plain text — 2-4 sentences, grounded only in the
+    numbers/rows returned. Never invent values. Use the rupee sign for
+    Indian currency.
   - Never describe your tool calls or internal steps in the final answer.
 """
 
@@ -4443,15 +4998,23 @@ def _capability_tool_schemas() -> list[dict[str, Any]]:
 
 
 def _tool_result_message(tc_id: str, result: ToolResult) -> dict[str, Any]:
-    """Render a capability result as a `tool` role message for the LLM."""
+    """Render a capability result as a `tool` role message for the LLM.
+
+    Keeps the serialized body under 2000 chars to prevent 413 errors when
+    multiple tool rounds accumulate in the context window (llama-3.1-8b has
+    an 8K token context window that fills up quickly with large SQL results).
+    """
     if result.ok:
         body: dict[str, Any] = {"ok": True, "result": result.output}
     else:
         body = {"ok": False, "error": result.error}
+    raw = json.dumps(body, default=str)
+    if len(raw) > 1400:
+        raw = raw[:1360] + ' ...(truncated)}"}'
     return {
         "role": "tool",
         "tool_call_id": tc_id,
-        "content": json.dumps(body, default=str)[:8000],
+        "content": raw,
     }
 
 
@@ -4471,18 +5034,43 @@ class AgenticLoop:
 
     async def run(self, state: TurnState, emit: EventEmitter) -> TurnState:
         groq = get_groq()
-        tools = _capability_tool_schemas()
         registry = get_registry()
+
+        from app.dynamic_ingest import list_dynamic_tables as _ldt
+        _dynamic_tables = _ldt()
+        _has_dynamic = bool(_dynamic_tables)
+
+        if _has_dynamic:
+            # Dynamic tables present: drop run_data_query and resolve_entities
+            # (legacy-only tools). Keep resolve_time_window so the 8b model can
+            # still call it — but the tool handler will redirect it to use SQL
+            # directly in query_user_table instead.
+            _legacy_caps = {"resolve_entities", "run_data_query"}
+            tools = [t for t in _capability_tool_schemas() if t["function"]["name"] not in _legacy_caps]
+            _dyn_names = ", ".join(t["table"] for t in _dynamic_tables)
+            _dyn_prefix = (
+                "CRITICAL: the user has uploaded dynamic tables. "
+                f"Available tables: {_dyn_names}. "
+                "Use ONLY query_user_table for ALL data questions. "
+                "Do NOT use resolve_time_window, resolve_entities, or run_data_query "
+                "(those only cover the legacy 52-row demo dataset, NOT the user's data).\n\n"
+            )
+        else:
+            tools = _capability_tool_schemas()
+            _dyn_prefix = ""
 
         messages: list[dict[str, Any]] = [
             {"role": "system",
-             "content": AGENTIC_LOOP_SYSTEM.format(schema=_schema_summary_text())},
+             "content": _dyn_prefix + AGENTIC_LOOP_SYSTEM.format(schema=_schema_summary_text())},
             {"role": "user",
              "content": (
                  f"Question: {state.question}\n"
                  f"Deterministic hints (non-binding): {_loop_hints(state)}"
              )},
         ]
+
+        _total_tool_calls = 0
+        _MAX_TOOL_CALLS = 10  # hard cap to prevent 8K context overflow on small models
 
         while True:
             # Cost guard — on the ceiling, force a best-effort final answer.
@@ -4491,6 +5079,13 @@ class AgenticLoop:
                 check_cost(state)
             except CostGuardError as e:
                 _loop_agent_log.info("cost guard hit: %s — forcing final answer", e)
+                return await self._force_final(state, emit, messages, groq)
+
+            # Tool-call cap: prevent context overflow on small-context models
+            if _total_tool_calls >= _MAX_TOOL_CALLS:
+                _loop_agent_log.info(
+                    "tool call cap (%d) reached — forcing final answer", _MAX_TOOL_CALLS
+                )
                 return await self._force_final(state, emit, messages, groq)
 
             iteration = state.iteration + 1
@@ -4557,6 +5152,7 @@ class AgenticLoop:
                     "error": result.error,
                     "duration_ms": round(result.duration_ms, 2),
                 })
+                _total_tool_calls += 1
                 state = state.append_tool_call(ToolCallRecord(
                     name=tc.name, args=tc.arguments, output=result.output,
                     ok=result.ok, error=result.error,

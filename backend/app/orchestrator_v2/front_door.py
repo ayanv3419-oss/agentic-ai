@@ -178,8 +178,17 @@ async def try_front_door(
         return FrontDoorOutcome(tier="clarification", detail=clar.to_dict())
 
     # --- Tier 3: KPI fast-path (zero-LLM) -----------------------------------
+    # ADR-0005: skip when the user has uploaded dynamic tables. The KPI
+    # registry only knows about legacy sales/purchase + enrichment tables;
+    # bypassing the orchestrator would return stale answers when the real
+    # data lives in u_* tables.
     try:
-        kpi_match = await match_kpi(ctx.question)
+        from app.dynamic_ingest import list_dynamic_tables
+        _skip_kpi_fast_path = bool(list_dynamic_tables())
+    except Exception:
+        _skip_kpi_fast_path = False
+    try:
+        kpi_match = await match_kpi(ctx.question) if not _skip_kpi_fast_path else None
     except Exception:
         log.exception("front_door: kpi match failed")
         kpi_match = None

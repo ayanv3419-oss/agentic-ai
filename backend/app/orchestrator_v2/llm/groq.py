@@ -34,6 +34,31 @@ from app.infrastructure import settings
 
 _groq_log = logging.getLogger("agentic_ai.groq")
 
+# Groq embeds the retry delay in 429 bodies: "Please try again in 17.9s."
+_RETRY_AFTER_RE = re.compile(r"try again in\s+([\d.]+)\s*s", re.IGNORECASE)
+
+
+def _retry_delay(status: int, body: str, resp: "httpx.Response | None" = None,
+                 attempt: int = 0) -> float:
+    """Return seconds to sleep before retrying a failed Groq request."""
+    if status == 429:
+        # 1. Prefer the header Groq sometimes sends.
+        if resp is not None:
+            hdr = resp.headers.get("retry-after") or resp.headers.get("x-ratelimit-reset-tokens")
+            if hdr:
+                try:
+                    return float(hdr) + 2.0
+                except (ValueError, TypeError):
+                    pass
+        # 2. Parse the body text ("Please try again in 17.9s").
+        m = _RETRY_AFTER_RE.search(body)
+        if m:
+            return min(float(m.group(1)) + 3.0, 120.0)
+        # 3. Conservative fallback when we can't parse the delay.
+        return min(30.0 * (2 ** attempt), 120.0)
+    # Non-429 errors: short exponential backoff.
+    return 0.5 * (2 ** attempt)
+
 
 # ---------------------------------------------------------------------------
 # Wire types
@@ -173,26 +198,31 @@ class GroqClient:
         last_status: int | None = None
         last_body = ""
         last_err: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 resp = await self._client.post(url, headers=headers, json=payload)
             except httpx.RequestError as e:
                 last_err = e
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                await asyncio.sleep(_retry_delay(0, "", attempt=attempt))
                 continue
             if resp.status_code in (401, 403):
                 return _err_response(f"Groq auth rejected: HTTP {resp.status_code}", "auth")
             if resp.status_code >= 400:
                 last_status = resp.status_code
                 try:
-                    last_body = (resp.text or "")[:300]
+                    last_body = (resp.text or "")[:500]
                 except Exception:
                     last_body = ""
                 last_err = httpx.HTTPStatusError(
                     f"HTTP {resp.status_code}", request=resp.request, response=resp
                 )
                 if resp.status_code >= 500 or resp.status_code == 429:
-                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    delay = _retry_delay(resp.status_code, last_body, resp, attempt)
+                    _groq_log.warning(
+                        "Groq HTTP %d (attempt %d/%d) — sleeping %.1fs: %s",
+                        resp.status_code, attempt + 1, 5, delay, last_body[:120],
+                    )
+                    await asyncio.sleep(delay)
                     continue
                 return _err_response(
                     f"Groq error: HTTP {resp.status_code} {last_body}", "upstream"
@@ -307,12 +337,12 @@ class GroqClient:
         last_status: int | None = None
         last_body = ""
         last_err: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 resp = await self._client.post(url, headers=headers, json=payload)
             except httpx.RequestError as e:
                 last_err = e
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                await asyncio.sleep(_retry_delay(0, "", attempt=attempt))
                 continue
             if resp.status_code in (401, 403):
                 return _err_tool_response(
@@ -321,11 +351,16 @@ class GroqClient:
             if resp.status_code >= 400:
                 last_status = resp.status_code
                 try:
-                    last_body = (resp.text or "")[:300]
+                    last_body = (resp.text or "")[:500]
                 except Exception:
                     last_body = ""
                 if resp.status_code >= 500 or resp.status_code == 429:
-                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    delay = _retry_delay(resp.status_code, last_body, resp, attempt)
+                    _groq_log.warning(
+                        "Groq HTTP %d (attempt %d/%d) — sleeping %.1fs: %s",
+                        resp.status_code, attempt + 1, 5, delay, last_body[:120],
+                    )
+                    await asyncio.sleep(delay)
                     continue
                 return _err_tool_response(
                     f"Groq error: HTTP {resp.status_code} {last_body}", "upstream"

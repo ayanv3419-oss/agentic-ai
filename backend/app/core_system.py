@@ -39,6 +39,11 @@ from app.analytics_engine import (
     run_query_turn,
     set_request_groq,
 )
+from app.dynamic_ingest import (
+    drop_all_dynamic_tables,
+    ingest_workbook,
+    list_dynamic_tables,
+)
 from app.database import engine_kind, engine_status
 from app.kpi import (
     calculate_by_name,
@@ -1216,6 +1221,156 @@ async def upload(
                     persistent_path.unlink()
             except Exception:
                 log.warning("cleanup of failed upload file failed: %s", persistent_path, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# /upload_workbook — multi-sheet dynamic ingestion (ADR-0005)
+# ---------------------------------------------------------------------------
+# Drops the whole .xlsx, each sheet becomes its own `u_<sheet>` table.
+# Bypasses the strict sales/purchase SCHEMA_SPEC — column types are inferred
+# from the data, no alias mapping required. Re-uploading replaces the per-
+# sheet tables. Used by the "drop a workbook" flow on the Upload page when
+# the user has multi-domain data (sales + inventory + product catalog +
+# hierarchy) that doesn't fit the legacy two-table model.
+
+@api_router.post("/upload_workbook")
+async def upload_workbook(
+    request: Request,
+    file: UploadFile = File(...),
+):
+    upload_log = logging.getLogger("agentic_ai.api.upload_workbook")
+    rl = _rate_limit_check(_client_ip(request), bucket_namespace="upload", limit_per_minute=5)
+    if rl is not None:
+        return JSONResponse(status_code=429, content=rl)
+
+    filename = file.filename or "upload"
+    batch_id = str(uuid4())
+
+    lower = filename.lower()
+    if not lower.endswith(".xlsx"):
+        return JSONResponse(status_code=400, content=envelope(
+            "Unsupported file type",
+            detail="/upload_workbook only accepts .xlsx files (multi-sheet). "
+                   "Use /upload for single-sheet xlsx or csv.",
+            kind="upload",
+        ))
+
+    # Spool to disk under data/uploads/{batch_id}.xlsx — kept until disconnect.
+    persistent_path = uploads_dir() / f"{batch_id}.xlsx"
+    bytes_written = 0
+    crashed = False
+    try:
+        try:
+            with persistent_path.open("wb") as out:
+                while True:
+                    chunk = await file.read(settings.upload_chunk_bytes)
+                    if not chunk:
+                        break
+                    bytes_written += len(chunk)
+                    if bytes_written > settings.max_upload_bytes:
+                        crashed = True
+                        return JSONResponse(status_code=413, content=envelope(
+                            "File too large",
+                            detail=f"Max {settings.max_upload_bytes // (1024*1024)} MB per upload.",
+                            kind="upload",
+                        ))
+                    out.write(chunk)
+        except Exception as e:
+            upload_log.exception("spool: failed")
+            crashed = True
+            return JSONResponse(status_code=400, content=envelope(
+                "Could not read upload",
+                detail=f"{type(e).__name__}: {e}",
+                kind="upload",
+            ))
+
+        if bytes_written == 0:
+            crashed = True
+            return JSONResponse(status_code=400, content=envelope(
+                "Empty file", kind="upload",
+            ))
+
+        # Ingest every sheet — drop+create+insert per sheet.
+        try:
+            summary = ingest_workbook(
+                wb_path=persistent_path,
+                source_file_name=filename,
+                batch_id=batch_id,
+            )
+        except Exception as e:
+            upload_log.exception("dynamic_ingest: crashed")
+            crashed = True
+            return JSONResponse(status_code=500, content=envelope(
+                "Ingest failed",
+                detail=f"{type(e).__name__}: {e}",
+                kind="internal",
+            ))
+
+        # Audit row + bump data_version so caches invalidate.
+        total_rows = sum(s["rows_inserted"] for s in summary["ingested"])
+        try:
+            await record_upload_meta(
+                batch_id=batch_id,
+                filename=filename,
+                target="(workbook)",
+                rows_inserted=total_rows,
+                rows_failed=0,
+                source="upload",
+                status="active",
+            )
+        except Exception:
+            upload_log.warning("could not record uploads meta", exc_info=True)
+        new_version = await _post_ingest_refresh()
+
+        upload_log.info(
+            "upload_workbook ok sheets=%d rows=%d batch=%s file=%s data_version=%d",
+            len(summary["ingested"]), total_rows, batch_id, persistent_path.name,
+            new_version,
+        )
+
+        return {
+            "batch_id":      batch_id,
+            "filename":      filename,
+            "sheet_count":   summary["sheet_count"],
+            "tables":        summary["tables"],
+            "ingested":      summary["ingested"],
+            "skipped":       summary["skipped"],
+            "total_rows":    total_rows,
+            "data_version":  new_version,
+            "bytes_received": bytes_written,
+            "file_path":     str(persistent_path),
+        }
+    except Exception as e:
+        upload_log.exception("upload_workbook: unhandled crash")
+        crashed = True
+        return JSONResponse(status_code=500, content=envelope(
+            "Upload failed",
+            detail=f"{type(e).__name__}: {e}",
+            kind="internal",
+        ))
+    finally:
+        if crashed:
+            try:
+                if persistent_path.exists():
+                    persistent_path.unlink()
+            except Exception:
+                log.warning("cleanup of failed upload file failed: %s", persistent_path, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# /tables/dynamic — list all u_* tables currently ingested (debug/UI helper)
+# ---------------------------------------------------------------------------
+
+@api_router.get("/tables/dynamic")
+async def list_dynamic_tables_route():
+    return {"tables": list_dynamic_tables()}
+
+
+@api_router.post("/tables/dynamic/disconnect_all")
+async def disconnect_all_dynamic_tables():
+    dropped = await drop_all_dynamic_tables()
+    new_version = await _post_ingest_refresh()
+    return {"dropped": dropped, "data_version": new_version}
 
 
 # ---------------------------------------------------------------------------
