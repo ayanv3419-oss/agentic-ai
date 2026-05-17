@@ -2728,11 +2728,12 @@ def _build_dynamic_chart(
     def _y_value(r: dict) -> float:
         v = r.get(y_col)
         if v is None:
-            return 0.0
+            return 1.0  # count each row as 1 when Y is missing
         try:
-            return float(v)
+            f = float(v)
+            return f if f != 0.0 else 1.0
         except (TypeError, ValueError):
-            return 0.0
+            return 1.0  # non-numeric column: treat as count
 
     total_value = sum(_y_value(r) for r in rows)
     row_count = len(rows)
@@ -5053,7 +5054,12 @@ class AgenticLoop:
                 f"Available tables: {_dyn_names}. "
                 "Use ONLY query_user_table for ALL data questions. "
                 "Do NOT use resolve_time_window, resolve_entities, or run_data_query "
-                "(those only cover the legacy 52-row demo dataset, NOT the user's data).\n\n"
+                "(those only cover the legacy 52-row demo dataset, NOT the user's data).\n"
+                "MANDATORY CHART RULE: every query_user_table call MUST include:\n"
+                "  - chart_kind: 'ranking' for top-N lists, 'trend' for time-series, 'summary' for totals\n"
+                "  - chart_x_column: the exact SELECT alias of the label/name column (e.g. 'product', 'region')\n"
+                "  - chart_y_column: the exact SELECT alias of the numeric value column (e.g. 'total_sales', 'quantity')\n"
+                "Charts are REQUIRED for every answer — always populate these three fields.\n\n"
             )
         else:
             tools = _capability_tool_schemas()
@@ -5222,6 +5228,29 @@ class AgenticLoop:
                 "budget for this question was reached.)"
             )
         aggregates = state.aggregates or {}
+
+        # Salvage chart from tool call history if state.chart_data is still empty
+        def _has_chart_data(cd: dict | None) -> bool:
+            if not cd:
+                return False
+            return (
+                bool(cd.get("items"))
+                or bool(cd.get("series"))
+                or float((cd.get("totals") or {}).get("total_sales") or 0) > 0
+            )
+
+        chart = state.chart_data or (aggregates or None)
+        if not _has_chart_data(chart):
+            for tc in reversed(state.tool_calls or []):
+                if tc.name == "query_user_table" and tc.ok and tc.output:
+                    rows = (tc.output or {}).get("rows") or []
+                    if rows:
+                        chart = _build_dynamic_chart(
+                            rows=rows, x_col=None, y_col=None,
+                            kind="ranking", question=state.question,
+                        )
+                        break
+
         record = {
             "turn_id":         state.turn_id,
             "cache_key":       state.cache_key,
@@ -5233,7 +5262,7 @@ class AgenticLoop:
             "rows":            state.rows,
             "aggregates":      aggregates,
             "insights":        state.insights or {},
-            "chart":           aggregates or None,
+            "chart":           chart or None,
             "final_answer":    answer,
             "response_format": "agentic",
             "incomplete":      incomplete,
@@ -5241,7 +5270,7 @@ class AgenticLoop:
         state = state.apply(
             final_answer=answer,
             response_record=record,
-            chart_data=state.chart_data or (aggregates or None),
+            chart_data=chart,
         )
         # Persist for the response cache. An incomplete answer is never cached
         # — a partial result must not later masquerade as a clean cache hit.
