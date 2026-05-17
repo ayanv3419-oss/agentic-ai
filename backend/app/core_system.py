@@ -43,6 +43,7 @@ from app.dynamic_ingest import (
     drop_all_dynamic_tables,
     ingest_workbook,
     list_dynamic_tables,
+    reconcile_registry,
 )
 from app.database import engine_kind, engine_status
 from app.kpi import (
@@ -1336,6 +1337,7 @@ async def upload_workbook(
             "ingested":      summary["ingested"],
             "skipped":       summary["skipped"],
             "total_rows":    total_rows,
+            "rows_inserted": total_rows,   # matches UploadResponse contract
             "data_version":  new_version,
             "bytes_received": bytes_written,
             "file_path":     str(persistent_path),
@@ -2236,6 +2238,17 @@ async def _startup() -> None:
 
     await init_database()
     _app_log.info("database engine: %s", engine_kind())
+
+    # Registry reconcile — rebuild dynamic_tables.json from SQLite so AI
+    # queries work immediately after restart even if the JSON was lost.
+    try:
+        rec = reconcile_registry()
+        if rec["added"] or rec["removed"]:
+            _app_log.info("dynamic table registry reconciled: %s", rec)
+        else:
+            _app_log.info("dynamic table registry: up to date")
+    except Exception:
+        _app_log.exception("dynamic table registry reconcile failed (continuing)")
 
     # KPI registry — table + default catalog. Always rebuild on startup so
     # shipped template updates (e.g. dataset-relative time tokens) propagate

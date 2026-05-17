@@ -7,7 +7,7 @@
  *
  * Pages live in `ui_system.tsx`. Data and state live in `client_core.ts`.
  */
-import React, { useState, type ComponentType } from 'react'
+import React, { useEffect, useState, type ComponentType } from 'react'
 import ReactDOM from 'react-dom/client'
 import * as Sentry from '@sentry/react'
 import './index.css'
@@ -36,7 +36,7 @@ import {
   Upload,
 } from 'lucide-react'
 
-import { cn, useAppStore } from '@/client_core'
+import { cn, fetchUploadsList, useAppStore } from '@/client_core'
 import type { NavKey } from '@/client_core'
 import { AiAssistant, Dashboard, ShopInfo, UploadData } from '@/ui_system'
 
@@ -266,6 +266,31 @@ class ErrorBoundary extends React.Component<
 
 export default function App() {
   const [view, setView] = useState<NavKey>('dashboard')
+
+  // On every mount, ask the backend which datasets are active and reconcile
+  // Zustand so the TopBar always shows the right file name — even after the
+  // browser tab was closed and reopened, or localStorage was cleared.
+  useEffect(() => {
+    fetchUploadsList()
+      .then(({ uploads }) => {
+        const active = uploads
+          .filter((u) => u.status === 'active')
+          .sort((a, b) => b.uploaded_at.localeCompare(a.uploaded_at))
+        const { setDataset } = useAppStore.getState()
+        if (active.length > 0) {
+          const u = active[0]
+          setDataset({
+            name: u.filename,
+            rows: u.rows_inserted,
+            uploadedAt: u.uploaded_at,
+            source: u.source === 'google_drive' ? 'drive' : 'upload',
+          })
+        } else {
+          setDataset(null)
+        }
+      })
+      .catch(() => { /* backend not ready yet — keep whatever localStorage has */ })
+  }, [])
 
   // ``onLogout`` is kept for the Sidebar API but is now a soft refresh —
   // there's no gate to send the user back to. The module-level cleanup

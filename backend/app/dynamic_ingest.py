@@ -349,6 +349,114 @@ def unregister_table(table: str) -> None:
         _save_registry(reg)
 
 
+def reconcile_registry() -> dict[str, int]:
+    """Reconcile data/dynamic_tables.json against the live SQLite DB.
+
+    On every startup:
+    - Adds entries for u_* tables that exist in the DB but not the registry
+      (covers the case where dynamic_tables.json was deleted or corrupted).
+    - Removes entries whose table no longer exists in the DB.
+
+    Column metadata is recovered from PRAGMA table_info; source_file and
+    uploaded_at are cross-referenced from the uploads table via _batch_id.
+
+    Returns {'added': N, 'removed': M}.
+    """
+    with _REGISTRY_LOCK:
+        reg = load_registry()
+
+        conn = sqlite3.connect(str(db_path()))
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'u_%'"
+            ).fetchall()
+            live_tables: set[str] = {r[0] for r in rows}
+            reg_tables: set[str] = set(reg.keys())
+
+            missing = live_tables - reg_tables    # in DB, not in JSON
+            orphaned = reg_tables - live_tables   # in JSON, not in DB
+
+            if not missing and not orphaned:
+                return {"added": 0, "removed": 0}
+
+            for t in orphaned:
+                reg.pop(t, None)
+
+            try:
+                upload_rows = conn.execute(
+                    "SELECT batch_id, filename, uploaded_at FROM uploads"
+                ).fetchall()
+                uploads_by_batch: dict[str, tuple[str, str]] = {
+                    r[0]: (r[1] or "(recovered)", r[2] or "")
+                    for r in upload_rows
+                }
+            except Exception:
+                uploads_by_batch = {}
+
+            for table in sorted(missing):
+                try:
+                    col_rows = conn.execute(
+                        f'PRAGMA table_info("{table}")'
+                    ).fetchall()
+                    columns = [
+                        {"name": r[1], "type": r[2] or "TEXT"}
+                        for r in col_rows
+                        if not r[1].startswith("_")
+                    ]
+
+                    try:
+                        row_count: int = conn.execute(
+                            f'SELECT COUNT(*) FROM "{table}"'
+                        ).fetchone()[0]
+                    except Exception:
+                        row_count = 0
+
+                    source_file = "(recovered)"
+                    uploaded_at = datetime.now().astimezone().isoformat(timespec="seconds")
+                    try:
+                        batch_row = conn.execute(
+                            f'SELECT DISTINCT _batch_id FROM "{table}" LIMIT 1'
+                        ).fetchone()
+                        if batch_row and batch_row[0] in uploads_by_batch:
+                            fname, u_at = uploads_by_batch[batch_row[0]]
+                            source_file = fname
+                            if u_at:
+                                uploaded_at = u_at
+                    except Exception:
+                        pass
+
+                    sheet_name = (
+                        table[2:].replace("_", " ").title()
+                        if table.startswith("u_") else table
+                    )
+
+                    reg[table] = {
+                        "columns":      columns,
+                        "source_sheet": sheet_name,
+                        "source_file":  source_file,
+                        "row_count":    row_count,
+                        "uploaded_at":  uploaded_at,
+                    }
+                except Exception:
+                    log.warning(
+                        "reconcile_registry: could not rebuild entry for %r (skipping)",
+                        table, exc_info=True,
+                    )
+        finally:
+            conn.close()
+
+        _save_registry(reg)
+
+    added = len(missing)
+    removed = len(orphaned)
+    if added or removed:
+        log.info(
+            "dynamic table registry reconciled: added=%d removed=%d live=%d",
+            added, removed, len(live_tables),
+        )
+    return {"added": added, "removed": removed}
+
+
 # ---------------------------------------------------------------------------
 # Per-sheet ingestion
 # ---------------------------------------------------------------------------
