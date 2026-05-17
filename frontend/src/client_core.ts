@@ -420,6 +420,13 @@ export async function uploadSales(
   return result
 }
 
+export async function uploadWorkbook(file: File): Promise<UploadResponse> {
+  const result = await uploadFile<UploadResponse>('/upload_workbook', file, {})
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  useAppStore.getState().observeServerDataVersion((result as any)?.data_version)
+  return result
+}
+
 export async function fetchUploadsList(): Promise<UploadsListResponse> {
   return apiGet<UploadsListResponse>('/uploads')
 }

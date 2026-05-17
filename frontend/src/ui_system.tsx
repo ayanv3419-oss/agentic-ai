@@ -81,6 +81,7 @@ import {
   streamAIQuery,
   syncDrive,
   uploadSales,
+  uploadWorkbook,
   useAppStore,
 } from '@/client_core'
 import type {
@@ -1694,7 +1695,8 @@ export function UploadData() {
     setBusy(true)
     setError(null)
     try {
-      const resp = await uploadSales(file)
+      const isWorkbook = /\.xlsx?$/i.test(file.name)
+      const resp = isWorkbook ? await uploadWorkbook(file) : await uploadSales(file)
       setDataset({
         name: resp.filename,
         rows: resp.rows_inserted,
