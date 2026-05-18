@@ -1889,11 +1889,21 @@ init_sentry()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Background the heavy startup work so the HTTP server binds immediately
-    # and Render's health-check grace period is not consumed while the DB,
-    # KPI registry, enrichment, and LLM probe are initialising.
-    # Any individual startup failure is already wrapped in try/except inside
-    # _startup() — errors are logged but the server stays up.
+    # Two-phase startup:
+    #   1. Critical-path (blocks before `yield`): init the DB so no request
+    #      can race with an un-opened SQLite file.  init_database() is fast.
+    #   2. Heavy stuff (KPI rebuild, hierarchy sync, enrichment, LLM probe,
+    #      vector vocab) runs in a background asyncio task so the HTTP
+    #      server binds immediately and Render's health-check grace period
+    #      isn't consumed.  Every step inside _startup() is already wrapped
+    #      in try/except, so errors are logged but the server stays up.
+    try:
+        from app.infrastructure import init_database
+        await init_database()
+        _app_log.info("MetricAi %s: database initialised (critical path done)", _app.version)
+    except Exception:
+        _app_log.exception("init_database() failed — DB-backed endpoints will return errors")
+
     _startup_task = asyncio.create_task(_startup())
     _app_log.info(
         "MetricAi %s: HTTP server accepting connections (background startup running)",
@@ -1919,7 +1929,7 @@ app = FastAPI(
         "Local-first single-user analytics powered by a Coordinator that "
         "talks to a local Qwen 3 model through Ollama."
     ),
-    version="5.1.0-coordinator",
+    version="5.2.0-coordinator",
     lifespan=lifespan,
 )
 
