@@ -57,7 +57,7 @@ In the Render dashboard → your service → **Environment** tab, add:
 | `FINANCIAL_DB_PATH` | `/data/financial_records.db` | Set by render.yaml |
 | `RESPONSE_STORE_PATH` | `/data/response_store.json` | Set by render.yaml |
 | `ALLOWED_ORIGINS` | `https://your-app.vercel.app` | Set AFTER Vercel deploy |
-| `GROQ_API_KEY` | `gsk_...` | Optional — users can send their own key |
+| `LLM_API_KEY` | `tgp_v1_...` | Together.ai API key (set in Render dashboard) |
 | `SENTRY_DSN` | `https://...@sentry.io/...` | Optional |
 
 ### 1.4 Deploy
@@ -145,7 +145,7 @@ Now that you have the Vercel URL, update CORS on Render:
 
 1. Open your Vercel URL
 2. Log in (`Mansuri` / `182012`)
-3. Go to **Shop Info** → enter a shop name + your Groq API key
+3. Go to **Shop Info** → enter your shop name and owner name
 4. Go to **Upload Data** → upload a CSV file
 5. Go to **Dashboard** → verify KPI numbers appear
 6. Go to **AI Assistant** → ask "what are my total sales?"
@@ -162,10 +162,11 @@ Now that you have the Vercel URL, update CORS on Render:
 | `FINANCIAL_DB_PATH` | Yes | `data/financial_records.db` | SQLite DB path |
 | `RESPONSE_STORE_PATH` | No | `data/response_store.json` | Response cache path |
 | `ALLOWED_ORIGINS` | Yes (prod) | `*` | Comma-separated allowed frontend origins |
-| `GROQ_API_KEY` | No | — | Server-side Groq key (users can send their own) |
-| `GROQ_MODEL` | No | `llama-3.3-70b-versatile` | Default LLM model |
+| `LLM_BASE_URL` | Yes | `https://api.together.xyz/v1` | OpenAI-compatible LLM endpoint |
+| `LLM_MODEL` | Yes | `Qwen/Qwen3-8B` | Model name at the provider |
+| `LLM_API_KEY` | Yes | — | Together.ai API key (set in Render dashboard) |
+| `LLM_MAX_TOKENS` | No | `2048` | Max tokens per LLM call |
 | `MAX_LOOP_ITERATIONS` | No | `8` | Max pipeline steps per turn |
-| `COST_LIMIT_USD` | No | `1.0` | Max Groq spend per turn |
 | `MAX_UPLOAD_BYTES` | No | `52428800` | Max upload size (50 MB) |
 | `RATE_LIMIT_PER_MINUTE` | No | `30` | Query rate limit per IP |
 | `SENTRY_DSN` | No | — | Sentry error tracking |
@@ -225,7 +226,7 @@ Dashboard → your project → **Deployments** → click `...` on any deploy →
 ```bash
 cd agentic-ai
 cp backend/.env.example backend/.env
-# Edit backend/.env — set GROQ_API_KEY at minimum
+# Edit backend/.env — set LLM_BASE_URL, LLM_MODEL (Ollama locally)
 pip install -r backend/requirements.txt
 python backend/main.py
 # Backend runs at http://localhost:8000
@@ -259,8 +260,8 @@ Set it exactly: `https://your-app.vercel.app` (no trailing slash).
 ### Backend returns 503 on first request
 → Render free tier spun down. Wait 30 seconds and retry.
 
-### "Missing Groq API key" error
-→ Set your Groq key in the app's **Shop Info** page. Get one free at [console.groq.com](https://console.groq.com).
+### AI returns "LLM not reachable" error
+→ Check that `LLM_BASE_URL` and `LLM_API_KEY` are set correctly in Render environment variables.
 
 ### Upload fails with "File too large"
 → Default max is 50 MB. Increase `MAX_UPLOAD_BYTES` in Render environment if needed.

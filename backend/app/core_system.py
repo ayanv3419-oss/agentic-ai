@@ -126,7 +126,7 @@ from app.monitoring import (
 )
 
 # Single Coordinator orchestration - no v1/v2 dual path. The previous
-# Groq-backed analytics_engine and orchestrator_v2 packages have been
+# legacy analytics_engine and orchestrator_v2 packages have been
 # removed; everything routes through app.coordinator.
 
 

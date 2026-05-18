@@ -51,7 +51,7 @@ Current maturity: **MVP / pre-production** (score 58/100). Not suitable for mult
 | File / folder | Owns |
 |---|---|
 | `app/infrastructure.py` | Settings, SQLite schema, DB helpers, upload parsers, response cache, synonyms |
-| `app/analytics_engine.py` | TurnState, EventEmitter, CostGuard, GroqClient, 14 tools + 4 capabilities, registry, AgenticLoop, Dashboard/DataClean sub-agents, Coordinator |
+| `app/analytics_engine.py` | TurnState, EventEmitter, CostGuard, LLM client, 14 tools + 4 capabilities, registry, AgenticLoop, Dashboard/DataClean sub-agents, Coordinator |
 | `app/core_system.py` | FastAPI app, all HTTP routes, CORS, rate limiter, startup, exception handlers |
 | `app/kpi/` | KPI registry (SQLite-backed), matcher, formula execution engine |
 | `app/hierarchy/` | Product + location tree management (v1 adjacency list + v2 6-level enterprise) |
@@ -85,7 +85,7 @@ core_system → kpi / hierarchy / vector / monitoring / enrichment / database / 
 1. **TurnState is immutable.** Never `state.field = value`. Always `state = state.apply(field=value)`.
 2. **Database tool is the only SQL path.** All SQLite access from the pipeline must go through the `Database` tool with `READ_PIN` or `INGESTION_PIN`. No direct `fetch_all()` calls from tools.
 3. **The LLM orchestrates capabilities; capabilities are deterministic inside.** On the query path the LLM picks capabilities dynamically (the agentic loop). But each capability composes a *fixed* sub-sequence of the 14 tools, and the LLM never picks those 14 directly. The cheap front door (response cache, KPI fast-path) and the `RouteClassifier`/`IntentAnalyzer` pre-pass stay fully deterministic. See ADR-0004.
-4. **No cross-request Groq key leakage.** Each turn uses a `contextvars`-scoped `GroqClient`. Never store user keys in shared state.
+4. **No cross-request state leakage.** Each turn uses a fresh LLM call scoped to that request. Never store per-request state in shared module-level variables.
 5. **Cache invalidation is total.** Any upload or disconnect calls `invalidate_all()` — no partial invalidation.
 6. **Import direction is downward.** `core_system → analytics_engine → infrastructure`. No reverse imports.
 7. **PresentationEmitter wraps all user-facing SSE.** Never emit raw internal events directly to the browser.
@@ -108,11 +108,12 @@ See `PRODUCTION_READINESS_REPORT.md` for full list and remediation plan.
 
 ## 6. LLM provider
 
-- **Provider:** Groq (`/openai/v1/chat/completions`)
-- **Default model:** `llama-3.3-70b-versatile`
+- **Local dev:** Ollama (`http://localhost:11434/v1`) — model `qwen3:1.7b` (CPU, no GPU required)
+- **Production (Render):** Together.ai (`https://api.together.xyz/v1`) — model `Qwen/Qwen3-8B`
+- **Config:** `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` env vars — any OpenAI-compatible endpoint works
 - **Used for:** AgenticLoop orchestration (native tool calling — the LLM picks capabilities), SqlPlanner, InsightEngine, chat/knowledge responder
 - **Not used for:** the deterministic pre-pass (`RouteClassifier`/`IntentAnalyzer`), `classify_query_kind`, KPI calculation, dashboard aggregates, forecasting (linear regression), the response cache + KPI fast-path
-- **Fallback:** None — if Groq is down, the agentic loop returns a turn-level error (there is no deterministic fallback pipeline; the cache + KPI fast-path still serve what they can)
+- **Fallback:** None — if the LLM endpoint is down, the agentic loop returns a turn-level error (the cache + KPI fast-path still serve what they can)
 
 ---
 

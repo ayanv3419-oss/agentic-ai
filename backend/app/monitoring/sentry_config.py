@@ -70,7 +70,7 @@ def init_sentry() -> bool:
 
 
 def _scrub_event(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any] | None:
-    """Last-mile event scrubber. Strips bearer tokens + groq keys from
+    """Last-mile event scrubber. Strips bearer tokens and auth headers from
     headers and request bodies before they reach Sentry. Conservative:
     when in doubt, drop a field rather than ship it."""
     try:
@@ -79,7 +79,7 @@ def _scrub_event(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any] 
         if isinstance(headers, dict):
             for h in list(headers.keys()):
                 low = h.lower()
-                if low in ("authorization", "x-groq-api-key", "cookie", "set-cookie"):
+                if low in ("authorization", "cookie", "set-cookie"):
                     headers[h] = "[scrubbed]"
         # Scrub data field — the upload endpoint can ship multipart bytes.
         data = request.get("data")

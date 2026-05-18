@@ -1,9 +1,9 @@
 """
-Local LLM client. Talks to a running Ollama instance via the OpenAI
-SDK's compatibility endpoint.
+LLM client. Talks to any OpenAI-compatible endpoint — Ollama locally,
+Together.ai / other cloud providers in production.
 
-Fail loudly: if Ollama isn't reachable, calls return an error response
-(never raise). No Groq fallback, no cloud fallback.
+Fail loudly: if the LLM endpoint isn't reachable, calls return an error
+response (never raise). No silent fallback.
 
 Qwen 3 thinking-token workaround: every system prompt has '/no_think'
 appended so the model skips its <think>...</think> reasoning block.
@@ -79,8 +79,8 @@ def strip_thinking(text: str) -> str:
 
 def _model_understands_no_think(model: str | None) -> bool:
     """`/no_think` is a Qwen3-specific control token. Sending it to any
-    other model (e.g. llama-3.3 on Groq in production) is at best
-    inert noise and at worst confuses the model. Gate strictly."""
+    non-Qwen model is at best inert noise and at worst confuses the model.
+    Gate strictly on model name."""
     if not model:
         return False
     return model.lower().startswith("qwen")
@@ -371,7 +371,7 @@ async def check_llm_health() -> tuple[bool, str]:
     """Reach the LLM endpoint, list models, confirm the configured model is present.
 
     Works with Ollama (no auth) and any OpenAI-compatible cloud API such as
-    Groq (sends Bearer token when LLM_API_KEY is set to a non-Ollama value).
+    Together.ai (sends Bearer token when LLM_API_KEY is set to a non-Ollama value).
 
     Returns (ok, message). On failure the message is the human-readable
     reason, suitable for surfacing in startup logs / /health output.
