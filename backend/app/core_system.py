@@ -912,25 +912,56 @@ async def errors_report(req: FrontendErrorReport):
 
 @api_router.get("/health")
 async def health() -> dict:
-    llm_ok, llm_msg = await check_llm_health()
-    return {
-        "status": "ok",
-        "version": app.version,
-        "data_version": get_data_version(),
-        "cache": {
-            "kind": "json_file",
-            "size": cache_size(),
-        },
-        "database": engine_status(),
-        "sales_rows": await count_rows("sales"),
-        "purchase_rows": await count_rows("purchase"),
-        "sentry": sentry_status(),
-        "llm": {
+    """Defensive health endpoint.
+
+    Every probe is wrapped in try/except so the load-balancer (Render)
+    always gets a 200 with degraded info — never a 500.  This matters
+    because /health runs concurrently with the background _startup()
+    task, so the DB, KPI registry, etc. may not be ready yet during
+    the first few seconds after a deploy.
+    """
+    def _safe(fn, default=None):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 — health must never raise
+            return {"error": type(exc).__name__, "detail": str(exc)[:200]} if default is None else default
+
+    async def _safe_async(coro_fn, default=None):
+        try:
+            return await coro_fn()
+        except Exception as exc:  # noqa: BLE001
+            return {"error": type(exc).__name__, "detail": str(exc)[:200]} if default is None else default
+
+    llm_block: dict
+    try:
+        llm_ok, llm_msg = await check_llm_health()
+        llm_block = {
             "ok": llm_ok,
             "detail": llm_msg,
             "model": settings.llm_model,
             "base_url": settings.llm_base_url,
+        }
+    except Exception as exc:  # noqa: BLE001
+        llm_block = {
+            "ok": False,
+            "detail": f"health probe crashed: {type(exc).__name__}: {str(exc)[:200]}",
+            "model": settings.llm_model,
+            "base_url": settings.llm_base_url,
+        }
+
+    return {
+        "status": "ok",
+        "version": app.version,
+        "data_version": _safe(get_data_version, default=0),
+        "cache": {
+            "kind": "json_file",
+            "size": _safe(cache_size, default=0),
         },
+        "database": _safe(engine_status, default={"kind": "unknown", "status": "starting"}),
+        "sales_rows": await _safe_async(lambda: count_rows("sales"), default=0),
+        "purchase_rows": await _safe_async(lambda: count_rows("purchase"), default=0),
+        "sentry": _safe(sentry_status, default={"enabled": False}),
+        "llm": llm_block,
         "auth_enabled": settings.auth_enabled,
     }
 
