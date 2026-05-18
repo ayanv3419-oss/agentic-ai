@@ -107,7 +107,37 @@ def ensure_no_think(
     return out
 
 
-_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+def _find_json_object(text: str) -> str | None:
+    """Find the first balanced {...} block in ``text`` using a
+    bracket-depth scan. The old greedy regex (`\\{.*\\}` with DOTALL)
+    matched from the first `{` to the LAST `}`, so two separate JSON
+    blocks in the same string were concatenated into garbage."""
+    depth = 0
+    start = -1
+    in_str = False
+    escape = False
+    for i, ch in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_str:
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    return text[start : i + 1]
+    return None
 
 
 def parse_strict_json(content: str) -> dict[str, Any]:
@@ -126,10 +156,10 @@ def parse_strict_json(content: str) -> dict[str, Any]:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
-    m = _JSON_BLOCK_RE.search(text)
-    if m:
+    block = _find_json_object(text)
+    if block:
         try:
-            return json.loads(m.group(0))
+            return json.loads(block)
         except json.JSONDecodeError as e:
             raise ValueError(f"Could not parse JSON: {e}") from e
     raise ValueError("LLM output contained no parseable JSON")

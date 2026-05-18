@@ -6,14 +6,18 @@ behaviour the frontend already assumes.
 from __future__ import annotations
 
 import threading
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Any
 
 
 _MAX_TURNS_PER_CONVO = 8
+_MAX_CONVERSATIONS = 256
 
 _LOCK = threading.Lock()
-_STORE: dict[str, deque] = {}
+# OrderedDict so we can evict the least-recently-used conversation
+# when we hit _MAX_CONVERSATIONS. Without this cap, a long-running
+# server with many distinct conversation_ids leaked unbounded memory.
+_STORE: "OrderedDict[str, deque]" = OrderedDict()
 
 
 def append_turn(
@@ -30,6 +34,10 @@ def append_turn(
         if bucket is None:
             bucket = deque(maxlen=_MAX_TURNS_PER_CONVO)
             _STORE[conversation_id] = bucket
+            if len(_STORE) > _MAX_CONVERSATIONS:
+                _STORE.popitem(last=False)  # evict oldest
+        else:
+            _STORE.move_to_end(conversation_id)  # mark MRU
         bucket.append({
             "question": question,
             "answer": answer or "",
@@ -42,7 +50,10 @@ def recent_turns(conversation_id: str | None) -> list[dict[str, Any]]:
         return []
     with _LOCK:
         bucket = _STORE.get(conversation_id)
-        return list(bucket) if bucket else []
+        if not bucket:
+            return []
+        _STORE.move_to_end(conversation_id)  # touch on read
+        return list(bucket)
 
 
 def render_context(conversation_id: str | None, *, max_turns: int = 4) -> str:

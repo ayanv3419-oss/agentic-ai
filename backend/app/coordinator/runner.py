@@ -55,101 +55,107 @@ async def run_query_turn(
         registry = get_registry()
     _ensure_sub_agents_registered(registry)
 
-    await emit("turn.start", {
-        "turn_id": state.turn_id,
-        "question": state.question,
-    })
+    try:
+        await emit("turn.start", {
+            "turn_id": state.turn_id,
+            "question": state.question,
+        })
 
-    cache_key = cache_key_for(state.question, conversation_id=state.conversation_id)
-    cached = get_cached(cache_key)
-    if cached and isinstance(cached, dict) and cached.get("final_answer"):
-        await emit("cache.hit", {
-            "stored_at": cached.get("stored_at"),
-            "mode": cached.get("mode", "agentic"),
-        })
-        await emit("final", {
-            "answer": cached.get("final_answer", ""),
-            "mode": cached.get("mode", "agentic"),
-            "from_cache": True,
-            "iteration_count": cached.get("iteration_count", 0),
-            "chart": cached.get("chart"),
-        })
+        cache_key = cache_key_for(state.question, conversation_id=state.conversation_id)
+        cached = get_cached(cache_key)
+        if cached and isinstance(cached, dict) and cached.get("final_answer"):
+            await emit("cache.hit", {
+                "stored_at": cached.get("stored_at"),
+                "mode": cached.get("mode", "agentic"),
+            })
+            await emit("final", {
+                "answer": cached.get("final_answer", ""),
+                "mode": cached.get("mode", "agentic"),
+                "from_cache": True,
+                "iteration_count": cached.get("iteration_count", 0),
+                "chart": cached.get("chart"),
+            })
+            await emit("turn.end", {
+                "turn_id": state.turn_id,
+                "from_cache": True,
+                "errors": [],
+                "final_answer": cached.get("final_answer", ""),
+                "mode": cached.get("mode", "agentic"),
+            })
+            try:
+                append_turn(
+                    state.conversation_id,
+                    question=state.question,
+                    answer=cached.get("final_answer", ""),
+                    route=cached.get("route"),
+                )
+            except Exception:
+                pass
+            return state.apply(final_answer=cached.get("final_answer", ""), finished=True)
+
+        try:
+            state = await run_loop(state, llm=llm, registry=registry, emit=emit)
+        except Exception as e:
+            _log.exception("coordinator loop crashed for turn %s", state.turn_id)
+            state = state.with_error(f"loop_crash:{type(e).__name__}:{e}")
+
+        answer = state.final_answer or (
+            "I wasn't able to complete the analysis. "
+            "Please try rephrasing the question."
+        )
+
+        final_payload: dict[str, Any] = {
+            "answer": answer,
+            "mode": "agentic",
+            "iteration_count": state.iteration,
+            "from_cache": False,
+        }
+        if state.chart_payload is not None:
+            final_payload["chart"] = state.chart_payload
+        if state.route:
+            final_payload["route"] = state.route
+        await emit("final", final_payload)
         await emit("turn.end", {
             "turn_id": state.turn_id,
-            "from_cache": True,
-            "errors": [],
-            "final_answer": cached.get("final_answer", ""),
-            "mode": cached.get("mode", "agentic"),
+            "from_cache": False,
+            "errors": list(state.errors),
+            "final_answer": answer,
+            "mode": "agentic",
         })
+
+        # Cache only clean answers.
+        if not state.errors and state.final_answer:
+            try:
+                put_cached(cache_key, {
+                    "final_answer": state.final_answer,
+                    "mode": "agentic",
+                    "iteration_count": state.iteration,
+                    "route": state.route,
+                    "chart": state.chart_payload,
+                })
+            except Exception:
+                _log.warning("cache write failed", exc_info=True)
+
         try:
             append_turn(
                 state.conversation_id,
                 question=state.question,
-                answer=cached.get("final_answer", ""),
-                route=cached.get("route"),
+                answer=state.final_answer,
+                route=state.route,
             )
         except Exception:
             pass
+
+        return state
+    finally:
+        # Always release the LLM client we allocated, even if emit() or
+        # the loop raises / the task gets cancelled. Without this the
+        # underlying httpx connection pool leaks on every aborted turn.
         if own_llm:
-            await llm.aclose()
-        return state.apply(final_answer=cached.get("final_answer", ""), finished=True)
-
-    try:
-        state = await run_loop(state, llm=llm, registry=registry, emit=emit)
-    except Exception as e:
-        _log.exception("coordinator loop crashed for turn %s", state.turn_id)
-        state = state.with_error(f"loop_crash:{type(e).__name__}:{e}")
-
-    answer = state.final_answer or (
-        "I wasn't able to complete the analysis. "
-        "Please try rephrasing the question."
-    )
-
-    final_payload: dict[str, Any] = {
-        "answer": answer,
-        "mode": "agentic",
-        "iteration_count": state.iteration,
-        "from_cache": False,
-    }
-    if state.chart_payload is not None:
-        final_payload["chart"] = state.chart_payload
-    if state.route:
-        final_payload["route"] = state.route
-    await emit("final", final_payload)
-    await emit("turn.end", {
-        "turn_id": state.turn_id,
-        "from_cache": False,
-        "errors": list(state.errors),
-        "final_answer": answer,
-        "mode": "agentic",
-    })
-
-    # Cache only clean answers.
-    if not state.errors and state.final_answer:
-        try:
-            put_cached(cache_key, {
-                "final_answer": state.final_answer,
-                "mode": "agentic",
-                "iteration_count": state.iteration,
-                "route": state.route,
-                "chart": state.chart_payload,
-            })
-        except Exception:
-            _log.warning("cache write failed", exc_info=True)
-
-    try:
-        append_turn(
-            state.conversation_id,
-            question=state.question,
-            answer=state.final_answer,
-            route=state.route,
-        )
-    except Exception:
-        pass
-
-    if own_llm:
-        await llm.aclose()
-    return state
+            try:
+                await llm.aclose()
+            except Exception:
+                _log.warning("llm close failed", exc_info=True)
 
 
 __all__ = ["run_query_turn"]
