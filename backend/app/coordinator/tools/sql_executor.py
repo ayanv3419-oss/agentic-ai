@@ -16,6 +16,8 @@ from app.infrastructure import get_connection
 
 _DEFAULT_MAX_ROWS = 500
 _HARD_ROW_CAP = 5000
+_CHART_MAX_POINTS = 500  # was 200 (silent), now matches default max_rows
+_TYPE_SAMPLE_ROWS = 50   # rows scanned to infer column types
 
 
 def _enforce_limit(sql: str, default_limit: int) -> str:
@@ -34,38 +36,72 @@ def _enforce_limit(sql: str, default_limit: int) -> str:
     return f"SELECT * FROM ({cleaned}) LIMIT {default_limit}"
 
 
+def _infer_column_types(
+    rows: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Classify each column as 'text' / 'number' / 'other' by scanning
+    up to _TYPE_SAMPLE_ROWS rows. None values are ignored. Booleans are
+    excluded from 'number' (they're an isinstance(int) trap)."""
+    if not rows:
+        return {}
+    cols = list(rows[0].keys())
+    sample = rows[:_TYPE_SAMPLE_ROWS]
+    out: dict[str, str] = {}
+    for c in cols:
+        kind = "other"
+        for r in sample:
+            v = r.get(c)
+            if v is None:
+                continue
+            if isinstance(v, bool):
+                # bool is int subclass in Python; treat as 'other'.
+                kind = "other"
+                break
+            if isinstance(v, (int, float)):
+                kind = "number"
+                break
+            if isinstance(v, str):
+                kind = "text"
+                break
+        out[c] = kind
+    return out
+
+
 def _build_chart_payload(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Auto-derive a chart payload when the result has 1-2 columns suitable
-    for plotting. Frontend uses 'category' + 'value' axis names."""
+    """Auto-derive a chart payload when the result has columns suitable
+    for plotting. Picks the first text-like column as x and the first
+    numeric column as y by scanning multiple rows (not just row[0]) so
+    a NULL at row 0 doesn't disqualify a valid column."""
     if not rows:
         return None
-    first = rows[0]
-    cols = list(first.keys())
-    if not cols:
+    types = _infer_column_types(rows)
+    if not types:
         return None
-    # Pick the first text-like column as x and the first numeric as y.
-    x_col = None
-    y_col = None
-    for c in cols:
-        v = first.get(c)
-        if x_col is None and isinstance(v, str):
-            x_col = c
-        if y_col is None and isinstance(v, (int, float)):
-            y_col = c
-        if x_col and y_col:
-            break
-    if x_col is None and len(cols) >= 1:
+    cols = list(types.keys())
+    x_col = next((c for c in cols if types[c] == "text"), None)
+    y_col = next((c for c in cols if types[c] == "number"), None)
+    if x_col is None and cols:
         x_col = cols[0]
-    if y_col is None and len(cols) >= 2:
-        y_col = cols[1]
-    if x_col is None or y_col is None:
+    if y_col is None:
+        # Try the second column as a fallback numeric, but only if it
+        # isn't the same column we picked for x.
+        for c in cols:
+            if c != x_col and types[c] != "text":
+                y_col = c
+                break
+    if x_col is None or y_col is None or x_col == y_col:
         return None
+    total = len(rows)
+    truncated = total > _CHART_MAX_POINTS
+    capped = rows[:_CHART_MAX_POINTS]
     return {
-        "kind": "bar" if len(rows) <= 30 else "line",
+        "kind": "bar" if total <= 30 else "line",
         "x": x_col,
         "y": y_col,
-        "labels": [str(r.get(x_col)) for r in rows[:200]],
-        "values": [r.get(y_col) for r in rows[:200]],
+        "labels": [str(r.get(x_col)) for r in capped],
+        "values": [r.get(y_col) for r in capped],
+        "total_points": total,
+        "truncated": truncated,
     }
 
 
