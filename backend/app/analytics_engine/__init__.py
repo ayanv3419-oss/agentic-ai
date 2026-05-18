@@ -29,6 +29,12 @@ from ._core import *  # noqa: F401, F403
 from ._core import (
     _has_any_uploaded_data,       # backend/tests/test_persistence_lifecycle.py
     _narrate_kpi,                 # backend/app/orchestrator_v2/front_door.py
+    # intent / classify helpers used by tests
+    _reset_last_kind,             # test_intent_router, test_analytics_intent
+    _build_intent_diagnostics,    # test_analytics_intent
+    _normalize_typos,             # test_analytics_intent
+    _ranking_direction,           # test_analytics_intent
+    _ranking_subject,             # test_analytics_intent
     # Phase 1 helpers — exposed so future code / tests can introspect them
     # without having to know the internal `_core` path.
     _schema_summary_text,
