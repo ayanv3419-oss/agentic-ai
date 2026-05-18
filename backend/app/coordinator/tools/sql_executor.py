@@ -7,12 +7,11 @@ applied again here (defense in depth).
 from __future__ import annotations
 
 import asyncio
-import sys
 from typing import Any
 
 from app.coordinator.tools.base import Tool, ToolContext, ToolOutcome
 from app.coordinator.tools.sql_dry_run import _validate_shape
-from app.infrastructure import get_connection, settings
+from app.infrastructure import get_connection
 
 
 _DEFAULT_MAX_ROWS = 500
@@ -115,19 +114,11 @@ class SqlExecutorTool(Tool):
             return ToolOutcome(ok=False, error=f"sql execution failed: {e}")
 
         result = [dict(r) for r in rows]
-        # Soft cost-guard check: byte estimate.
-        try:
-            payload_bytes = sys.getsizeof(repr(result))
-        except Exception:
-            payload_bytes = 0
-        if payload_bytes > settings.sql_max_bytes_scanned:
-            return ToolOutcome(
-                ok=False,
-                error=(
-                    f"Result exceeds byte cap "
-                    f"({payload_bytes} > {settings.sql_max_bytes_scanned})"
-                ),
-            )
+        # NOTE: the legacy `sql_max_bytes_scanned` check used
+        # sys.getsizeof(repr(result)) which measured the Python string
+        # object size, not bytes scanned from disk - effectively a
+        # no-op against the 10 GB default. Removed. Row bounding is
+        # handled by the outer LIMIT in _enforce_limit + _HARD_ROW_CAP.
 
         chart = _build_chart_payload(result)
         updates: dict[str, Any] = {

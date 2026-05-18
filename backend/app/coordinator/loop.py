@@ -83,6 +83,9 @@ def _initial_messages(state: TurnState) -> list[dict[str, Any]]:
     return msgs
 
 
+_TOOL_MSG_CAP = 24000
+
+
 def _tool_message(call_id: str, name: str, content: Any) -> dict[str, Any]:
     if isinstance(content, str):
         body = content
@@ -91,11 +94,19 @@ def _tool_message(call_id: str, name: str, content: Any) -> dict[str, Any]:
             body = json.dumps(content, default=str, ensure_ascii=False)
         except Exception:
             body = str(content)
+    if len(body) > _TOOL_MSG_CAP:
+        # Tell the LLM the result was truncated so it can adapt
+        # (e.g. ask Schema for fewer tables, narrow a query, etc.).
+        # Otherwise it silently bases SQL on a sliced schema.
+        body = (
+            body[:_TOOL_MSG_CAP]
+            + f"\n...[TRUNCATED, full size {len(body)} bytes]"
+        )
     return {
         "role": "tool",
         "tool_call_id": call_id,
         "name": name,
-        "content": body[:8000],
+        "content": body,
     }
 
 
