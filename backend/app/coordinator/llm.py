@@ -397,9 +397,20 @@ async def check_llm_health() -> tuple[bool, str]:
     if resp.status_code != 200:
         return False, f"LLM API returned HTTP {resp.status_code}: {resp.text[:200]}"
 
+    # Different providers return different shapes for /models:
+    #   - OpenAI / Ollama : {"data": [{"id": "..."}, ...]}
+    #   - Together.ai     : [{"id": "..."}, ...]   (bare list)
+    #   - Some proxies    : {"models": [{"id": "..."}, ...]}
+    # Be liberal in what we accept.
     try:
-        data = resp.json()
-        ids = {m.get("id") for m in data.get("data", []) if isinstance(m, dict)}
+        payload = resp.json()
+        if isinstance(payload, list):
+            models = payload
+        elif isinstance(payload, dict):
+            models = payload.get("data") or payload.get("models") or []
+        else:
+            models = []
+        ids = {m.get("id") for m in models if isinstance(m, dict) and m.get("id")}
     except Exception as e:
         return False, f"Could not parse LLM /models response: {e}"
 
