@@ -39,15 +39,19 @@ services:
         sync: false   # set in Render dashboard (required when AUTH_ENABLED=true)
       - key: AUTH_TOKEN_SECRET
         sync: false   # set in Render dashboard (required when AUTH_ENABLED=true)
-      # --- LLM (Together.ai — OpenAI-compatible, runs Qwen) ----------------
-      # Together.ai hosts Qwen/Qwen3-8B with an OpenAI-compatible endpoint.
-      # Set LLM_API_KEY in the Render dashboard (sync: false).
+      # --- LLM (DashScope — Alibaba's official Qwen API, OpenAI-compatible) -
+      # DashScope is the canonical home of the Qwen family with a generous
+      # free tier for new accounts.  Endpoint is OpenAI-compatible so the
+      # existing AsyncOpenAI client works unchanged.
+      # Set LLM_API_KEY in the Render dashboard (sync: false) to a
+      # DashScope key from https://dashscope.console.aliyun.com/apiKey
+      # (or the international console: https://dashscope-intl.console.aliyun.com).
       - key: LLM_BASE_URL
-        value: "https://api.together.xyz/v1"
+        value: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
       - key: LLM_API_KEY
-        sync: false   # Together.ai key — set in Render dashboard
+        sync: false   # DashScope key — set in Render dashboard
       - key: LLM_MODEL
-        value: "Qwen/Qwen3-8B"
+        value: "qwen-plus"
       - key: LLM_TEMPERATURE
         value: "0.0"
       - key: LLM_MAX_TOKENS
