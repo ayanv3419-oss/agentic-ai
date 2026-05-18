@@ -39,19 +39,18 @@ services:
         sync: false   # set in Render dashboard (required when AUTH_ENABLED=true)
       - key: AUTH_TOKEN_SECRET
         sync: false   # set in Render dashboard (required when AUTH_ENABLED=true)
-      # --- LLM (DashScope — Alibaba's official Qwen API, OpenAI-compatible) -
-      # DashScope is the canonical home of the Qwen family with a generous
-      # free tier for new accounts.  Endpoint is OpenAI-compatible so the
-      # existing AsyncOpenAI client works unchanged.
-      # Set LLM_API_KEY in the Render dashboard (sync: false) to a
-      # DashScope key from https://dashscope.console.aliyun.com/apiKey
-      # (or the international console: https://dashscope-intl.console.aliyun.com).
+      # --- LLM (OpenRouter — free Qwen, OpenAI-compatible) -----------------
+      # OpenRouter aggregates dozens of providers behind one OpenAI-compatible
+      # endpoint and offers Qwen models on a free tier (50 req/day @ $0
+      # balance, 1000 req/day with $10+ unused credit, 20 req/min cap).
+      # Globally accessible — works from networks where Together.ai or
+      # DashScope are blocked.  Sign up at https://openrouter.ai/keys.
       - key: LLM_BASE_URL
-        value: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        value: "https://openrouter.ai/api/v1"
       - key: LLM_API_KEY
-        sync: false   # DashScope key — set in Render dashboard
+        sync: false   # OpenRouter key (sk-or-...) — set in Render dashboard
       - key: LLM_MODEL
-        value: "qwen-plus"
+        value: "qwen/qwen3-coder:free"
       - key: LLM_TEMPERATURE
         value: "0.0"
       - key: LLM_MAX_TOKENS
