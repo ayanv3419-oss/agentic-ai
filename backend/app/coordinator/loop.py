@@ -159,13 +159,17 @@ async def run_loop(
 
         if resp.error:
             # Don't count an erroring round toward the iteration cap.
-            _log.warning("llm error in loop: %s", resp.error)
+            _log.warning("llm error in loop: %s (kind=%s)", resp.error, resp.error_kind)
             state = state.with_error(f"llm:{resp.error_kind}:{resp.error}")
             if not state.final_answer:
+                # Surface the real reason so we can diagnose — don't hide it
+                # behind a hard-coded "check Ollama" string (we're not always
+                # on Ollama; production uses Together.ai).
+                short = (resp.error or "unknown error").splitlines()[0][:300]
                 state = state.apply(
                     final_answer=(
-                        "I couldn't reach the local model. "
-                        "Please check that Ollama is running and the model is pulled."
+                        f"The AI provider returned an error ({resp.error_kind or 'error'}): "
+                        f"{short}"
                     ),
                 )
             break

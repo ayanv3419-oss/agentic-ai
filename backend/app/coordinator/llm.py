@@ -235,13 +235,13 @@ class LLMClient:
             resp = await self._client.chat.completions.create(**kwargs)
         except APIConnectionError as e:
             return _err_response(
-                f"Cannot reach Ollama at {self.base_url}: {e}",
+                f"Cannot reach LLM at {self.base_url}: {e}",
                 "network",
             )
         except APITimeoutError as e:
-            return _err_response(f"Ollama timed out: {e}", "network")
+            return _err_response(f"LLM request timed out at {self.base_url}: {e}", "network")
         except APIError as e:
-            return _err_response(f"Ollama API error: {e}", "upstream")
+            return _err_response(f"LLM API error from {self.base_url} ({self.model}): {e}", "upstream")
         except Exception as e:
             _log.exception("llm.complete unexpected failure")
             return _err_response(f"{type(e).__name__}: {e}", "unknown")
@@ -257,7 +257,7 @@ class LLMClient:
                 finish_reason=choice.finish_reason,
             )
         except (AttributeError, IndexError, ValueError, TypeError) as e:
-            return _err_response(f"Malformed Ollama response: {e}", "parse")
+            return _err_response(f"Malformed LLM response from {self.base_url}: {e}", "parse")
 
     async def complete_stream(
         self,
@@ -319,13 +319,20 @@ class LLMClient:
             resp = await self._client.chat.completions.create(**kwargs)
         except APIConnectionError as e:
             return _err_tool_response(
-                f"Cannot reach Ollama at {self.base_url}: {e}",
+                f"Cannot reach LLM at {self.base_url}: {e}",
                 "network",
             )
         except APITimeoutError as e:
-            return _err_tool_response(f"Ollama timed out: {e}", "network")
+            return _err_tool_response(f"LLM request timed out at {self.base_url}: {e}", "network")
         except APIError as e:
-            return _err_tool_response(f"Ollama API error: {e}", "upstream")
+            # Surface the real provider error — status code, body, etc.
+            detail = str(e)
+            status = getattr(e, "status_code", None) or getattr(e, "code", None)
+            body = getattr(e, "body", None) or getattr(e, "response", None)
+            return _err_tool_response(
+                f"LLM API error from {self.base_url} (model={self.model}, status={status}): {detail} body={str(body)[:300]}",
+                "upstream",
+            )
         except Exception as e:
             _log.exception("llm.complete_with_tools unexpected failure")
             return _err_tool_response(f"{type(e).__name__}: {e}", "unknown")
@@ -359,7 +366,7 @@ class LLMClient:
                 finish_reason=choice.finish_reason,
             )
         except (AttributeError, IndexError, ValueError, TypeError) as e:
-            return _err_tool_response(f"Malformed Ollama response: {e}", "parse")
+            return _err_tool_response(f"Malformed LLM response from {self.base_url}: {e}", "parse")
 
 
 # ---------------------------------------------------------------------------
