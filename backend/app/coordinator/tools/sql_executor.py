@@ -7,7 +7,6 @@ applied again here (defense in depth).
 from __future__ import annotations
 
 import asyncio
-import re
 import sys
 from typing import Any
 
@@ -21,10 +20,19 @@ _HARD_ROW_CAP = 5000
 
 
 def _enforce_limit(sql: str, default_limit: int) -> str:
-    """Add a LIMIT clause if the SQL doesn't already have one."""
-    if re.search(r"\blimit\b\s+\d+", sql, re.IGNORECASE):
-        return sql
-    return f"{sql.rstrip().rstrip(';')} LIMIT {default_limit}"
+    """Cap the outermost result at ``default_limit`` rows.
+
+    Previously this used a regex (``\\blimit\\b\\s+\\d+``) to decide
+    whether to add a LIMIT - but the regex matched a LIMIT inside a CTE
+    or subquery and skipped the outer cap, letting big joins return
+    unbounded rows. We now always wrap the SQL in
+    ``SELECT * FROM (<sql>) LIMIT N`` so the outermost row count is
+    bounded regardless of inner clauses. SQLite handles outer LIMIT
+    cleanly over inner ORDER BY / LIMIT (the inner ordering survives;
+    the outer LIMIT just trims). The redundant-LIMIT case is harmless.
+    """
+    cleaned = sql.rstrip().rstrip(";").strip()
+    return f"SELECT * FROM ({cleaned}) LIMIT {default_limit}"
 
 
 def _build_chart_payload(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
