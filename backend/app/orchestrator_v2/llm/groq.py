@@ -23,6 +23,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import threading
 import re
 from typing import Any, AsyncIterator
 
@@ -438,6 +439,11 @@ def parse_strict_json(content: str) -> dict[str, Any]:
 
 
 _groq_singleton: GroqClient | None = None
+# Guards the singleton's first-time construction so two concurrent
+# get_groq() callers (background tasks, KPI engine warmup racing the
+# first request) don't both build a client and leak the loser's
+# httpx pool.
+_groq_singleton_lock = threading.Lock()
 _request_groq: contextvars.ContextVar[GroqClient | None] = contextvars.ContextVar(
     "request_groq", default=None
 )
@@ -460,7 +466,12 @@ def get_groq() -> GroqClient:
         return cur
     global _groq_singleton
     if _groq_singleton is None:
-        _groq_singleton = GroqClient()
+        with _groq_singleton_lock:
+            # Double-checked locking — only the first caller through the
+            # gate pays the construction cost; subsequent callers see the
+            # populated singleton without touching the lock.
+            if _groq_singleton is None:
+                _groq_singleton = GroqClient()
     return _groq_singleton
 
 

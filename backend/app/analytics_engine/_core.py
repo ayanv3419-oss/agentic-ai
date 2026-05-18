@@ -2638,6 +2638,19 @@ _RAW_SQL_SELECT = re.compile(r"^\s*select\b", re.IGNORECASE | re.DOTALL)
 _RAW_SQL_QUOTED_IDENT = re.compile(r'"([^"]+)"')
 _RAW_SQL_BACKTICK_IDENT = re.compile(r"`([^`]+)`")
 _RAW_SQL_BARE_IDENT = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b")
+# Bare (unquoted) table names following FROM/JOIN. LLMs almost always omit
+# quotes for snake_case identifiers, so the quoted-only whitelist below
+# missed nearly every call. This catches them pre-flight with a usable
+# error instead of letting the LLM burn iterations on "no such table".
+_RAW_SQL_BARE_TABLE = re.compile(
+    r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+# "no such column: foo" / "no such column: tbl.foo" — extracts `foo`.
+_SQLITE_NO_COLUMN = re.compile(
+    r"no such column:\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
 _RAW_SQL_MAX_LIMIT = 500
 
 
@@ -2675,6 +2688,43 @@ class RawSqlQueryArgs(BaseModel):
             "what the user asked for."
         ),
     )
+    chart_y_label: str | None = Field(
+        default=None,
+        description=(
+            "Semantic label for the Y-axis value. Pick the one that matches "
+            "what your SELECT actually measures: 'sales' (default — rupee "
+            "amounts), 'count' (counts of customers/transactions/items), "
+            "'quantity' (stock_qty, units), 'percent' (rates/ratios), or a "
+            "short custom word. The frontend uses this to label the chart "
+            "axis and pick the right number formatter (rupees vs plain "
+            "integer) — so a customers-by-purchase-count chart no longer "
+            "shows ₹40 next to 'Cash Sale'."
+        ),
+    )
+
+
+def _normalize_y_label(label: str | None) -> str:
+    """Normalize the LLM-supplied chart_y_label to one of the formatter
+    classes the frontend knows about. Anything we don't recognise passes
+    through verbatim — the frontend falls back to a plain integer format
+    for unknown labels rather than misformatting as currency.
+    """
+    if not label:
+        return "sales"
+    s = label.strip().lower()
+    # Money-ish synonyms collapse to 'sales' so existing currency-format
+    # paths keep working without per-call changes.
+    if s in {"sales", "revenue", "amount", "total", "rupees", "₹",
+             "gross_sales", "net_sales", "gross", "net"}:
+        return "sales"
+    if s in {"count", "counts", "number", "transactions", "orders",
+             "purchases", "frequency"}:
+        return "count"
+    if s in {"quantity", "qty", "units", "stock", "stock_qty"}:
+        return "quantity"
+    if s in {"percent", "percentage", "pct", "rate", "ratio", "share"}:
+        return "percent"
+    return s
 
 
 def _build_dynamic_chart(
@@ -2684,6 +2734,7 @@ def _build_dynamic_chart(
     y_col: str | None,
     kind: str,
     question: str,
+    y_label: str | None = None,
 ) -> dict[str, Any]:
     """Convert raw SQL rows into the SalesChart-shaped chart_data dict the
     frontend ChatChart already understands.
@@ -2691,6 +2742,8 @@ def _build_dynamic_chart(
     Returns the same {kind, totals, series, items} structure produced by the
     legacy ResultAggregator, populated from whatever the LLM aliased.
     """
+    y_label_norm = _normalize_y_label(y_label)
+
     if not rows:
         return {
             "kind":        kind if kind in ("ranking", "trend", "summary") else "summary",
@@ -2699,6 +2752,7 @@ def _build_dynamic_chart(
             "totals":      {"total_sales": 0.0, "orders": 0, "customers": 0},
             "series":      [],
             "items":       [],
+            "y_label":     y_label_norm,
             "empty":       True,
         }
 
@@ -2763,6 +2817,7 @@ def _build_dynamic_chart(
             },
             "series":      series,
             "items":       [],
+            "y_label":     y_label_norm,
         }
 
     if kind == "ranking":
@@ -2786,6 +2841,7 @@ def _build_dynamic_chart(
             },
             "series":           [],
             "items":            items,
+            "y_label":          y_label_norm,
         }
 
     # summary — single value with a token series so the chart still renders.
@@ -2803,6 +2859,7 @@ def _build_dynamic_chart(
             for r in rows[:50]
         ],
         "items":       [],
+        "y_label":     y_label_norm,
     }
 
 
@@ -2841,31 +2898,39 @@ class RawSqlQueryTool(Tool):
         if not re.search(r"\bLIMIT\b", sql, re.IGNORECASE):
             sql = sql + " LIMIT 50"
 
-        # Identifier whitelist: every quoted/backticked identifier must be
-        # in the dynamic registry. Bare identifiers can be SQL aliases the
-        # LLM declares — we don't whitelist those (validator below uses the
-        # quoted-identifier check only).
+        # Identifier whitelist: every table name (quoted, backticked, OR
+        # bare after FROM/JOIN) must be in the dynamic registry. Bare
+        # column identifiers can still be SQL aliases the LLM declares, so
+        # those aren't whitelisted — SQLite catches them and we enrich the
+        # error below with which tables actually have the column.
+        dyn_tables_now = list_dynamic_tables()
         whitelist = known_dynamic_identifiers() | {
             "u_sales", "u_purchase",  # safety for forward-compat
         }
-        unknown: list[str] = []
+        unknown_tables: list[str] = []
         for ident in _RAW_SQL_QUOTED_IDENT.findall(sql):
             if ident in whitelist:
                 continue
-            unknown.append(ident)
+            unknown_tables.append(ident)
         for ident in _RAW_SQL_BACKTICK_IDENT.findall(sql):
             if ident in whitelist:
                 continue
-            unknown.append(ident)
-        if unknown:
-            # Allow the LLM to retry with a hint about what IS available.
-            tables = [t["table"] for t in list_dynamic_tables()]
+            unknown_tables.append(ident)
+        for ident in _RAW_SQL_BARE_TABLE.findall(sql):
+            # Only u_* are valid here; bare names that don't start with u_
+            # are almost always typos (e.g. `sales_transactions` instead of
+            # `u_sales_transactions`).
+            if ident in whitelist or ident.lower() in whitelist:
+                continue
+            unknown_tables.append(ident)
+        if unknown_tables:
+            tables = [t["table"] for t in dyn_tables_now]
             return ToolResult(
                 ok=False,
                 error=(
-                    f"unknown identifier(s) in SQL: {sorted(set(unknown))!r}. "
+                    f"unknown table(s) in SQL: {sorted(set(unknown_tables))!r}. "
                     f"Available user tables: {tables}. "
-                    f"Use the exact column names from the schema in the system prompt."
+                    f"Use the exact table names from the schema in the system prompt."
                 ),
             )
 
@@ -2881,7 +2946,30 @@ class RawSqlQueryTool(Tool):
         try:
             rows = await fetch_all(sql, ())
         except sqlite3.Error as e:
-            return ToolResult(ok=False, error=f"SQL exec failed: {e}")
+            # Enrich "no such column" with a column → tables index so the
+            # LLM can pick the right table on retry instead of looping on
+            # the wrong one (e.g. u_sales_transactions has no `party_name`
+            # but u_sale_report does). This is the single highest-impact
+            # signal we can give back to the loop.
+            err_str = f"SQL exec failed: {e}"
+            m = _SQLITE_NO_COLUMN.search(str(e))
+            if m:
+                missing_col = m.group(1).lower()
+                col_idx = _columns_index_for_dynamic(dyn_tables_now)
+                # Try exact match first, then suffix/contains match (handles
+                # `u_sale_report.party_name` vs aliases with table prefix).
+                tables_with = col_idx.get(missing_col) or [
+                    t for col, ts in col_idx.items()
+                    if missing_col in col or col in missing_col
+                    for t in ts
+                ]
+                if tables_with:
+                    err_str += (
+                        f" — column {missing_col!r} exists in tables: "
+                        f"{sorted(set(tables_with))}. "
+                        f"Retry your SQL against one of those tables."
+                    )
+            return ToolResult(ok=False, error=err_str)
         except Exception as e:
             return ToolResult(ok=False, error=f"DB error: {type(e).__name__}: {e}")
 
@@ -2896,6 +2984,7 @@ class RawSqlQueryTool(Tool):
             y_col=args.chart_y_column,
             kind=(args.chart_kind or "ranking").strip().lower(),
             question=state.question,
+            y_label=args.chart_y_label,
         )
 
         _raw_sql_log.info(
@@ -3317,12 +3406,26 @@ DOMAIN_WORDS = frozenset({
     "product", "products", "item", "items", "sku",
     "report", "reports", "dashboard",
     "kpi", "kpis", "analytics", "analysis",
+    # Inventory / catalog / hierarchy — required so dynamic-table
+    # questions ("inventory turnover ratio", "low stock", "warehouse
+    # utilisation") clear the analytics threshold and reach the loop
+    # instead of falling through to `restricted`.
+    "inventory", "stock", "stockout", "restock", "overstock", "understock",
+    "warehouse", "warehouses", "depot",
+    "brand", "brands", "category", "categories", "subcategory", "subcategories",
+    "department", "departments", "season", "seasons",
+    "hierarchy", "catalog", "catalogue", "assortment",
+    "payment", "payments", "cash", "upi", "card",
+    "region", "regions", "store", "stores", "channel", "channels",
+    "discount", "discounts", "gst", "tax",
+    "profit", "margin", "margins", "loss",
+    "ratio", "valuation",
 })
 
 METRIC_WORDS = frozenset({
     "total", "sum", "count", "average", "avg", "mean", "aov",
     "metric", "metrics", "performance", "summary", "stats", "statistics",
-    "amount", "amt", "value",
+    "amount", "amt", "value", "ratio", "rate", "share",
 })
 
 TREND_WORDS = frozenset({
@@ -3570,15 +3673,17 @@ def classify_query_kind(
         if pat.search(lower):
             return _decide("chat", 0.9, f"chat_pattern:{pat.pattern[:32]}")
 
-    # 3. KNOWLEDGE wins for genuine definitional / advice queries. The
-    #    regex's own lookaheads already exclude data-lookup phrasings
-    #    ("explain my X", "tell me about my/last/this X"), so any match
-    #    here is a real knowledge intent — even when domain words appear
-    #    ("explain net revenue", "tell me about customer retention").
-    if has_knowledge:
+    # 3. KNOWLEDGE wins for genuine definitional / advice queries — but
+    #    ONLY when the analytics signal is weak. If domain words push
+    #    a_score above the threshold, the question is about the user's
+    #    data even if it uses "what is" phrasing (e.g. "What is the
+    #    inventory turnover ratio?" — wants a number, not a definition).
+    #    A possessive ("my", "our") is also a hard tell for data lookup.
+    #    This matches the documented design rule (see docstring rule 3).
+    if has_knowledge and a_score < ANALYTICS_THRESHOLD and not has_possessive:
         return _decide(
             "general_knowledge", 0.92,
-            "knowledge phrasing (regex match after data-lookup filter)",
+            "knowledge phrasing (regex match, weak analytics signal)",
         )
 
     # 4. MISSING_DATA wins whenever an out-of-scope dimension is explicitly
@@ -4848,6 +4953,82 @@ def _project_forecast(series: list[dict]) -> list[dict]:
 # 2.1 Loop prompt + capability tool schemas
 # ---------------------------------------------------------------------------
 
+# Topic → column-substring buckets used to derive dynamic routing hints
+# from the actual workbook the user uploaded. Self-correcting on every new
+# upload — no need to hand-edit AGENTIC_LOOP_SYSTEM every time a column
+# name changes.
+_ROUTING_SIGNALS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("customer / party",
+     "who bought what, top customers, repeat buyers",
+     ("party", "customer", "buyer", "client")),
+    ("transaction type / payment",
+     "credit/debit, cash, UPI, payment mode/status",
+     ("transaction_type", "payment_type", "payment_mode", "payment_status")),
+    ("inventory / stock / warehouse",
+     "stock levels, low/dead/overstock, supplier, warehouse",
+     ("stock_qty", "stock", "warehouse", "supplier", "inventory_status")),
+    ("product hierarchy / catalog",
+     "brand, category, sub-category, department, season",
+     ("brand", "category", "subcategory", "department", "user_group",
+      "launch_season", "product_category")),
+    ("geography / region / store",
+     "region/state/city/store, sales channel",
+     ("region", "state", "city", "store", "sales_channel")),
+    ("date / time",
+     "any date- or time-of-day breakdown",
+     ("date", "hour", "time", "_at")),
+    ("monetary amounts",
+     "totals, gross/net sales, discount, gst, prices",
+     ("amount", "sales", "revenue", "gross", "net_sales", "price",
+      "value", "gst", "discount", "loyalty")),
+)
+
+
+def _dynamic_routing_hints(
+    dyn_tables: list[dict[str, Any]],
+) -> list[str]:
+    """Group dynamic tables by topical signal so the LLM picks the right
+    table on the first try. Hints are built from the *actual* columns
+    present, replacing the static `Picking the right capability` examples
+    that went stale whenever the user uploaded a workbook with different
+    sheet names.
+
+    Returns one human-readable line per signal that has at least one
+    matching table — e.g.
+        "questions about customer / party → u_sale_report, u_item_details".
+    """
+    hints: list[str] = []
+    for signal, phrase, needles in _ROUTING_SIGNALS:
+        matching: list[str] = []
+        for t in dyn_tables:
+            col_names = [str(c.get("name", "")).lower()
+                         for c in t.get("columns", [])]
+            if any(n in c for n in needles for c in col_names):
+                matching.append(t["table"])
+        if matching:
+            hints.append(
+                f"questions about {signal} ({phrase}) "
+                f"→ {', '.join(matching)}"
+            )
+    return hints
+
+
+def _columns_index_for_dynamic(
+    dyn_tables: list[dict[str, Any]],
+) -> dict[str, list[str]]:
+    """Reverse index: column name (lowercased) → list of u_* tables that
+    contain it. Used to enrich `no such column: X` errors with a usable
+    'X exists in tables: Y, Z' hint."""
+    idx: dict[str, list[str]] = {}
+    for t in dyn_tables:
+        for c in t.get("columns", []):
+            name = str(c.get("name", "")).lower()
+            if not name:
+                continue
+            idx.setdefault(name, []).append(t["table"])
+    return idx
+
+
 def _schema_summary_text() -> str:
     """Compact dataset description injected into the loop's system prompt.
 
@@ -4855,6 +5036,10 @@ def _schema_summary_text() -> str:
     the user has uploaded (one per sheet of their workbook). The LLM uses
     run_data_query for the legacy tables and query_user_table for the u_*
     tables.
+
+    Each dynamic column is annotated with its SQL type (`int`, `real`,
+    `text`) so the LLM doesn't try to SUM a text column or compare a date
+    using the wrong operator.
     """
     parts: list[str] = []
     try:
@@ -4875,18 +5060,28 @@ def _schema_summary_text() -> str:
         )
 
     # Dynamic tables — added inline so the LLM can write raw SELECTs against
-    # them via the query_user_table capability. Compact format: column names
-    # only, no types (LLM infers from the data and we're on a TPM budget).
+    # them via the query_user_table capability. Columns now include their
+    # SQL type so the LLM picks the right operators and aggregations.
     try:
         from app.dynamic_ingest import list_dynamic_tables
         dyn_tables = list_dynamic_tables()
         if dyn_tables:
             dyn_lines = ["User-uploaded tables (use query_user_table for these):"]
             for t in dyn_tables:
-                cols = ", ".join(c["name"] for c in t.get("columns", []))
+                cols = ", ".join(
+                    f"{c['name']}({(c.get('type') or 'TEXT')[:4].lower()})"
+                    for c in t.get("columns", [])
+                )
                 dyn_lines.append(
                     f'  - {t["table"]} ({t["row_count"]} rows): {cols}'
                 )
+            hints = _dynamic_routing_hints(dyn_tables)
+            if hints:
+                dyn_lines.append("")
+                dyn_lines.append(
+                    "Routing hints (derived from the actual columns in YOUR workbook):"
+                )
+                dyn_lines.extend(f"  - {h}" for h in hints)
             parts.append("\n".join(dyn_lines))
     except Exception:
         pass
@@ -4926,15 +5121,19 @@ Available capabilities (call them as tools):
   - google_drive: access the user's Google Drive (action='list' /
     'ingest'). Use only if the user asks to pull from Drive.
 
-Picking the right capability:
-  - "low stock", "overstocked", "inventory turnover", "dead stock" →
-      query_user_table on u_inventory_master.
-  - "top brand", "best category", "subcategory growth", "product hierarchy"
-      → query_user_table on u_product_hierarchy or u_sales_transactions.
-  - "transactions by region/state/store", "payment method", "peak hours"
-      → query_user_table on u_sales_transactions.
-  - "Sales last month / total / by Party" on the legacy data →
-      run_data_query (sales_summary, product_performance, etc.)
+Picking the right table:
+  - For ANY question about user-uploaded data, use query_user_table and
+    pick the table whose columns actually contain the signal asked for.
+    The Dataset schema above lists every column of every u_* table — read
+    it before writing SQL. The 'Routing hints' line at the bottom of the
+    schema groups tables by topic (customer, inventory, payment, geography,
+    etc.) based on the columns actually present in this user's workbook.
+  - "Sales last month / total / by Party" on the LEGACY sales/purchase
+    tables → run_data_query (sales_summary, product_performance, etc.).
+  - Never assume a column exists because it was in a previous workbook —
+    different uploads have different columns. If the schema says a column
+    is in u_sale_report, it is NOT in u_sales_transactions (and vice
+    versa).
 
 CRITICAL — always produce a chart:
   - run_data_query already builds a chart for sales aggregates.
@@ -5059,7 +5258,10 @@ class AgenticLoop:
                 "  - chart_kind: 'ranking' for top-N lists, 'trend' for time-series, 'summary' for totals\n"
                 "  - chart_x_column: the exact SELECT alias of the label/name column (e.g. 'product', 'region')\n"
                 "  - chart_y_column: the exact SELECT alias of the numeric value column (e.g. 'total_sales', 'quantity')\n"
-                "Charts are REQUIRED for every answer — always populate these three fields.\n\n"
+                "  - chart_y_label: what the Y-axis MEASURES — pick 'sales' for rupee amounts (default), "
+                "'count' for COUNT(*) of customers/transactions, 'quantity' for stock_qty/units, "
+                "'percent' for rates/ratios. Wrong label = chart shows ₹40 next to 'Cash Sale'.\n"
+                "Charts are REQUIRED for every answer — always populate these four fields.\n\n"
             )
         else:
             tools = _capability_tool_schemas()
@@ -5085,6 +5287,31 @@ class AgenticLoop:
                 check_cost(state)
             except CostGuardError as e:
                 _loop_agent_log.info("cost guard hit: %s — forcing final answer", e)
+                # Cost-cap fires when the LLM burned its budget without
+                # producing a usable answer (often a wrong-table retry
+                # loop). Track it as user_facing so the operator can spot
+                # which questions blow the budget repeatedly.
+                try:
+                    from app.errors import log_error
+                    log_error(
+                        message=f"cost guard ceiling reached: {e}",
+                        module="ai",
+                        severity="medium",
+                        user_facing=True,
+                        source="AgenticLoop.cost_guard",
+                        suggested_fix=(
+                            "Inspect tool_calls in turn_id %s; usually a wrong-table or "
+                            "syntax-error retry loop." % state.turn_id
+                        ),
+                        context={
+                            "turn_id":   state.turn_id,
+                            "question":  state.question,
+                            "iteration": state.iteration,
+                            "tool_count": len(state.tool_calls or []),
+                        },
+                    )
+                except Exception:
+                    _loop_agent_log.debug("log_error capture failed", exc_info=True)
                 return await self._force_final(state, emit, messages, groq)
 
             # Tool-call cap: prevent context overflow on small-context models
@@ -5108,6 +5335,27 @@ class AgenticLoop:
             if resp.error:
                 msg = f"LLM orchestration failed: {resp.error_kind}: {resp.error}"
                 _loop_agent_log.warning(msg)
+                # Persist into error_log so /errors surfaces it and we have
+                # a record of LLM-side failures (the global FastAPI handler
+                # only sees unhandled exceptions, which this isn't).
+                try:
+                    from app.errors import log_error
+                    log_error(
+                        message=msg,
+                        module="ai",
+                        severity="high",
+                        source="AgenticLoop.run",
+                        context={
+                            "turn_id":      state.turn_id,
+                            "question":     state.question,
+                            "iteration":    state.iteration,
+                            "error_kind":   resp.error_kind,
+                            "tokens_in":    state.tokens_in,
+                            "tokens_out":   state.tokens_out,
+                        },
+                    )
+                except Exception:
+                    _loop_agent_log.debug("log_error capture failed", exc_info=True)
                 return state.append_error(msg)
 
             if not resp.tool_calls:

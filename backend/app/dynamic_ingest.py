@@ -391,6 +391,11 @@ def reconcile_registry() -> dict[str, int]:
                     for r in upload_rows
                 }
             except Exception:
+                log.warning(
+                    "reconcile_registry: uploads table read failed; "
+                    "recovered tables will lack source-file metadata",
+                    exc_info=True,
+                )
                 uploads_by_batch = {}
 
             for table in sorted(missing):
@@ -409,6 +414,10 @@ def reconcile_registry() -> dict[str, int]:
                             f'SELECT COUNT(*) FROM "{table}"'
                         ).fetchone()[0]
                     except Exception:
+                        log.warning(
+                            "reconcile_registry: COUNT failed for %r; "
+                            "registering with row_count=0", table, exc_info=True,
+                        )
                         row_count = 0
 
                     source_file = "(recovered)"
@@ -423,7 +432,11 @@ def reconcile_registry() -> dict[str, int]:
                             if u_at:
                                 uploaded_at = u_at
                     except Exception:
-                        pass
+                        log.debug(
+                            "reconcile_registry: _batch_id lookup failed for %r; "
+                            "leaving source_file as '(recovered)'",
+                            table, exc_info=True,
+                        )
 
                     sheet_name = (
                         table[2:].replace("_", " ").title()

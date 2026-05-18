@@ -36,7 +36,14 @@ import {
   Upload,
 } from 'lucide-react'
 
-import { cn, fetchUploadsList, useAppStore } from '@/client_core'
+import {
+  cn,
+  clearAuth,
+  fetchUploadsList,
+  loginWith,
+  probeAuthEnabled,
+  useAppStore,
+} from '@/client_core'
 import type { NavKey } from '@/client_core'
 import { AiAssistant, Dashboard, ShopInfo, UploadData } from '@/ui_system'
 
@@ -264,8 +271,105 @@ class ErrorBoundary extends React.Component<
 // re-introduce LoginGate by reading from the backend's POST /auth/login
 // endpoint, which the backend still exposes.
 
+// ===========================================================================
+// LoginGate — only renders when the backend reports AUTH_ENABLED=true
+// AND we have no token in the store. In the default (AUTH_ENABLED=false)
+// configuration the gate is invisible and the app loads straight to the
+// dashboard, matching today's behaviour. Phase-3 wiring; the actual
+// credentials live in ADMIN_USERNAME / ADMIN_PASSWORD env vars.
+// ===========================================================================
+function LoginGate({ onSuccess }: { onSuccess: () => void }) {
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!username || !password) {
+      setError('Username and password are both required.')
+      return
+    }
+    setSubmitting(true)
+    setError(null)
+    try {
+      await loginWith(username, password)
+      onSuccess()
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Login failed'
+      setError(msg)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="h-screen w-screen flex items-center justify-center bg-zinc-950 text-zinc-100">
+      <form
+        onSubmit={submit}
+        className="w-full max-w-sm rounded-2xl bg-zinc-900/70 border border-zinc-800 p-6 space-y-4"
+      >
+        <div className="flex items-center gap-2">
+          <div className="w-7 h-7 rounded-md bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
+            <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+          </div>
+          <div>
+            <div className="font-semibold tracking-tight">Agentic AI</div>
+            <div className="text-[11px] text-zinc-500">Sign in to continue</div>
+          </div>
+        </div>
+        <div className="space-y-2">
+          <label className="block text-xs text-zinc-400">Username</label>
+          <input
+            type="text"
+            autoFocus
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            className="w-full px-3 py-2 rounded-md bg-zinc-950 border border-zinc-800 text-sm text-zinc-100 focus:outline-none focus:border-emerald-500"
+            disabled={submitting}
+          />
+        </div>
+        <div className="space-y-2">
+          <label className="block text-xs text-zinc-400">Password</label>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            className="w-full px-3 py-2 rounded-md bg-zinc-950 border border-zinc-800 text-sm text-zinc-100 focus:outline-none focus:border-emerald-500"
+            disabled={submitting}
+          />
+        </div>
+        {error && (
+          <div className="text-[11px] text-red-300 bg-red-500/10 border border-red-500/30 rounded-md px-2 py-1.5">
+            {error}
+          </div>
+        )}
+        <button
+          type="submit"
+          disabled={submitting}
+          className="w-full py-2 rounded-md bg-emerald-500/80 hover:bg-emerald-500 text-zinc-950 text-sm font-medium disabled:opacity-50"
+        >
+          {submitting ? 'Signing in…' : 'Sign in'}
+        </button>
+      </form>
+    </div>
+  )
+}
+
+
 export default function App() {
   const [view, setView] = useState<NavKey>('dashboard')
+  const authToken = useAppStore((s) => s.auth.token)
+  const authEnabled = useAppStore((s) => s.auth.authEnabled)
+  // Bump this to force a re-probe of /health (e.g. after login).
+  const [authProbe, setAuthProbe] = useState(0)
+
+  // Probe /health on boot to discover whether AUTH_ENABLED=true. Result
+  // lives in store.auth.authEnabled — the gate below renders only when
+  // we've confirmed it's true AND there's no token yet.
+  useEffect(() => {
+    void probeAuthEnabled()
+  }, [authProbe])
 
   // On every mount, ask the backend which datasets are active and reconcile
   // Zustand so the TopBar always shows the right file name — even after the
@@ -290,12 +394,19 @@ export default function App() {
         }
       })
       .catch(() => { /* backend not ready yet — keep whatever localStorage has */ })
-  }, [])
+  }, [authToken])
 
-  // ``onLogout`` is kept for the Sidebar API but is now a soft refresh —
-  // there's no gate to send the user back to. The module-level cleanup
-  // above already removes any stale ``agentic-ai:gate`` flag.
+  // Gate the app on a real backend login when AUTH_ENABLED=true.
+  // The boolean stays null until probeAuthEnabled resolves; treat null
+  // as "not yet enabled" so we don't flash the LoginGate on every boot.
+  if (authEnabled === true && !authToken) {
+    return <LoginGate onSuccess={() => setAuthProbe((n) => n + 1)} />
+  }
+
   const onLogout = () => {
+    clearAuth()
+    // Force the auth probe + uploads fetch to re-run after the token is gone.
+    setAuthProbe((n) => n + 1)
     window.location.reload()
   }
 

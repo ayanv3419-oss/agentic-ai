@@ -13,8 +13,10 @@ import asyncio
 import collections
 import logging
 import os
+import sys
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -281,11 +283,13 @@ async def auth_login(req: LoginRequest, request: Request) -> dict:
             ),
         )
 
-    # Username is case-insensitive; password is exact.
-    if (
-        username.lower() != _APP_LOGIN_USER.lower()
-        or password != _APP_LOGIN_PASSWORD
-    ):
+    # Phase 3: real credential check + HMAC-signed token. When
+    # ADMIN_USERNAME / ADMIN_PASSWORD are unset, check_admin_credentials
+    # falls back to the legacy APP_LOGIN_USER / APP_LOGIN_PASSWORD pair
+    # so existing dev environments keep working without env edits.
+    from app.auth import check_admin_credentials, mint_token
+
+    if not check_admin_credentials(username, password):
         log.info("auth/login: rejected attempt for user=%r", username[:40])
         return JSONResponse(
             status_code=401,
@@ -296,16 +300,20 @@ async def auth_login(req: LoginRequest, request: Request) -> dict:
             ),
         )
 
-    # Mint a short opaque token. Not enforced server-side today; the
-    # frontend may store it and echo it back as Authorization for future
-    # multi-tenant work.
-    token = uuid4().hex
+    # Mint a self-contained HMAC-signed token. Validates standalone via
+    # AUTH_TOKEN_SECRET — no server-side session store. Frontend sends it
+    # back as `Authorization: Bearer ...` on every subsequent request,
+    # and the auth middleware enforces when AUTH_ENABLED=true.
+    canonical_username = settings.admin_username or _APP_LOGIN_USER
+    token = mint_token(canonical_username)
     log.info("auth/login: success for user=%r", username[:40])
     return {
         "ok": True,
         "authenticated": True,
-        "username": _APP_LOGIN_USER,
+        "username": canonical_username,
         "token": token,
+        "token_ttl_hours": settings.auth_token_ttl_hours,
+        "auth_enabled": settings.auth_enabled,
     }
 
 
@@ -924,6 +932,10 @@ async def health() -> dict:
         "sales_rows": await count_rows("sales"),
         "purchase_rows": await count_rows("purchase"),
         "sentry": sentry_status(),
+        # Frontend reads this on boot to decide whether to render the
+        # LoginGate. Public field — only the boolean leaks, never the
+        # credentials or the signing secret.
+        "auth_enabled": settings.auth_enabled,
     }
 
 
@@ -2100,6 +2112,16 @@ async def query_stream(req: QueryRequest, request: Request):
 # ===========================================================================
 
 def configure_logging(level: int = logging.INFO) -> None:
+    # Force UTF-8 on the underlying streams so unicode in log messages
+    # (e.g. the `→` arrow used by dynamic_ingest) renders cleanly on
+    # Windows consoles instead of leaking as escaped `→`.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -2113,6 +2135,18 @@ _app_log = logging.getLogger("agentic_ai")
 
 init_sentry()
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Names resolved at call time: _startup / _shutdown are defined later
+    # in this module, after the routes and exception handlers they touch.
+    await _startup()
+    try:
+        yield
+    finally:
+        await _shutdown()
+
+
 app = FastAPI(
     title="Agentic AI",
     description=(
@@ -2120,6 +2154,7 @@ app = FastAPI(
         "the default; set FORCE_V1=1 to pin back to v1."
     ),
     version="4.0.0-v2",
+    lifespan=lifespan,
 )
 
 _raw_origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
@@ -2134,6 +2169,54 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+
+# Public routes that must NEVER require auth — load-balancer health probe,
+# the login endpoint itself, the session probe, and the FastAPI/MCP
+# discovery surface. Everything else is gated when AUTH_ENABLED=true.
+_AUTH_PUBLIC_PREFIXES = (
+    "/health",
+    "/auth/login",
+    "/auth/me",
+    "/auth/google/login",
+    "/auth/google/callback",
+    "/docs",
+    "/openapi.json",
+    "/redoc",
+    "/mcp",            # MCP sub-app has its own session handshake
+)
+
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    """Single touch-point for Bearer-token enforcement. Disabled when
+    AUTH_ENABLED=false (the historical single-user MVP mode) so a
+    missing env var on Render does not brick the deploy.
+    """
+    if not settings.auth_enabled:
+        return await call_next(request)
+    # CORS preflight must always pass — the browser fires OPTIONS before
+    # any Authorization header is reachable.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    path = request.url.path or "/"
+    if any(path == p or path.startswith(p + "/") or path == p for p in _AUTH_PUBLIC_PREFIXES):
+        return await call_next(request)
+    # Defer the actual check to the helper so the logic stays in one place.
+    from app.auth import verify_token
+    hdr = request.headers.get("Authorization") or ""
+    token = hdr[7:].strip() if hdr.lower().startswith("bearer ") else ""
+    if not token or verify_token(token) is None:
+        return JSONResponse(
+            status_code=401,
+            content=envelope(
+                "Unauthorized",
+                detail="Missing or invalid Bearer token",
+                kind="auth",
+            ),
+            headers={"WWW-Authenticate": 'Bearer realm="agentic-ai"'},
+        )
+    return await call_next(request)
 
 app.include_router(api_router)
 
@@ -2231,7 +2314,6 @@ def _module_for_path(path: str) -> str:
     return "system"
 
 
-@app.on_event("startup")
 async def _startup() -> None:
     from app.infrastructure import init_database, list_uploads_meta, load_synonyms
     from app.vector import register_vocabulary
@@ -2378,7 +2460,6 @@ async def _startup() -> None:
             _app_log.exception("FastMCP /mcp lifespan failed to start (continuing)")
 
 
-@app.on_event("shutdown")
 async def _shutdown() -> None:
     global _mcp_lifespan_cm
     if _mcp_lifespan_cm is not None:
