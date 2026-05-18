@@ -1,16 +1,19 @@
-"""Agentic AI — entry shim.
+"""MetricAi backend - entry shim.
 
 Run from the project root:
     python backend/main.py
 or:
     uvicorn backend.app.core_system:app --port 8000 --reload
 
-Architecture (3 modules under app/):
-    infrastructure.py     — settings, schema, SQLite + JSON cache + memory
-    analytics_engine.py   — TurnState + 14 tools + registry + Groq + SSE +
-                            cost guard, coordinator + 7 sub-agents
-    core_system.py        — FastAPI app, every HTTP route, auth, middleware,
-                            exception handlers, startup hook
+Architecture:
+    infrastructure.py - settings, schema, SQLite + JSON cache + memory
+    coordinator/      - immutable TurnState, Coordinator loop, 8 tools,
+                        3 sub-agents (sqlWriter/rcaReasoner/insightFmt),
+                        SSE emitter, local LLM client (Ollama + Qwen 3)
+    agents.py         - deterministic UI agents (DashboardAgent,
+                        DataCleanAgent) - no LLM
+    core_system.py    - FastAPI app, every HTTP route, middleware,
+                        exception handlers, startup hook
 """
 from __future__ import annotations
 

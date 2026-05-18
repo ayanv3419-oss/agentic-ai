@@ -8,6 +8,8 @@ python-multipart>=0.0.9
 aiosqlite>=0.20.0
 openpyxl>=3.1.0
 itsdangerous>=2.2.0
+# --- Local LLM client (OpenAI-compatible, pointed at Ollama) ---
+openai>=1.51.0
 # --- Analytics acceleration (DuckDB) ---
 duckdb>=1.0.0
 # --- Vector / semantic retrieval (in-process; pgvector/Qdrant adapters

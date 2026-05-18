@@ -55,10 +55,17 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # --- Groq -----------------------------------------------------------
-    groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
-    groq_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_MODEL")
-    groq_base_url: str = Field(default="https://api.groq.com/openai/v1", alias="GROQ_BASE_URL")
+    # --- Local LLM (Ollama + Qwen 3) -----------------------------------
+    # The Coordinator talks to a LOCAL model through Ollama's OpenAI-
+    # compatible endpoint. There is intentionally no cloud fallback - if
+    # Ollama is unreachable the backend fails loudly at startup.
+    llm_base_url: str = Field(
+        default="http://localhost:11434/v1", alias="LLM_BASE_URL"
+    )
+    llm_api_key: str = Field(default="ollama", alias="LLM_API_KEY")
+    llm_model: str = Field(default="qwen3:8b", alias="LLM_MODEL")
+    llm_temperature: float = Field(default=0.0, alias="LLM_TEMPERATURE")
+    llm_max_tokens: int = Field(default=900, alias="LLM_MAX_TOKENS")
 
     # --- Cost / safety budgets ------------------------------------------
     max_loop_iterations: int = Field(default=8, alias="MAX_LOOP_ITERATIONS")

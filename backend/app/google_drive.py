@@ -267,7 +267,7 @@ async def ingest_drive_files(
     refresh once if anything landed. Returns one result dict per file.
     """
     # Local imports avoid an import cycle: core_system imports this module.
-    from app.analytics_engine import DataCleanAgent
+    from app.agents import DataCleanAgent
     from app.core_system import _post_ingest_refresh
     from app.infrastructure import UploadError, count_rows, get_connection
     from app.dedup import compute_file_hash

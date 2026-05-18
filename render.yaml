@@ -1,12 +1,12 @@
 services:
   - type: web
-    name: agentic-ai-backend
+    name: agentic-ai
     runtime: python
-    region: oregon
+    region: virginia
     plan: free
-    rootDir: .
-    buildCommand: pip install -r backend/requirements.txt
-    startCommand: uvicorn backend.app.core_system:app --host 0.0.0.0 --port $PORT
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
 
     disk:
@@ -24,13 +24,9 @@ services:
       - key: ALLOWED_ORIGINS
         value: "*"
         # After Vercel deploys, change this to your Vercel URL, e.g.:
-        # value: https://agentic-ai.vercel.app
-      # Where the Google OAuth callback bounces the browser back to once
-      # the user grants Drive access. NOT a secret — just a URL, safe in
-      # git. Without this the callback fell back to localhost:5173 and the
-      # production user landed on a "site can't be reached" page.
+        # value: https://agentic-ai-livid-eta.vercel.app
       - key: FRONTEND_URL
-        value: https://agentic-ai-ayanv3419-oss-projects.vercel.app
+        value: https://agentic-ai-livid-eta.vercel.app
       # --- Auth (Phase 3) -------------------------------------------
       # Default off so a misconfigured deploy doesn't brick — flip to
       # "true" in the Render dashboard once ADMIN_USERNAME + PASSWORD
@@ -43,8 +39,20 @@ services:
         sync: false   # set in Render dashboard (required when AUTH_ENABLED=true)
       - key: AUTH_TOKEN_SECRET
         sync: false   # set in Render dashboard (required when AUTH_ENABLED=true)
-      - key: GROQ_API_KEY
-        sync: false   # set manually in Render dashboard (optional server-side key)
+      # --- LLM (Groq — OpenAI-compatible cloud API) ------------------
+      # The Coordinator uses any OpenAI-compatible endpoint.
+      # Groq is the recommended cloud provider: fast, generous free tier.
+      # Get a key at https://console.groq.com/keys
+      - key: LLM_BASE_URL
+        value: "https://api.groq.com/openai/v1"
+      - key: LLM_API_KEY
+        sync: false   # set in Render dashboard — your Groq API key (gsk_...)
+      - key: LLM_MODEL
+        value: "llama-3.3-70b-versatile"
+      - key: LLM_TEMPERATURE
+        value: "0.0"
+      - key: LLM_MAX_TOKENS
+        value: "2048"
       - key: SENTRY_DSN
         sync: false   # set in Render dashboard if you use Sentry
       # Google Drive OAuth — secrets only in the Render dashboard, never

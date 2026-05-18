@@ -29,18 +29,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.analytics_engine import (
-    DashboardAgent,
-    DataCleanAgent,
+from app.agents import DashboardAgent, DataCleanAgent
+from app.coordinator import (
     EventEmitter,
-    GroqClient,
+    PresentationEmitter as _CoordinatorPresentation,
     TurnState,
     format_sse,
-    get_registry,
-    reset_request_groq,
     run_query_turn,
-    set_request_groq,
 )
+from app.coordinator.llm import check_llm_health
 from app.dynamic_ingest import (
     drop_all_dynamic_tables,
     ingest_workbook,
@@ -128,11 +125,9 @@ from app.monitoring import (
     set_request_context,
 )
 
-# v2 orchestrator — gated by ORCHESTRATOR_VERSION env / X-Orchestrator-Version
-# header. Imports are unconditional; the package loads cleanly even when v1 is
-# the only path actually exercised at runtime.
-from app.orchestrator_v2 import run_query_turn_v2
-from app.orchestrator_v2.state import RequestContext as V2RequestContext
+# Single Coordinator orchestration - no v1/v2 dual path. The previous
+# Groq-backed analytics_engine and orchestrator_v2 packages have been
+# removed; everything routes through app.coordinator.
 
 
 log = logging.getLogger("agentic_ai.api")
@@ -917,11 +912,9 @@ async def errors_report(req: FrontendErrorReport):
 
 @api_router.get("/health")
 async def health() -> dict:
+    llm_ok, llm_msg = await check_llm_health()
     return {
         "status": "ok",
-        # Pull from the FastAPI app so a version bump in one place
-        # (the FastAPI(...) constructor) propagates here automatically
-        # instead of drifting like the previous hardcoded string did.
         "version": app.version,
         "data_version": get_data_version(),
         "cache": {
@@ -932,9 +925,12 @@ async def health() -> dict:
         "sales_rows": await count_rows("sales"),
         "purchase_rows": await count_rows("purchase"),
         "sentry": sentry_status(),
-        # Frontend reads this on boot to decide whether to render the
-        # LoginGate. Public field — only the boolean leaks, never the
-        # credentials or the signing secret.
+        "llm": {
+            "ok": llm_ok,
+            "detail": llm_msg,
+            "model": settings.llm_model,
+            "base_url": settings.llm_base_url,
+        },
         "auth_enabled": settings.auth_enabled,
     }
 
@@ -1699,24 +1695,7 @@ class QueryRequest(BaseModel):
 HEARTBEAT_SECONDS = 15.0
 
 
-def _resolve_groq_key(request: Request) -> str:
-    header_key = (request.headers.get("X-Groq-Api-Key") or "").strip()
-    return header_key or settings.groq_api_key.strip()
-
-
-def _validate_pre_stream(req: QueryRequest, api_key: str) -> dict[str, Any] | None:
-    if not api_key:
-        return envelope(
-            "Missing Groq API key",
-            detail="Set `GROQ_API_KEY` in backend/.env or send `X-Groq-Api-Key` header.",
-            kind="auth",
-        )
-    if any(c.isspace() for c in api_key):
-        return envelope("Invalid Groq API key format",
-                        detail="Key must not contain whitespace.", kind="auth")
-    if len(api_key) < 20:
-        return envelope("Invalid Groq API key format",
-                        detail="Key looks too short (expected 20+ chars).", kind="auth")
+def _validate_pre_stream(req: QueryRequest) -> dict[str, Any] | None:
     if not req.question.strip():
         return envelope("Empty question",
                         detail="Question must contain non-whitespace.", kind="validation")
@@ -1734,234 +1713,18 @@ def _safe_create_task(coro):
         return None
 
 
-# Internal event names that MUST NOT reach the user-facing SSE stream.
-# Dropped silently by PresentationEmitter; the originals stay in the
-# backend logs and Sentry breadcrumbs for debugging.
-#
-# Note: `loop.iteration` (emitted by the AgenticLoop each time the LLM picks
-# a capability) is intentionally NOT hidden — it carries the loop's
-# decision/reasoning for the frontend to surface, and its payload (iteration,
-# capability, args, reasoning) contains no internal-only fields.
-_HIDDEN_INTERNAL_EVENTS = {
-    "tool.start",            # internal pipeline step names
-    "tool.end",
-    "kpi.matched",           # leaks kpi_id + matched_alias internals
-    "mode.selected",         # internal mode classifier
-    "query.kind",            # internal kind classifier output
-}
-
-# Fields stripped from any event payload before it streams to the user.
-_HIDDEN_PAYLOAD_FIELDS = frozenset({
-    "formula", "formula_expression", "sql_used", "sql",
-    "required_columns", "missing_columns",
-    "kpi_id", "matched_alias", "stack_trace",
-    "computed_at", "request_payload", "_internal",
-})
+# PresentationEmitter (event scrubbing + hidden-event filtering) now
+# lives in app.coordinator.emitter and is wrapped around every emitter
+# automatically by the runner.
 
 
-def _scrub_payload(data):
-    """Recursively strip forbidden keys from a payload before emit.
-    Never raises — falls through to original data on any error."""
+async def _runner(initial: TurnState, emitter: EventEmitter) -> None:
+    """Single-Coordinator turn runner. PresentationEmitter sanitises
+    every event before it hits the wire."""
+    user_emitter = _CoordinatorPresentation(emitter)
     try:
-        if isinstance(data, dict):
-            return {
-                k: _scrub_payload(v)
-                for k, v in data.items()
-                if k not in _HIDDEN_PAYLOAD_FIELDS
-            }
-        if isinstance(data, list):
-            return [_scrub_payload(item) for item in data]
-        return data
+        await run_query_turn(initial, user_emitter.emit)
     except Exception:
-        return data
-
-
-class PresentationEmitter:
-    """Wraps the real EventEmitter to enforce the user-facing presentation
-    contract:
-
-      1. Internal event names (tool.start, tool.end, kpi.matched, etc.)
-         are silently dropped.
-      2. Any event payload has its `formula` / `sql_used` / `required_columns`
-         / `stack_trace` / `_internal` fields stripped recursively.
-      3. Heartbeats, comments, and `close()` pass through unchanged.
-
-    The wrapper is applied at the SSE-runner boundary, so EVERY code path
-    that emits through it (KPI fast-path, 14-tool fallback, chat, error
-    handlers) gets the same sanitization for free.
-    """
-
-    def __init__(self, inner: EventEmitter):
-        self._inner = inner
-
-    async def emit(self, event: str, data):
-        if event in _HIDDEN_INTERNAL_EVENTS:
-            return
-        await self._inner.emit(event, _scrub_payload(data))
-
-    async def comment(self, text: str):
-        await self._inner.comment(text)
-
-    async def close(self):
-        await self._inner.close()
-
-    def stream(self):
-        return self._inner.stream()
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator version resolution (v1 / v2)
-# ---------------------------------------------------------------------------
-# v2 is the reflective Worker/Critic/Validator pipeline under
-# ``app.orchestrator_v2``. During the parallel-flag rollout (plan Q1), v1
-# stays the default and v2 is opt-in per-deployment or per-request.
-
-_VALID_ORCHESTRATOR_VERSIONS = {"v1", "v2"}
-
-
-def _resolve_orchestrator_version(request: Request) -> str:
-    """
-    Pick which orchestrator handles this turn.
-
-    Resolution order (later items override earlier ones):
-      1. Default: ``"v2"`` (post-P8 flip).
-      2. ``ORCHESTRATOR_VERSION`` environment variable.
-      3. ``FORCE_V1`` env var truthy → pins to v1 (emergency rollback).
-      4. ``X-Orchestrator-Version`` request header (per-request override).
-
-    Unknown values are ignored and the lower-precedence value is kept.
-    The ``FORCE_V1`` lever exists so a deployment can pin back to v1
-    without a code change if v2 misbehaves in production.
-    """
-    chosen = "v2"   # P8: default flipped from v1 → v2.
-
-    env_val = (os.environ.get("ORCHESTRATOR_VERSION") or "").strip().lower()
-    if env_val in _VALID_ORCHESTRATOR_VERSIONS:
-        chosen = env_val
-    elif env_val:
-        log.warning("unknown ORCHESTRATOR_VERSION env=%r — keeping %s", env_val, chosen)
-
-    if (os.environ.get("FORCE_V1") or "").strip().lower() in ("1", "true", "yes"):
-        chosen = "v1"
-
-    header_val = (request.headers.get("X-Orchestrator-Version") or "").strip().lower()
-    if header_val in _VALID_ORCHESTRATOR_VERSIONS:
-        chosen = header_val
-    elif header_val:
-        log.warning("unknown X-Orchestrator-Version=%r — keeping %s", header_val, chosen)
-
-    return chosen
-
-
-def _shadow_v2_enabled(request: Request) -> bool:
-    """
-    Shadow mode: when on, every v1 request also runs v2 in parallel
-    (silently) so we can quantify v2's divergence pre-flag-flip.
-    Controlled by ``SHADOW_V2`` env or ``X-Shadow-V2`` header. Off by
-    default. Mutually exclusive with the user actually opting into v2
-    (then there's no v1 to shadow against).
-    """
-    if (request.headers.get("X-Shadow-V2") or "").strip().lower() in ("1", "true", "yes"):
-        return True
-    return (os.environ.get("SHADOW_V2") or "").strip().lower() in ("1", "true", "yes")
-
-
-async def _runner_v2_shadow(
-    ctx: V2RequestContext,
-    v1_question: str,
-) -> None:
-    """
-    Background-task runner for shadow mode. Runs v2 against a silent
-    emitter, computes a diff against the (already-streamed-to-user) v1
-    answer, and writes one row to ``v2_shadow_log``. Never raises.
-    """
-    import time as _time
-
-    from app.orchestrator_v2.monitoring.shadow import (
-        SilentEventEmitter,
-        compute_diff,
-        record_shadow_run,
-    )
-    from app.orchestrator_v2 import run_query_turn_v2
-
-    started = _time.perf_counter()
-    silent = SilentEventEmitter()
-    final_state = None
-    try:
-        final_state = await run_query_turn_v2(ctx, silent)
-    except Exception:
-        log.exception("shadow runner crashed")
-    duration_v2_ms = (_time.perf_counter() - started) * 1000.0
-
-    v2_final = silent.final_event() or {}
-    v2_answer = v2_final.get("answer")
-    v2_mode = v2_final.get("mode") or "v2"
-
-    # We don't have v1's answer here — it streamed to the user. The diff
-    # job below records v2-side only; an offline join (by request_id +
-    # timestamp) lines it up with the v1 record persisted in
-    # response_store.json or the existing audit infrastructure.
-    diff = compute_diff(
-        v1_answer=None,
-        v2_answer=v2_answer,
-        v2_state=final_state,
-    )
-    await record_shadow_run(
-        request_id=ctx.request_id,
-        conversation_id=ctx.conversation_id,
-        question=v1_question,
-        v1_mode="v1",
-        v1_answer=None,
-        v2_mode=v2_mode,
-        v2_answer=v2_answer,
-        v2_outcome=(final_state.outcome if final_state else "crashed"),
-        diff=diff,
-        duration_v1_ms=0.0,  # filled in by the offline join job
-        duration_v2_ms=duration_v2_ms,
-    )
-
-
-async def _runner_v2(
-    ctx: V2RequestContext,
-    emitter: EventEmitter,
-) -> None:
-    """
-    v2 turn runner. Symmetric to ``_runner`` but takes a ``RequestContext``
-    instead of a ``TurnState`` — v2 owns its own state model
-    (``ExecutionState``). Cleanup semantics (PresentationEmitter wrap,
-    safe-error envelope, emitter.close()) mirror the v1 runner exactly so
-    the SSE wire format stays compatible.
-    """
-    user_emitter = PresentationEmitter(emitter)
-    try:
-        await run_query_turn_v2(ctx, user_emitter)
-    except Exception:
-        log.exception("orchestrator_v2 crashed for request %s", ctx.request_id)
-        # User-safe error: never leak the exception class or message.
-        await user_emitter.emit("agent.result", envelope(
-            "We hit an issue answering your question.",
-            detail="The v2 analytics pipeline encountered an error. Try again or rephrase.",
-            kind="internal",
-        ))
-        await user_emitter.emit("turn.end", {
-            "turn_id": f"v2-{ctx.request_id}",
-            "errors": ["pipeline_error_v2"],
-            "final_answer": None,
-        })
-    finally:
-        await emitter.close()
-
-
-async def _runner(initial: TurnState, emitter: EventEmitter, api_key: str) -> None:
-    client = GroqClient(api_key=api_key)
-    token = set_request_groq(client)
-    # Wrap with the presentation filter so NO code path can leak technical
-    # details into the SSE stream. The real emitter is used for the queue
-    # (heartbeats, close) — only emit() goes through the sanitizer.
-    user_emitter = PresentationEmitter(emitter)
-    try:
-        await run_query_turn(initial, user_emitter)
-    except Exception as e:
         log.exception("coordinator crashed for turn %s", initial.turn_id)
         # User-safe error: never leak the exception class or message.
         await user_emitter.emit("agent.result", envelope(
@@ -1975,14 +1738,6 @@ async def _runner(initial: TurnState, emitter: EventEmitter, api_key: str) -> No
             "final_answer": None,
         })
     finally:
-        try:
-            reset_request_groq(token)
-        except Exception:
-            pass
-        try:
-            await client.aclose()
-        except Exception:
-            pass
         await emitter.close()
 
 
@@ -2047,9 +1802,8 @@ def _stream_response(
 
 @api_router.post("/query_stream")
 async def query_stream(req: QueryRequest, request: Request):
-    api_key = _resolve_groq_key(request)
     emitter = EventEmitter()
-    pre_error = _validate_pre_stream(req, api_key)
+    pre_error = _validate_pre_stream(req)
     if pre_error is not None:
         _safe_create_task(_emit_pre_stream_error(emitter, pre_error))
         return _stream_response(emitter)
@@ -2064,46 +1818,12 @@ async def query_stream(req: QueryRequest, request: Request):
         question_chars=len(req.question),
     )
 
-    orchestrator_version = _resolve_orchestrator_version(request)
-    shadow_v2 = _shadow_v2_enabled(request) and orchestrator_version == "v1"
-    shadow_task = None
-
-    if orchestrator_version == "v2":
-        # v2 reflective pipeline. State stays inside v2 — RequestContext
-        # is the minimal handoff.
-        ctx = V2RequestContext(
-            request_id=uuid4().hex,
-            question=req.question,
-            conversation_id=req.conversation_id,
-            groq_api_key=api_key,
-        )
-        runner_task = _safe_create_task(_runner_v2(ctx, emitter))
-    else:
-        # v1 path — original engine.
-        initial = TurnState(
-            question=req.question,
-            conversation_id=req.conversation_id,
-        )
-        runner_task = _safe_create_task(_runner(initial, emitter, api_key))
-
-        # Shadow mode: spawn a parallel v2 run that won't stream to the
-        # user. Logs to v2_shadow_log for offline diffing.
-        if shadow_v2:
-            shadow_ctx = V2RequestContext(
-                request_id=uuid4().hex,
-                question=req.question,
-                conversation_id=req.conversation_id,
-                groq_api_key=api_key,
-            )
-            shadow_task = _safe_create_task(
-                _runner_v2_shadow(shadow_ctx, req.question)
-            )
-
+    initial = TurnState(
+        question=req.question,
+        conversation_id=req.conversation_id,
+    )
+    runner_task = _safe_create_task(_runner(initial, emitter))
     heartbeat_task = _safe_create_task(_heartbeat(emitter))
-    # ``shadow_task`` is INTENTIONALLY excluded from the stream cleanup
-    # tuple — it must run to completion regardless of whether the user's
-    # SSE stream finishes first (it would otherwise be cancelled the
-    # moment v1's ``turn.end`` arrives, before its DB write).
     return _stream_response(emitter, runner_task, heartbeat_task)
 
 
@@ -2148,12 +1868,12 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(
-    title="Agentic AI",
+    title="MetricAi",
     description=(
-        "Local-first single-user analytics. v2 reflective orchestrator is "
-        "the default; set FORCE_V1=1 to pin back to v1."
+        "Local-first single-user analytics powered by a Coordinator that "
+        "talks to a local Qwen 3 model through Ollama."
     ),
-    version="4.0.0-v2",
+    version="5.0.0-coordinator",
     lifespan=lifespan,
 )
 
@@ -2402,9 +2122,27 @@ async def _startup() -> None:
     except Exception:
         _app_log.exception("enrichment bootstrap failed (continuing)")
 
-    registry = get_registry()
-    _app_log.info("registry: %d tools registered: %s", len(registry.names), registry.names)
+    # Coordinator registry (8 tools + 3 sub-agents).
+    from app.coordinator.tools import build_default_registry
+    from app.coordinator.sub_agents import register_sub_agents
+    registry = build_default_registry()
+    register_sub_agents(registry)
+    _app_log.info(
+        "coordinator registry: %d tools+sub-agents registered: %s",
+        len(registry.names()), registry.names(),
+    )
     _app_log.info("financial DB ready at %s", settings.financial_db_path)
+
+    # Local LLM health check - fail loudly on startup if Ollama is down
+    # or the configured model isn't pulled. No cloud fallback.
+    try:
+        ok, msg = await check_llm_health()
+        if ok:
+            _app_log.info("LLM health: %s", msg)
+        else:
+            _app_log.error("LLM health FAILED: %s", msg)
+    except Exception:
+        _app_log.exception("LLM health check crashed (continuing - /query_stream will surface the error)")
 
     # Report persistent dataset state at boot so the operator can confirm
     # data survived the restart. SQLite tables hold the parsed rows;
