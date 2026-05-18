@@ -1858,12 +1858,27 @@ init_sentry()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Names resolved at call time: _startup / _shutdown are defined later
-    # in this module, after the routes and exception handlers they touch.
-    await _startup()
+    # Background the heavy startup work so the HTTP server binds immediately
+    # and Render's health-check grace period is not consumed while the DB,
+    # KPI registry, enrichment, and LLM probe are initialising.
+    # Any individual startup failure is already wrapped in try/except inside
+    # _startup() — errors are logged but the server stays up.
+    _startup_task = asyncio.create_task(_startup())
+    _app_log.info(
+        "MetricAi %s: HTTP server accepting connections (background startup running)",
+        _app.version,
+    )
     try:
         yield
     finally:
+        # Give the background task a chance to finish before we tear down
+        # the DB connections it may still be using.
+        if not _startup_task.done():
+            _app_log.info("waiting for background startup to complete before shutdown…")
+            try:
+                await asyncio.wait_for(_startup_task, timeout=120.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                _startup_task.cancel()
         await _shutdown()
 
 
@@ -1873,7 +1888,7 @@ app = FastAPI(
         "Local-first single-user analytics powered by a Coordinator that "
         "talks to a local Qwen 3 model through Ollama."
     ),
-    version="5.0.0-coordinator",
+    version="5.1.0-coordinator",
     lifespan=lifespan,
 )
 
@@ -2123,15 +2138,18 @@ async def _startup() -> None:
         _app_log.exception("enrichment bootstrap failed (continuing)")
 
     # Coordinator registry (8 tools + 3 sub-agents).
-    from app.coordinator.tools import build_default_registry
-    from app.coordinator.sub_agents import register_sub_agents
-    registry = build_default_registry()
-    register_sub_agents(registry)
-    _app_log.info(
-        "coordinator registry: %d tools+sub-agents registered: %s",
-        len(registry.names()), registry.names(),
-    )
-    _app_log.info("financial DB ready at %s", settings.financial_db_path)
+    try:
+        from app.coordinator.tools import build_default_registry
+        from app.coordinator.sub_agents import register_sub_agents
+        registry = build_default_registry()
+        register_sub_agents(registry)
+        _app_log.info(
+            "coordinator registry: %d tools+sub-agents registered: %s",
+            len(registry.names()), registry.names(),
+        )
+        _app_log.info("financial DB ready at %s", settings.financial_db_path)
+    except Exception:
+        _app_log.exception("coordinator registry bootstrap failed (continuing — /query_stream will surface the error)")
 
     # Local LLM health check - fail loudly on startup if Ollama is down
     # or the configured model isn't pulled. No cloud fallback.
