@@ -3673,17 +3673,23 @@ def classify_query_kind(
         if pat.search(lower):
             return _decide("chat", 0.9, f"chat_pattern:{pat.pattern[:32]}")
 
-    # 3. KNOWLEDGE wins for genuine definitional / advice queries — but
-    #    ONLY when the analytics signal is weak. If domain words push
-    #    a_score above the threshold, the question is about the user's
-    #    data even if it uses "what is" phrasing (e.g. "What is the
-    #    inventory turnover ratio?" — wants a number, not a definition).
-    #    A possessive ("my", "our") is also a hard tell for data lookup.
-    #    This matches the documented design rule (see docstring rule 3).
-    if has_knowledge and a_score < ANALYTICS_THRESHOLD and not has_possessive:
+    # 3. KNOWLEDGE wins for genuine definitional / advice queries.
+    #    Two cases allow the knowledge gate to fire:
+    #      a) No possessive — pure definitions ("explain net revenue",
+    #         "what is profit margin") always route here regardless of
+    #         analytics score; the user is asking for a concept, not data.
+    #      b) Possessive present BUT no missing dimension AND weak analytics
+    #         signal — advisory questions like "how can I improve my
+    #         conversion rate" which contain "my" but are clearly advice.
+    #    Blocked when: possessive + (missing dimension OR strong analytics
+    #    signal) — those cases are either missing_data or data_query.
+    if has_knowledge and (
+        not has_possessive
+        or (has_possessive and missing is None and a_score < ANALYTICS_THRESHOLD)
+    ):
         return _decide(
             "general_knowledge", 0.92,
-            "knowledge phrasing (regex match, weak analytics signal)",
+            "knowledge phrasing (regex match)",
         )
 
     # 4. MISSING_DATA wins whenever an out-of-scope dimension is explicitly
