@@ -77,9 +77,25 @@ def strip_thinking(text: str) -> str:
     return cleaned
 
 
-def ensure_no_think(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Append the Qwen3 /no_think directive to the first system message
-    (or prepend one) so the model skips its reasoning block."""
+def _model_understands_no_think(model: str | None) -> bool:
+    """`/no_think` is a Qwen3-specific control token. Sending it to any
+    other model (e.g. llama-3.3 on Groq in production) is at best
+    inert noise and at worst confuses the model. Gate strictly."""
+    if not model:
+        return False
+    return model.lower().startswith("qwen")
+
+
+def ensure_no_think(
+    messages: list[dict[str, Any]],
+    *,
+    model: str | None = None,
+) -> list[dict[str, Any]]:
+    """Append the Qwen3 /no_think directive when the active model is a
+    Qwen3 variant. For any other model (llama, mixtral, etc.) the
+    messages are returned unchanged."""
+    if not _model_understands_no_think(model):
+        return [dict(m) for m in messages]
     out = [dict(m) for m in messages]
     for m in out:
         if m.get("role") == "system":
@@ -175,7 +191,7 @@ class LLMClient:
             m.model_dump() if isinstance(m, LLMMessage) else dict(m)
             for m in messages
         ]
-        msgs = ensure_no_think(msgs)
+        msgs = ensure_no_think(msgs, model=self.model)
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": msgs,
@@ -224,7 +240,7 @@ class LLMClient:
             m.model_dump() if isinstance(m, LLMMessage) else dict(m)
             for m in messages
         ]
-        msgs = ensure_no_think(msgs)
+        msgs = ensure_no_think(msgs, model=self.model)
         try:
             stream = await self._client.chat.completions.create(
                 model=self.model,
@@ -258,7 +274,7 @@ class LLMClient:
         """Native tool-calling completion. When ``tools`` is empty falls
         back to a plain completion (used for cost-guard 'final answer')."""
         msgs = [dict(m) for m in messages]
-        msgs = ensure_no_think(msgs)
+        msgs = ensure_no_think(msgs, model=self.model)
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": msgs,
