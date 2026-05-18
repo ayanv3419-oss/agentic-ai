@@ -16,18 +16,19 @@
  *   - Dashboard       (KPIs + charts, with month / range filtering)
  *   - AiAssistant     (SSE chat over POST /query_stream)
  *   - UploadData      (CSV/XLSX upload + Google Drive sync UI + uploads table)
- *   - ShopInfo        (shop identity + Groq API key form)
+ *   - ShopInfo        (shop identity form)
  *
  * Subcomponents that are only used by one page (e.g. UploadsTable, ChatChart,
  * KPI cards, the Google glyph) live next to that page in this file. Anything
  * that's shared across pages — chart axis helpers, the API client, the global
  * store — lives in `charts.ts` / `api.ts`.
  */
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react'
 import {
-
   AlertTriangle,
+  BarChart2,
   Building2,
+  Calendar,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
@@ -38,6 +39,7 @@ import {
   RefreshCw,
   Save,
   ShoppingBag,
+  ShoppingCart,
   Send,
   Sparkles,
   Square,
@@ -509,7 +511,7 @@ export function Dashboard() {
         </div>
       )}
 
-      <div className="mt-10 grid lg:grid-cols-3 gap-5">
+      <div className="mt-10 grid sm:grid-cols-2 lg:grid-cols-4 gap-5">
         <HeroKpi
           label="Total Sales"
           value={data ? formatCurrency(data.kpis.total_sales) : '—'}
@@ -525,8 +527,32 @@ export function Dashboard() {
           label="Customers"
           value={data ? data.kpis.customers.toLocaleString('en-IN') : '—'}
         />
+        <SimpleKpi
+          icon={<TrendingUp className="w-5 h-5" />}
+          label="Avg Order"
+          value={
+            data && data.kpis.orders > 0
+              ? formatCurrency(data.kpis.total_sales / data.kpis.orders)
+              : '—'
+          }
+        />
       </div>
 
+      {/* No-data empty state: replaces charts when nothing has been uploaded yet */}
+      {!loading && !error && data && data.kpis.orders === 0 && data.series.length === 0 ? (
+        <div className="mt-8 card p-10 flex flex-col items-center justify-center text-center gap-4 border-dashed">
+          <div className="w-16 h-16 rounded-2xl bg-zinc-900 border border-zinc-800 flex items-center justify-center">
+            <BarChart2 className="w-8 h-8 text-zinc-700" />
+          </div>
+          <div>
+            <div className="text-base font-semibold text-zinc-300">No data yet</div>
+            <div className="mt-1 text-sm text-zinc-500 max-w-xs">
+              Upload a CSV or connect Google Drive to see your sales charts.
+            </div>
+          </div>
+        </div>
+      ) : (
+        <>
       <section className="mt-8 card p-7">
         <SectionHeader
           title="Sales Performance"
@@ -646,6 +672,8 @@ export function Dashboard() {
       </section>
 
       <MonthlySalesPie data={data?.monthly_sales_pie ?? []} />
+        </>
+      )}
     </div>
   )
 }
@@ -749,13 +777,13 @@ interface HeroKpiProps {
 
 function HeroKpi({ label, value, period }: HeroKpiProps) {
   return (
-    <div className="card p-7 lg:col-span-2 animate-slide-up bg-gradient-to-br from-zinc-900/60 to-zinc-900/20">
+    <div className="card p-6 animate-slide-up bg-gradient-to-br from-emerald-950/40 to-zinc-900/20 border-emerald-900/30">
       <div className="flex items-center justify-between">
-        <span className="text-sm font-medium text-zinc-300 uppercase tracking-wide">{label}</span>
+        <span className="text-xs font-medium text-zinc-400 uppercase tracking-wider">{label}</span>
         <TrendingUp className="w-4 h-4 text-emerald-400" />
       </div>
-      <div className="mt-3 text-4xl md:text-5xl font-semibold tracking-tight">{value}</div>
-      <div className="mt-2 text-sm text-zinc-500">{period}</div>
+      <div className="mt-3 text-3xl font-semibold tracking-tight text-emerald-50">{value}</div>
+      <div className="mt-1.5 text-xs text-zinc-500">{period}</div>
     </div>
   )
 }
@@ -807,11 +835,18 @@ const TOOL_LABELS: Record<string, string> = {
   generate_narrative: 'Writing the analysis',
 }
 
-const SUGGESTIONS = [
-  'What are my last 2 days sales?',
-  'Show this month revenue',
-  'Why did sales drop?',
-  'Top performing products this week',
+interface Suggestion {
+  icon: ComponentType<{ className?: string }>
+  text: string
+}
+
+const SUGGESTIONS: Suggestion[] = [
+  { icon: TrendingUp,     text: 'Sales this month' },
+  { icon: ShoppingCart,   text: 'Top products' },
+  { icon: Users,          text: 'Customer count' },
+  { icon: AlertTriangle,  text: 'Lowest revenue day' },
+  { icon: BarChart2,      text: 'Revenue breakdown' },
+  { icon: Calendar,       text: 'Weekly trend' },
 ]
 
 const newId = (): string =>
@@ -1126,26 +1161,34 @@ function EmptyState({ onPick }: { onPick: (s: string) => void }) {
   return (
     <div className="py-16 animate-fade-in">
       <div className="text-center">
-        <div className="inline-flex w-12 h-12 rounded-xl bg-emerald-500/10 border border-emerald-500/30 items-center justify-center mb-4">
-          <Sparkles className="w-5 h-5 text-emerald-400" />
+        <div className="inline-flex w-14 h-14 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 items-center justify-center mb-5 shadow-lg shadow-emerald-900/20">
+          <Sparkles className="w-6 h-6 text-emerald-400" />
         </div>
         <h2 className="text-2xl font-semibold tracking-tight">How can I help today?</h2>
-        <p className="mt-2 text-sm text-zinc-500">
-          Ask in plain English. I'll pull the data, run the analysis, and explain the result.
+        <p className="mt-2 text-sm text-zinc-500 max-w-sm mx-auto">
+          Ask in plain English — I'll query your data, run the analysis, and explain the result.
         </p>
       </div>
 
-      <div className="mt-10 grid sm:grid-cols-2 gap-3">
-        {SUGGESTIONS.map((s) => (
-          <button
-            key={s}
-            type="button"
-            onClick={() => onPick(s)}
-            className="text-left card px-4 py-3 hover:border-zinc-700 hover:bg-zinc-900/70 transition-colors"
-          >
-            <span className="text-sm text-zinc-200">{s}</span>
-          </button>
-        ))}
+      <div className="mt-10 grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        {SUGGESTIONS.map((s) => {
+          const Icon = s.icon
+          return (
+            <button
+              key={s.text}
+              type="button"
+              onClick={() => onPick(s.text)}
+              className="group text-left card px-4 py-3.5 hover:border-emerald-500/30 hover:bg-emerald-950/20 transition-all duration-150"
+            >
+              <div className="flex items-center gap-3">
+                <span className="w-7 h-7 rounded-lg bg-zinc-800 border border-zinc-700 flex items-center justify-center shrink-0 group-hover:bg-emerald-500/10 group-hover:border-emerald-500/30 transition-colors">
+                  <Icon className="w-3.5 h-3.5 text-zinc-400 group-hover:text-emerald-400 transition-colors" />
+                </span>
+                <span className="text-sm text-zinc-300 group-hover:text-zinc-100 transition-colors">{s.text}</span>
+              </div>
+            </button>
+          )
+        })}
       </div>
     </div>
   )

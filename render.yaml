@@ -39,16 +39,15 @@ services:
         sync: false   # set in Render dashboard (required when AUTH_ENABLED=true)
       - key: AUTH_TOKEN_SECRET
         sync: false   # set in Render dashboard (required when AUTH_ENABLED=true)
-      # --- LLM (Groq — OpenAI-compatible cloud API) ------------------
-      # The Coordinator uses any OpenAI-compatible endpoint.
-      # Groq is the recommended cloud provider: fast, generous free tier.
-      # Get a key at https://console.groq.com/keys
+      # --- LLM (Together.ai — OpenAI-compatible, runs Qwen) ----------------
+      # Together.ai hosts Qwen/Qwen3-8B with an OpenAI-compatible endpoint.
+      # Set LLM_API_KEY in the Render dashboard (sync: false).
       - key: LLM_BASE_URL
-        value: "https://api.groq.com/openai/v1"
+        value: "https://api.together.xyz/v1"
       - key: LLM_API_KEY
-        sync: false   # set in Render dashboard — your Groq API key (gsk_...)
+        sync: false   # Together.ai key — set in Render dashboard
       - key: LLM_MODEL
-        value: "llama-3.3-70b-versatile"
+        value: "Qwen/Qwen3-8B"
       - key: LLM_TEMPERATURE
         value: "0.0"
       - key: LLM_MAX_TOKENS

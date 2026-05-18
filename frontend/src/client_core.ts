@@ -599,7 +599,7 @@ export async function syncDrive(
 export async function streamAIQuery(
   message: string,
   onEvent: (e: SseEvent) => void,
-  opts?: { apiKey?: string; signal?: AbortSignal; maxRetries?: number },
+  opts?: { signal?: AbortSignal; maxRetries?: number },
 ): Promise<void> {
   return streamQueryWithRetry(message, onEvent, {
     signal:     opts?.signal,

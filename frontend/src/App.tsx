@@ -81,7 +81,7 @@ interface NavItem {
 }
 
 const ITEMS: NavItem[] = [
-  { key: 'shop',      label: 'Shop Info',     icon: Building2,        hint: 'Identity & API key' },
+  { key: 'shop',      label: 'Shop Info',     icon: Building2,        hint: 'Identity' },
   { key: 'upload',    label: 'Upload Data',   icon: Upload,           hint: 'CSV / Excel' },
   { key: 'dashboard', label: 'Dashboard',     icon: LayoutDashboard,  hint: 'KPIs & charts' },
   { key: 'ai',        label: 'AI Assistant',  icon: MessageSquare,    hint: 'Ask in plain English' },
