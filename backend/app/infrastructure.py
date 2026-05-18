@@ -88,6 +88,23 @@ class Settings(BaseSettings):
     # --- Rate limiting ---------------------------------------------------
     rate_limit_per_minute: int = Field(default=30, alias="RATE_LIMIT_PER_MINUTE")
 
+    # --- Vector embeddings ----------------------------------------------
+    # Dimension of the in-memory entity/synonym embedding store. Small by
+    # default — enough for entity-space discrimination without burning RAM.
+    vector_dim: int = Field(default=128, alias="VECTOR_DIM")
+
+    # --- Auth (Phase 3) -------------------------------------------------
+    # When False (default), every route is public — matches the historical
+    # single-user-MVP behaviour and avoids bricking a deploy that hasn't
+    # set credentials. Flip to True on Render once ADMIN_USERNAME +
+    # ADMIN_PASSWORD + AUTH_TOKEN_SECRET are configured.
+    auth_enabled:        bool = Field(default=False, alias="AUTH_ENABLED")
+    admin_username:      str  = Field(default="",    alias="ADMIN_USERNAME")
+    admin_password:      str  = Field(default="",    alias="ADMIN_PASSWORD")
+    auth_token_secret:   str  = Field(default="dev-auth-secret-CHANGE-ME",
+                                      alias="AUTH_TOKEN_SECRET")
+    auth_token_ttl_hours: int = Field(default=168,   alias="AUTH_TOKEN_TTL_HOURS")
+
     # --- Server ---------------------------------------------------------
     host: str = Field(default="0.0.0.0", alias="HOST")
     port: int = Field(default=8000, alias="PORT")
@@ -1465,6 +1482,13 @@ def get_cached(key: str) -> dict[str, Any] | None:
     return entry if isinstance(entry, dict) else None
 
 
+# Hard cap on cached entries. The store was previously unbounded — every
+# unique question grew the JSON file forever, and the whole file is
+# rewritten on every put. 500 covers a useful working set without making
+# the cache a multi-MB serialization tax. Override via env if needed.
+_MAX_CACHE_ENTRIES = int(os.environ.get("RESPONSE_CACHE_MAX_ENTRIES") or 500)
+
+
 def put_cached(key: str, record: dict[str, Any]) -> None:
     payload = dict(record)
     payload.setdefault(
@@ -1473,6 +1497,21 @@ def put_cached(key: str, record: dict[str, Any]) -> None:
     with _CACHE_LOCK:
         data = _cache_load()
         data[key] = payload
+        # LRU-by-stored_at eviction. We can't track real reads cheaply in a
+        # flat-file cache, so newest-stored wins — keeps recently-asked
+        # questions and drops the long tail of one-offs.
+        if len(data) > _MAX_CACHE_ENTRIES:
+            ordered = sorted(
+                data.items(),
+                key=lambda kv: (kv[1] or {}).get("stored_at") or "",
+            )
+            drop_n = len(data) - _MAX_CACHE_ENTRIES
+            for old_key, _ in ordered[:drop_n]:
+                data.pop(old_key, None)
+            _cache_log.info(
+                "response cache trimmed: %d entries evicted (cap=%d)",
+                drop_n, _MAX_CACHE_ENTRIES,
+            )
         _cache_save(data)
 
 

@@ -292,6 +292,36 @@ function formatCompact(n: number): string {
   return `₹${n}`
 }
 
+// Format a chart value using the LLM-supplied y_label. 'sales' (the
+// back-compat default) uses the rupee formatter; counts/quantities/
+// percents use plain numeric formats so the chart no longer shows ₹40
+// next to a customer's purchase count.
+function formatChartValue(n: number, yLabel?: string): string {
+  const lbl = (yLabel ?? 'sales').toLowerCase()
+  if (lbl === 'sales') return formatINR(n)
+  if (lbl === 'percent') return `${(n ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })}%`
+  // count / quantity / anything-else → plain integer locale format
+  return (n ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })
+}
+
+function formatChartCompact(n: number, yLabel?: string): string {
+  const lbl = (yLabel ?? 'sales').toLowerCase()
+  if (lbl === 'sales') return formatCompact(n)
+  if (lbl === 'percent') return `${(n ?? 0).toFixed(0)}%`
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
+  return `${n}`
+}
+
+function chartValueLabel(yLabel?: string): string {
+  const lbl = (yLabel ?? 'sales').toLowerCase()
+  if (lbl === 'sales')    return 'Sales'
+  if (lbl === 'count')    return 'Count'
+  if (lbl === 'quantity') return 'Quantity'
+  if (lbl === 'percent')  return 'Percent'
+  return lbl.charAt(0).toUpperCase() + lbl.slice(1)
+}
+
 function formatMonth(month: string): string {
   const [y, m] = month.split('-').map(Number)
   if (!y || !m) return month
@@ -378,9 +408,12 @@ export function Dashboard() {
   // Auto-reload when serverDataVersion bumps (after upload, unarchive,
   // KPI toggle, etc.). The initial mount-time load above already covers
   // the very first render, so this fires only when the version moves.
+  // Read filters fresh from the store: the closure captured at effect
+  // registration would otherwise reload the wrong month if the user
+  // changed it between version bumps.
   useEffect(() => {
     if (serverDataVersion === null) return
-    void load(filters.month)
+    void load(useAppStore.getState().filters.month)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [serverDataVersion])
 
@@ -1229,6 +1262,8 @@ function ChatChart({ chart }: { chart: SalesChart }) {
   const items = chart.items ?? []
   const comparison = chart.comparison
   const kind: ChartKind = chart.kind ?? 'summary'
+  const yLabel = chart.y_label
+  const isCurrency = (yLabel ?? 'sales').toLowerCase() === 'sales'
 
   if (
     !hasSales
@@ -1241,11 +1276,20 @@ function ChatChart({ chart }: { chart: SalesChart }) {
     <div className="rounded-2xl rounded-tl-md bg-zinc-900/60 border border-zinc-800 px-4 py-3">
       <div className="flex items-baseline gap-3 mb-2">
         <div className="text-2xl font-semibold tracking-tight text-zinc-50">
-          {formatINR(totals.total_sales)}
+          {formatChartValue(totals.total_sales, yLabel)}
         </div>
-        {totals.orders > 0 && (
+        {/* Hide the "orders" sub-label for non-currency charts — for a
+            customers-by-purchase-count chart, "10 orders" was nonsense.
+            Show the y_label name + row count instead. */}
+        {isCurrency && totals.orders > 0 && (
           <div className="text-xs text-zinc-500">
             {totals.orders.toLocaleString('en-IN')} orders
+          </div>
+        )}
+        {!isCurrency && (
+          <div className="text-xs text-zinc-500">
+            {chartValueLabel(yLabel)}
+            {totals.orders > 0 ? ` · ${totals.orders.toLocaleString('en-IN')} rows` : ''}
           </div>
         )}
         <div className="text-[11px] text-zinc-600 ml-auto">
@@ -1254,7 +1298,7 @@ function ChatChart({ chart }: { chart: SalesChart }) {
       </div>
 
       {kind === 'ranking' ? (
-        <RankingChart items={items.length ? items : seriesToItems(series)} />
+        <RankingChart items={items.length ? items : seriesToItems(series)} yLabel={yLabel} />
       ) : (kind === 'comparison' || kind === 'rca') && comparison ? (
         <ComparisonChart comparison={comparison} />
       ) : (
@@ -1278,6 +1322,8 @@ function TimeSeriesChart({ chart }: { chart: SalesChart }) {
   const chartHeight = baseHeight + Math.max(0, tickConfig.height - 32)
   const horizon = chart.forecast_horizon_days ?? 0
   const hasSplit = horizon > 0 && series.some((s) => (s as { predicted?: boolean }).predicted)
+  const yLabel = chart.y_label
+  const tooltipLabel = chartValueLabel(yLabel)
 
   if (series.length < 2) {
     return (
@@ -1320,14 +1366,14 @@ function TimeSeriesChart({ chart }: { chart: SalesChart }) {
             tickLine={false}
             axisLine={false}
             width={48}
-            tickFormatter={(v: number) => formatCompact(v)}
+            tickFormatter={(v: number) => formatChartCompact(v, yLabel)}
           />
           <Tooltip
             contentStyle={CHART_TOOLTIP_STYLE}
             cursor={{ stroke: '#3f3f46', strokeDasharray: '3 3' }}
             formatter={(v: number, _n: unknown, p: { payload?: { predicted?: boolean } }) => [
-              formatINR(v),
-              p?.payload?.predicted ? 'Forecast' : 'Sales',
+              formatChartValue(v, yLabel),
+              p?.payload?.predicted ? 'Forecast' : tooltipLabel,
             ]}
             labelFormatter={(l: string) => formatBucketTooltip(l, granularity)}
           />
@@ -1371,13 +1417,20 @@ function TimeSeriesChart({ chart }: { chart: SalesChart }) {
   )
 }
 
-function RankingChart({ items }: { items: RankingItem[] }) {
+function RankingChart({
+  items,
+  yLabel,
+}: {
+  items: RankingItem[]
+  yLabel?: string
+}) {
   if (items.length === 0) {
     return <div className="text-[11px] text-zinc-500">No items to rank.</div>
   }
   const trimmed = items.slice(0, 10)
   const angle = trimmed.length > 4 ? -28 : 0
   const height = angle === 0 ? 200 : 240
+  const tooltipLabel = chartValueLabel(yLabel)
   return (
     <div className="-ml-2" style={{ height }}>
       <ResponsiveContainer>
@@ -1403,12 +1456,12 @@ function RankingChart({ items }: { items: RankingItem[] }) {
             tickLine={false}
             axisLine={false}
             width={52}
-            tickFormatter={(v: number) => formatCompact(v)}
+            tickFormatter={(v: number) => formatChartCompact(v, yLabel)}
           />
           <Tooltip
             contentStyle={CHART_TOOLTIP_STYLE}
             cursor={{ fill: 'rgba(63, 63, 70, 0.3)' }}
-            formatter={(v: number) => [formatINR(v), 'Sales']}
+            formatter={(v: number) => [formatChartValue(v, yLabel), tooltipLabel]}
           />
           <Bar dataKey="sales" fill="#10b981" radius={[4, 4, 0, 0]} />
         </BarChart>

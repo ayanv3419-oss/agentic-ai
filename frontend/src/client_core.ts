@@ -183,6 +183,11 @@ export interface SalesChart {
   items?: RankingItem[]
   comparison?: ChartComparison
   forecast_horizon_days?: number
+  // Semantic label for the Y axis (sales / count / quantity / percent / ...)
+  // Backend normalises LLM-supplied label via _normalize_y_label.
+  // When absent, frontend treats the value as currency for back-compat
+  // with legacy KPI / ResultAggregator charts.
+  y_label?: string
 }
 
 export interface SseEvent {
@@ -256,7 +261,20 @@ function resolveBackendUrl(): string {
     (import.meta.env.VITE_API_BASE_URL as string | undefined) ??
     PRODUCTION_FALLBACK
   const trimmed = (candidate || '').trim().replace(/\/+$/, '')
-  return trimmed || PRODUCTION_FALLBACK
+  const resolved = trimmed || PRODUCTION_FALLBACK
+  // Loud warning in dev when nothing was configured and we silently
+  // landed on the production Render app. This hides the most common
+  // local-dev footgun: forgetting VITE_BACKEND_URL and then wondering
+  // why local backend changes have no effect.
+  if (import.meta.env.DEV && resolved === PRODUCTION_FALLBACK) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[client_core] VITE_BACKEND_URL not set; using production fallback ` +
+      `${PRODUCTION_FALLBACK}. Set VITE_BACKEND_URL=http://localhost:8000 ` +
+      `in .env.local to talk to your local backend.`,
+    )
+  }
+  return resolved
 }
 
 const BASE_URL = resolveBackendUrl()
@@ -289,6 +307,23 @@ async function handle<T>(res: Response, label: string): Promise<T> {
   return (await res.json()) as T
 }
 
+// Inject the Authorization: Bearer header on every backend request when
+// the store has a token. The backend's auth middleware ignores it when
+// AUTH_ENABLED=false, so this is safe to always do — no flag plumbing.
+function withAuthHeader(init?: RequestInit): RequestInit {
+  try {
+    const token = useAppStore.getState().auth.token
+    if (!token) return init ?? {}
+    const headers = new Headers(init?.headers ?? undefined)
+    if (!headers.has('Authorization')) {
+      headers.set('Authorization', `Bearer ${token}`)
+    }
+    return { ...(init ?? {}), headers }
+  } catch {
+    return init ?? {}
+  }
+}
+
 async function safeFetch(input: RequestInfo, init?: RequestInit): Promise<Response> {
   try {
     return await fetch(input, init)
@@ -306,18 +341,18 @@ async function safeFetch(input: RequestInfo, init?: RequestInit): Promise<Respon
 }
 
 export async function apiGet<T>(path: string): Promise<T> {
-  const res = await safeFetch(`${BASE_URL}${path}`, {
+  const res = await safeFetch(`${BASE_URL}${path}`, withAuthHeader({
     headers: buildHeaders(),
-  })
+  }))
   return handle<T>(res, `GET ${path}`)
 }
 
 export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
-  const res = await safeFetch(`${BASE_URL}${path}`, {
+  const res = await safeFetch(`${BASE_URL}${path}`, withAuthHeader({
     method: 'POST',
     headers: buildHeaders(),
     body: body === undefined ? undefined : JSON.stringify(body),
-  })
+  }))
   return handle<T>(res, `POST ${path}`)
 }
 
@@ -334,11 +369,11 @@ export async function uploadFile<T>(
   if (shop.groqApiKey) headers['X-Groq-Api-Key'] = shop.groqApiKey
   // eslint-disable-next-line no-console
   console.info(`[api] UPLOAD ${path} file=${file.name} bytes=${file.size}`)
-  const res = await safeFetch(`${BASE_URL}${path}`, {
+  const res = await safeFetch(`${BASE_URL}${path}`, withAuthHeader({
     method: 'POST',
     headers,
     body: fd,
-  })
+  }))
   return handle<T>(res, `UPLOAD ${path}`)
 }
 
@@ -351,7 +386,7 @@ export async function streamQuery(
   signal?: AbortSignal,
 ): Promise<void> {
   const { shop, conversationId } = useAppStore.getState()
-  const res = await safeFetch(`${BASE_URL}/query_stream`, {
+  const res = await safeFetch(`${BASE_URL}/query_stream`, withAuthHeader({
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -360,7 +395,7 @@ export async function streamQuery(
     },
     body: JSON.stringify({ question, conversation_id: conversationId }),
     signal,
-  })
+  }))
   if (!res.ok || !res.body) {
     const detail = await res.json().catch(() => undefined)
     // eslint-disable-next-line no-console
@@ -371,40 +406,119 @@ export async function streamQuery(
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let buf = ''
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buf += decoder.decode(value, { stream: true })
-    const blocks = buf.split('\n\n')
-    buf = blocks.pop() ?? ''
-    for (const block of blocks) {
-      if (!block.trim()) continue
-      let event = 'message'
-      let data = ''
-      for (const line of block.split('\n')) {
-        if (line.startsWith('event:')) event = line.slice(6).trim()
-        else if (line.startsWith('data:')) data += line.slice(5).trim()
-      }
-      if (!data) continue
-      try {
-        const parsed = JSON.parse(data)
-        // Stamp serverDataVersion from any SSE payload that carries it
-        // (turn.end + final from the backend's emit boundary). Powers the
-        // Dashboard auto-refetch and the chat "data updated" banner.
-        if (parsed && typeof parsed === 'object' && 'data_version' in parsed) {
-          useAppStore.getState().observeServerDataVersion(parsed.data_version)
+  // The finally block releases the underlying ReadableStream lock so the
+  // network connection can be reclaimed when the user navigates away
+  // mid-stream. Previously the reader was leaked: the AbortController
+  // stopped *new* reads but the reader reference (and its buffered data)
+  // sat in memory until GC, doubled in React StrictMode.
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const blocks = buf.split('\n\n')
+      buf = blocks.pop() ?? ''
+      for (const block of blocks) {
+        if (!block.trim()) continue
+        let event = 'message'
+        let data = ''
+        for (const line of block.split('\n')) {
+          if (line.startsWith('event:')) event = line.slice(6).trim()
+          else if (line.startsWith('data:')) {
+            // SSE spec: strip one leading space, join multi-line data fields with \n.
+            // The old `+= .trim()` silently glued JSON tokens together when a
+            // payload happened to contain a newline.
+            data += (data ? '\n' : '') + line.slice(5).replace(/^ /, '')
+          }
         }
-        onEvent({ event, data: parsed })
-      } catch {
-        onEvent({ event, data })
+        if (!data) continue
+        try {
+          const parsed = JSON.parse(data)
+          // Stamp serverDataVersion from any SSE payload that carries it
+          // (turn.end + final from the backend's emit boundary). Powers the
+          // Dashboard auto-refetch and the chat "data updated" banner.
+          if (parsed && typeof parsed === 'object' && 'data_version' in parsed) {
+            useAppStore.getState().observeServerDataVersion(parsed.data_version)
+          }
+          onEvent({ event, data: parsed })
+        } catch {
+          onEvent({ event, data })
+        }
       }
     }
+  } finally {
+    try { await reader.cancel() } catch { /* already done / aborted */ }
   }
 }
 
 // ---------------------------------------------------------------------------
 // 4. Public API surface
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Auth helpers — call /auth/login, store the signed token, sign the user
+// out. Used by the LoginGate component. The backend's auth middleware
+// validates the token on every subsequent request via the Authorization
+// header that withAuthHeader() injects.
+// ---------------------------------------------------------------------------
+
+export interface LoginResult {
+  ok: boolean
+  token: string
+  username: string
+  token_ttl_hours?: number
+  auth_enabled?: boolean
+}
+
+export async function loginWith(
+  username: string,
+  password: string,
+): Promise<LoginResult> {
+  const res = await safeFetch(`${BASE_URL}/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => undefined)
+    throw new ApiError(
+      (detail as { detail?: string } | undefined)?.detail
+        ?? `Login failed (HTTP ${res.status})`,
+      res.status,
+      detail,
+    )
+  }
+  const result = (await res.json()) as LoginResult
+  useAppStore.getState().setAuthToken(result.token, result.username)
+  if (typeof result.auth_enabled === 'boolean') {
+    useAppStore.getState().setAuthEnabled(result.auth_enabled)
+  }
+  return result
+}
+
+// Clear the local auth state. Renamed from `logout` because the codebase
+// already has a Google-Drive `logout()` that hits POST /auth/logout —
+// keeping the names distinct prevents a TS duplicate-declaration error
+// and keeps the call sites readable.
+export function clearAuth(): void {
+  useAppStore.getState().setAuthToken(null, null)
+}
+
+// Probe /health for the backend's AUTH_ENABLED flag. Called once on app
+// boot so the LoginGate knows whether to render. Never throws — silently
+// leaves authEnabled as null on network error.
+export async function probeAuthEnabled(): Promise<boolean | null> {
+  try {
+    const res = await safeFetch(`${BASE_URL}/health`)
+    if (!res.ok) return null
+    const json = await res.json().catch(() => ({})) as { auth_enabled?: boolean }
+    const flag = typeof json.auth_enabled === 'boolean' ? json.auth_enabled : false
+    useAppStore.getState().setAuthEnabled(flag)
+    return flag
+  } catch {
+    return null
+  }
+}
 
 export async function uploadSales(
   file: File,
@@ -563,6 +677,16 @@ interface AppState {
   // past it.
   conversationStartVersion: number | null
 
+  // Phase 3 auth: token from /auth/login is sent as Authorization: Bearer
+  // on every backend request. authEnabled is what the BACKEND told us via
+  // /health — frontend uses it to decide whether to render the LoginGate.
+  // When null we haven't probed yet; treat as enabled to be safe.
+  auth: {
+    token:       string | null
+    username:    string | null
+    authEnabled: boolean | null
+  }
+
   setShop: (info: Partial<ShopInfo>) => void
   setDataset: (d: DatasetMeta | null) => void
   setFilters: (f: Partial<DashboardFilters>) => void
@@ -573,6 +697,10 @@ interface AppState {
   clearChat: () => void
   setStreaming: (b: boolean) => void
   rotateConversation: () => void
+
+  // Auth setters
+  setAuthToken: (token: string | null, username?: string | null) => void
+  setAuthEnabled: (enabled: boolean) => void
 
   // Monotonically updates serverDataVersion (ignores stale lower values).
   // First call within a conversation also stamps conversationStartVersion.
@@ -610,6 +738,8 @@ export const useAppStore = create<AppState>()(
       serverDataVersion: null,
       conversationStartVersion: null,
 
+      auth: { token: null, username: null, authEnabled: null },
+
       setShop: (info) => set((s) => ({ shop: { ...s.shop, ...info } })),
       setDataset: (d) => set({ dataset: d }),
       setFilters: (f) => set((s) => ({ filters: { ...s.filters, ...f } })),
@@ -639,6 +769,11 @@ export const useAppStore = create<AppState>()(
           conversationStartVersion: null,
         }),
 
+      setAuthToken: (token, username) =>
+        set((s) => ({ auth: { ...s.auth, token, username: username ?? s.auth.username } })),
+      setAuthEnabled: (enabled) =>
+        set((s) => ({ auth: { ...s.auth, authEnabled: enabled } })),
+
       observeServerDataVersion: (v) => {
         if (v === null || v === undefined) return
         const n = typeof v === 'number' ? v : Number(v)
@@ -663,6 +798,9 @@ export const useAppStore = create<AppState>()(
         dataset: s.dataset,
         chatHistory: s.chatHistory.slice(-MAX_PERSISTED_MESSAGES),
         conversationId: s.conversationId,
+        // Persist auth so a page refresh doesn't kick the user out.
+        // authEnabled stays in memory (re-probed via /health on boot).
+        auth: { token: s.auth.token, username: s.auth.username, authEnabled: null },
       }),
     },
   ),

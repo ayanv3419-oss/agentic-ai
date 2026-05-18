@@ -31,6 +31,18 @@ services:
       # production user landed on a "site can't be reached" page.
       - key: FRONTEND_URL
         value: https://agentic-ai-ayanv3419-oss-projects.vercel.app
+      # --- Auth (Phase 3) -------------------------------------------
+      # Default off so a misconfigured deploy doesn't brick — flip to
+      # "true" in the Render dashboard once ADMIN_USERNAME + PASSWORD
+      # + AUTH_TOKEN_SECRET are also set there.
+      - key: AUTH_ENABLED
+        value: "false"
+      - key: ADMIN_USERNAME
+        sync: false   # set in Render dashboard (required when AUTH_ENABLED=true)
+      - key: ADMIN_PASSWORD
+        sync: false   # set in Render dashboard (required when AUTH_ENABLED=true)
+      - key: AUTH_TOKEN_SECRET
+        sync: false   # set in Render dashboard (required when AUTH_ENABLED=true)
       - key: GROQ_API_KEY
         sync: false   # set manually in Render dashboard (optional server-side key)
       - key: SENTRY_DSN
