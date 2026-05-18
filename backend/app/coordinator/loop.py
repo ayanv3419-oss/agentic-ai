@@ -8,7 +8,8 @@ Coordinator loop. Drives the agentic cycle:
     5. Reflect, repeat. Stop when the LLM emits no more tool calls or
        the iteration cap is hit, then emit final + turn.end.
 
-Maximum: 10 iterations (hooks.MAX_ITERATIONS). Cost guard enforces it.
+Caps: 10 LLM rounds (MAX_ITERATIONS) AND 20 total tool calls
+(MAX_TOOL_CALLS). Either trips, the loop ends.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ import uuid
 from typing import Any
 
 from app.coordinator.dispatcher import dispatch
-from app.coordinator.hooks import MAX_ITERATIONS
+from app.coordinator.hooks import MAX_ITERATIONS, MAX_TOOL_CALLS
 from app.coordinator.llm import LLMClient
 from app.coordinator.memory import render_context
 from app.coordinator.state import ToolCall, TurnState
@@ -63,7 +64,8 @@ Strict rules:
     further tool calls.
   - You MUST NOT call SqlExecutor without first calling SqlDryRun on the
     same SQL.
-  - Stay under 10 total tool calls per turn.
+  - Hard caps: 10 LLM rounds AND 20 total tool calls per turn. Either
+    trips, the turn ends - so plan ahead.
   - When in doubt, ask for fewer rows (smaller LIMIT) rather than more."""
 
 
@@ -131,6 +133,9 @@ async def run_loop(
         if state.cost.iterations >= MAX_ITERATIONS:
             _log.info("iteration cap reached for turn=%s", state.turn_id)
             break
+        if state.iteration >= MAX_TOOL_CALLS:
+            _log.info("tool-call cap reached for turn=%s", state.turn_id)
+            break
         if state.finished and state.final_answer:
             break
 
@@ -140,18 +145,11 @@ async def run_loop(
             temperature=0.0,
             max_tokens=900,
         )
-        state = state.apply(
-            cost=state.cost.with_iter(
-                tokens_in=resp.tokens_in,
-                tokens_out=resp.tokens_out,
-            ),
-        )
 
         if resp.error:
+            # Don't count an erroring round toward the iteration cap.
             _log.warning("llm error in loop: %s", resp.error)
             state = state.with_error(f"llm:{resp.error_kind}:{resp.error}")
-            # If we already have a final_answer use it; otherwise give a
-            # safe placeholder.
             if not state.final_answer:
                 state = state.apply(
                     final_answer=(
@@ -161,6 +159,14 @@ async def run_loop(
                 )
             break
 
+        # Only successful rounds count toward the round budget.
+        state = state.apply(
+            cost=state.cost.with_iter(
+                tokens_in=resp.tokens_in,
+                tokens_out=resp.tokens_out,
+            ),
+        )
+
         # No tool calls = the LLM is done; treat its content as the
         # final answer if insightFmt hasn't already produced one.
         if not resp.tool_calls:
@@ -168,7 +174,12 @@ async def run_loop(
                 state = state.apply(final_answer=resp.content.strip())
             break
 
-        # Add assistant message + dispatch each tool call.
+        # Add assistant message + dispatch every tool call in the batch.
+        # Dispatching all of them (rather than break-on-insightFmt) keeps
+        # the OpenAI tool-calling protocol satisfied: every tool_calls[i]
+        # in the assistant message MUST have a matching tool message.
+        # Loop termination after insightFmt is handled by the outer while
+        # check on state.finished + state.final_answer.
         messages.append(_assistant_with_tool_calls(resp.content, resp.tool_calls))
         for tc in resp.tool_calls:
             state = state.apply(iteration=state.iteration + 1)
@@ -192,13 +203,8 @@ async def run_loop(
                     "error": result.error,
                 },
             ))
-            # If insightFmt just succeeded we have the final answer and
-            # can stop after the LLM gets one more chance to wrap up.
             if call.name == "insightFmt" and result.status == "ok":
                 state = state.apply(finished=True)
-                break
-        if state.cost.iterations >= MAX_ITERATIONS:
-            break
 
     return state
 

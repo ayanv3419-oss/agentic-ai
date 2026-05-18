@@ -88,8 +88,11 @@ async def dispatch(
     )
 
     new_state = state.with_tool_call(call).with_tool_result(result)
-    # Apply any state updates the tool requested.
-    if outcome.state_updates:
+    # Apply any state updates the tool requested - but ONLY when the tool
+    # succeeded. A failing tool may have set partial updates before its
+    # error path returned; applying them would corrupt downstream state
+    # (e.g. a stale sql_draft consumed by SqlDryRun).
+    if outcome.ok and outcome.state_updates:
         new_state = new_state.apply(**outcome.state_updates)
 
     run_post_hooks(new_state, call, result)

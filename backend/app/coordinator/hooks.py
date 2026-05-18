@@ -22,7 +22,11 @@ from app.coordinator.tools.base import ToolOutcome
 _log = logging.getLogger("coordinator.hooks")
 
 # Hard caps tied to the user's spec.
+# MAX_ITERATIONS bounds the number of LLM rounds (each round may emit
+# multiple tool calls). MAX_TOOL_CALLS bounds total tool dispatches per
+# turn, catching the "single round emits 50 tools" failure mode.
 MAX_ITERATIONS = 10
+MAX_TOOL_CALLS = 20
 
 
 @dataclass
@@ -33,7 +37,7 @@ class HookOutcome:
 
 
 def cost_guard(state: TurnState, call: ToolCall) -> HookOutcome:
-    """Short-circuit when iteration / cost budget is exhausted."""
+    """Short-circuit when iteration / tool-call budget is exhausted."""
     if state.cost.iterations >= MAX_ITERATIONS:
         return HookOutcome(
             skip=True,
@@ -41,6 +45,15 @@ def cost_guard(state: TurnState, call: ToolCall) -> HookOutcome:
             forced_result=ToolOutcome(
                 ok=False,
                 error=f"Iteration cap {MAX_ITERATIONS} exceeded - emit final answer.",
+            ),
+        )
+    if state.iteration >= MAX_TOOL_CALLS:
+        return HookOutcome(
+            skip=True,
+            reason=f"tool-call limit ({MAX_TOOL_CALLS}) reached",
+            forced_result=ToolOutcome(
+                ok=False,
+                error=f"Tool-call cap {MAX_TOOL_CALLS} exceeded - emit final answer.",
             ),
         )
     return HookOutcome()
@@ -114,6 +127,7 @@ def run_post_hooks(state: TurnState, call: ToolCall, result: ToolResult) -> None
 __all__ = [
     "HookOutcome",
     "MAX_ITERATIONS",
+    "MAX_TOOL_CALLS",
     "cost_guard",
     "log_call",
     "log_result",
