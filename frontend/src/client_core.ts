@@ -46,7 +46,6 @@ export interface ChatMessage {
 export interface ShopInfo {
   shopName: string
   ownerName: string
-  groqApiKey: string
 }
 
 export interface DatasetMeta {
@@ -290,10 +289,8 @@ export class ApiError extends Error {
 }
 
 function buildHeaders(extra?: HeadersInit): Headers {
-  const { shop } = useAppStore.getState()
   const h = new Headers(extra)
   if (!h.has('Content-Type')) h.set('Content-Type', 'application/json')
-  if (shop.groqApiKey) h.set('X-Groq-Api-Key', shop.groqApiKey)
   return h
 }
 
@@ -361,12 +358,10 @@ export async function uploadFile<T>(
   file: File,
   extra?: Record<string, string>,
 ): Promise<T> {
-  const { shop } = useAppStore.getState()
   const fd = new FormData()
   fd.append('file', file)
   Object.entries(extra ?? {}).forEach(([k, v]) => fd.append(k, v))
   const headers: Record<string, string> = {}
-  if (shop.groqApiKey) headers['X-Groq-Api-Key'] = shop.groqApiKey
   // eslint-disable-next-line no-console
   console.info(`[api] UPLOAD ${path} file=${file.name} bytes=${file.size}`)
   const res = await safeFetch(`${BASE_URL}${path}`, withAuthHeader({
@@ -385,13 +380,12 @@ export async function streamQuery(
   onEvent: (e: SseEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const { shop, conversationId } = useAppStore.getState()
+  const { conversationId } = useAppStore.getState()
   const res = await safeFetch(`${BASE_URL}/query_stream`, withAuthHeader({
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
-      ...(shop.groqApiKey ? { 'X-Groq-Api-Key': shop.groqApiKey } : {}),
     },
     body: JSON.stringify({ question, conversation_id: conversationId }),
     signal,
@@ -607,10 +601,6 @@ export async function streamAIQuery(
   onEvent: (e: SseEvent) => void,
   opts?: { apiKey?: string; signal?: AbortSignal; maxRetries?: number },
 ): Promise<void> {
-  const apiKey = opts?.apiKey ?? useAppStore.getState().shop.groqApiKey
-  if (!apiKey) {
-    throw new ApiError('Groq API key not configured. Set it in Shop Info.', 401)
-  }
   return streamQueryWithRetry(message, onEvent, {
     signal:     opts?.signal,
     maxRetries: opts?.maxRetries ?? 2,
@@ -710,7 +700,6 @@ interface AppState {
 const emptyShop: ShopInfo = {
   shopName: '',
   ownerName: '',
-  groqApiKey: '',
 }
 
 const defaultMonth = (): string => new Date().toISOString().slice(0, 7)

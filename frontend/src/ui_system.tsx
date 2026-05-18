@@ -32,14 +32,11 @@ import {
   ChevronLeft,
   ChevronRight,
   Cloud,
-  Eye,
-  EyeOff,
   FileSpreadsheet,
   LayoutDashboard,
   Loader2,
   RefreshCw,
   Save,
-  ShieldCheck,
   ShoppingBag,
   Send,
   Sparkles,
@@ -829,7 +826,6 @@ export function AiAssistant() {
   const updateMessage = useAppStore((s) => s.updateMessage)
   const clearChat = useAppStore((s) => s.clearChat)
   const setStreaming = useAppStore((s) => s.setStreaming)
-  const apiKeySet = useAppStore((s) => Boolean(s.shop.groqApiKey))
   // Banner inputs: when serverDataVersion advances past the version
   // captured at conversation-start, the next reply uses fresher data
   // than the answers already on screen. We surface that explicitly so
@@ -867,8 +863,8 @@ export function AiAssistant() {
   }, [input])
 
   const canSend = useMemo(
-    () => input.trim().length > 0 && !isStreaming && apiKeySet,
-    [input, isStreaming, apiKeySet],
+    () => input.trim().length > 0 && !isStreaming,
+    [input, isStreaming],
   )
 
   const stop = () => {
@@ -879,7 +875,6 @@ export function AiAssistant() {
   const handleSend = async () => {
     const text = input.trim()
     if (!text || isStreaming) return
-    if (!apiKeySet) return
 
     const userMsg: ChatMessage = {
       id: newId(),
@@ -1026,7 +1021,7 @@ export function AiAssistant() {
       <div ref={scrollerRef} className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto px-6 md:px-10 py-8">
           {messages.length === 0 ? (
-            <EmptyState onPick={(s) => setInput(s)} apiKeySet={apiKeySet} />
+            <EmptyState onPick={(s) => setInput(s)} />
           ) : (
             <div className="space-y-6">
               {messages.map((m) => (
@@ -1055,12 +1050,6 @@ export function AiAssistant() {
               </button>
             </div>
           )}
-          {!apiKeySet && (
-            <div className="mb-3 flex items-center gap-2 text-xs text-amber-400/80">
-              <AlertTriangle className="w-3.5 h-3.5" />
-              Set your Groq API key in Shop Info to enable the assistant.
-            </div>
-          )}
           <div className="relative flex items-end gap-2 rounded-2xl border border-zinc-800 bg-zinc-900/60 focus-within:border-emerald-500/50 transition-colors p-2">
             <textarea
               ref={textareaRef}
@@ -1068,13 +1057,8 @@ export function AiAssistant() {
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}
               rows={1}
-              placeholder={
-                apiKeySet
-                  ? 'Ask anything about your business…'
-                  : 'API key required — open Shop Info to add yours'
-              }
-              disabled={!apiKeySet}
-              className="flex-1 resize-none bg-transparent px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none disabled:opacity-60"
+              placeholder="Ask anything about your business…"
+              className="flex-1 resize-none bg-transparent px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none"
             />
             {isStreaming ? (
               <button
@@ -1138,13 +1122,7 @@ function ChatHeader({ onClear, hasMessages }: { onClear: () => void; hasMessages
   )
 }
 
-function EmptyState({
-  onPick,
-  apiKeySet,
-}: {
-  onPick: (s: string) => void
-  apiKeySet: boolean
-}) {
+function EmptyState({ onPick }: { onPick: (s: string) => void }) {
   return (
     <div className="py-16 animate-fade-in">
       <div className="text-center">
@@ -1163,8 +1141,7 @@ function EmptyState({
             key={s}
             type="button"
             onClick={() => onPick(s)}
-            disabled={!apiKeySet}
-            className="text-left card px-4 py-3 hover:border-zinc-700 hover:bg-zinc-900/70 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="text-left card px-4 py-3 hover:border-zinc-700 hover:bg-zinc-900/70 transition-colors"
           >
             <span className="text-sm text-zinc-200">{s}</span>
           </button>
@@ -1598,7 +1575,6 @@ const MAX_BYTES = 1024 * 1024 * 1024 // 1 GB
 export function UploadData() {
   const dataset = useAppStore((s) => s.dataset)
   const setDataset = useAppStore((s) => s.setDataset)
-  const apiKeySet = useAppStore((s) => Boolean(s.shop.groqApiKey))
 
   const [file, setFile] = useState<File | null>(null)
   const [busy, setBusy] = useState(false)
@@ -1960,13 +1936,6 @@ export function UploadData() {
         </section>
       </div>
 
-      {!apiKeySet && (
-        <div className="mt-6 text-xs text-amber-400/80 flex items-center gap-2">
-          <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
-          Set your Groq API key in Shop Info before running analytics on this dataset.
-        </div>
-      )}
-
       {dataset && (
         <section className="mt-8 card p-5 flex items-center gap-4 animate-slide-up">
           <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
@@ -2228,7 +2197,6 @@ export function ShopInfo() {
   const clearShop = useAppStore((s) => s.clearShop)
 
   const [form, setForm] = useState<ShopInfoType>(shop)
-  const [showKey, setShowKey] = useState(false)
   const [savedAt, setSavedAt] = useState<string | null>(null)
 
   const update = <K extends keyof ShopInfoType>(k: K, v: ShopInfoType[K]) =>
@@ -2241,9 +2209,9 @@ export function ShopInfo() {
   }
 
   const onClear = () => {
-    if (!confirm('Clear all shop info, including the API key?')) return
+    if (!confirm('Clear all shop info?')) return
     clearShop()
-    setForm({ shopName: '', ownerName: '', groqApiKey: '' })
+    setForm({ shopName: '', ownerName: '' })
     setSavedAt(null)
   }
 
@@ -2254,7 +2222,7 @@ export function ShopInfo() {
       <PageHeader
         icon={<Building2 className="w-5 h-5 text-emerald-400" />}
         title="Shop Info"
-        subtitle="Identity and credentials. The Groq API key is used for every analytics request."
+        subtitle="Your shop identity."
       />
 
       <form onSubmit={onSave} className="mt-8 max-w-2xl space-y-5">
@@ -2270,32 +2238,6 @@ export function ShopInfo() {
           onChange={(v) => update('ownerName', v)}
           placeholder="Full legal name"
         />
-
-        <div>
-          <label className="label">Groq API Key</label>
-          <div className="relative">
-            <input
-              type={showKey ? 'text' : 'password'}
-              value={form.groqApiKey}
-              onChange={(e) => update('groqApiKey', e.target.value)}
-              placeholder="gsk_..."
-              autoComplete="off"
-              spellCheck={false}
-              data-1p-ignore
-              data-lpignore="true"
-              className="input pr-10 font-mono text-sm"
-            />
-            <button
-              type="button"
-              onClick={() => setShowKey((s) => !s)}
-              className="absolute right-1 top-1/2 -translate-y-1/2 p-2 text-zinc-500 hover:text-zinc-200 rounded-md"
-              aria-label={showKey ? 'Hide API key' : 'Show API key'}
-            >
-              {showKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-            </button>
-          </div>
-          <KeyNotice hasKey={Boolean(form.groqApiKey)} />
-        </div>
 
         <div className="flex items-center gap-3 pt-3">
           <button type="submit" disabled={!dirty} className="btn btn-primary">
@@ -2335,21 +2277,3 @@ function Field({ label, value, onChange, placeholder }: FieldProps) {
   )
 }
 
-function KeyNotice({ hasKey }: { hasKey: boolean }) {
-  if (hasKey) {
-    return (
-      <p className="mt-2 flex items-start gap-2 text-xs text-zinc-500">
-        <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5" />
-        <span>
-          Stored locally in your browser. Sent as <code className="text-zinc-400 font-mono">X-Groq-Api-Key</code> on every API call. Never bundled into source.
-        </span>
-      </p>
-    )
-  }
-  return (
-    <p className="mt-2 flex items-start gap-2 text-xs text-amber-400/80">
-      <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-      <span>API key required to run analytics queries. Get one at console.groq.com.</span>
-    </p>
-  )
-}

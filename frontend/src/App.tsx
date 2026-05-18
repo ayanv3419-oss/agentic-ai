@@ -94,8 +94,6 @@ interface SidebarProps {
 }
 
 function Sidebar({ active, onSelect, onLogout }: SidebarProps) {
-  const apiKeySet = useAppStore((s) => Boolean(s.shop.groqApiKey))
-
   return (
     <aside className="w-64 shrink-0 bg-zinc-950 border-r border-zinc-800 flex flex-col">
       <div className="px-5 h-16 flex items-center gap-2 border-b border-zinc-800">
@@ -136,26 +134,6 @@ function Sidebar({ active, onSelect, onLogout }: SidebarProps) {
       </nav>
 
       <div className="p-3 border-t border-zinc-800 space-y-2">
-        <div className="px-3 py-2.5 rounded-lg bg-zinc-900/60 border border-zinc-800">
-          <div className="flex items-center justify-between">
-            <div className="text-[11px] uppercase tracking-wider text-zinc-500">Groq API</div>
-            <span
-              className={cn(
-                'inline-block w-1.5 h-1.5 rounded-full',
-                apiKeySet ? 'bg-emerald-400' : 'bg-amber-400',
-              )}
-            />
-          </div>
-          <div
-            className={cn(
-              'text-sm font-medium mt-1',
-              apiKeySet ? 'text-emerald-400' : 'text-amber-400',
-            )}
-          >
-            {apiKeySet ? 'Connected' : 'Not configured'}
-          </div>
-        </div>
-
         <button
           type="button"
           onClick={onLogout}
@@ -199,7 +177,7 @@ function TopBar() {
         )}
         <div className="flex items-center gap-1.5">
           <Activity className="w-3.5 h-3.5 text-emerald-400" />
-          <span>Powered by Groq</span>
+          <span>Powered by Qwen</span>
         </div>
       </div>
     </header>
