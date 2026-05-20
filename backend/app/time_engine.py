@@ -2,7 +2,8 @@
 
 NEVER use the machine clock for analytics. Every relative-time concept
 ("today", "yesterday", "last 7 days", "this month", "previous month")
-must anchor to `MAX("Date")` across sales + purchase tables.
+must anchor to the latest date in the uploaded data — scanned across the
+sales/purchase tables AND every dynamic u_* table's date columns.
 
 Public surface:
     get_dataset_current_date()        — ISO YYYY-MM-DD or None when no data
@@ -27,7 +28,13 @@ from datetime import date, datetime, timedelta
 from threading import Lock
 from typing import Any
 
-from app.infrastructure import ALLOWED_TABLES, fetch_one, get_data_version, quoted
+from app.infrastructure import (
+    ALLOWED_TABLES,
+    fetch_all,
+    fetch_one,
+    get_data_version,
+    quoted,
+)
 
 
 _log = logging.getLogger("agentic_ai.time_engine")
@@ -68,9 +75,24 @@ async def get_dataset_current_date() -> str | None:
     return tokens.get("dataset_today") or None
 
 
+def _valid_iso(d: Any) -> bool:
+    return (isinstance(d, str) and len(d) == 10
+            and d[4] == "-" and d[7] == "-")
+
+
 async def _scan_max_date() -> str | None:
-    """Live DB scan — never cache outside this module."""
+    """Live DB scan — never cache outside this module.
+
+    Scans the canonical sales/purchase tables (the "Date" column) AND
+    every dynamically-ingested u_* table (any column whose name contains
+    'date'), so the dataset's "today" reflects the user's real uploaded
+    data — not just the legacy system tables. Without the u_* scan,
+    relative windows like "last 3 days" anchored to stale system-table
+    dates instead of the actual uploaded data.
+    """
     candidates: list[str] = []
+
+    # 1. Canonical sales / purchase tables — fixed "Date" column.
     for table in ALLOWED_TABLES:
         try:
             row = await fetch_one(
@@ -82,8 +104,41 @@ async def _scan_max_date() -> str | None:
             _log.warning("time_engine: scan of %s failed", table, exc_info=True)
             continue
         d = row.get("max_d") if row else None
-        if isinstance(d, str) and len(d) == 10 and d[4] == "-" and d[7] == "-":
+        if _valid_iso(d):
             candidates.append(d)
+
+    # 2. Dynamic u_* tables — scan every date-like column.
+    try:
+        u_tables = await fetch_all(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name LIKE 'u\\_%' ESCAPE '\\'"
+        )
+    except Exception:
+        _log.warning("time_engine: failed to list u_* tables", exc_info=True)
+        u_tables = []
+    for t in u_tables or []:
+        name = (t.get("name") if isinstance(t, dict) else None) or ""
+        if not name:
+            continue
+        try:
+            cols = await fetch_all(f"PRAGMA table_info({quoted(name)})")
+        except Exception:
+            continue
+        for c in cols or []:
+            col = (c.get("name") if isinstance(c, dict) else None) or ""
+            if "date" not in col.lower():
+                continue
+            try:
+                row = await fetch_one(
+                    f'SELECT MAX({quoted(col)}) AS max_d FROM {quoted(name)} '
+                    f'WHERE {quoted(col)} GLOB \'????-??-??\''
+                )
+            except Exception:
+                continue
+            d = row.get("max_d") if row else None
+            if _valid_iso(d):
+                candidates.append(d)
+
     if not candidates:
         return None
     return max(candidates)

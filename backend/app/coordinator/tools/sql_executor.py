@@ -7,6 +7,7 @@ applied again here (defense in depth).
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 from app.coordinator.tools.base import Tool, ToolContext, ToolOutcome
@@ -67,11 +68,81 @@ def _infer_column_types(
     return out
 
 
-def _build_chart_payload(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Auto-derive a chart payload when the result has columns suitable
-    for plotting. Picks the first text-like column as x and the first
-    numeric column as y by scanning multiple rows (not just row[0]) so
-    a NULL at row 0 doesn't disqualify a valid column."""
+_DATE_COL_HINT = re.compile(r"(date|month|year|day|week|quarter|period|bucket)", re.I)
+_DATE_VAL = re.compile(r"^\d{4}([-/]\d{1,2}){0,2}$")
+
+
+def _y_label_for(col: str) -> str:
+    """Map a numeric column name to a y-axis semantic label. The frontend
+    treats 'sales' as currency (₹) and anything else as a plain count."""
+    c = (col or "").lower()
+    if any(k in c for k in ("amount", "total", "sales", "revenue", "price", "value", "cost")):
+        return "sales"
+    if any(k in c for k in ("qty", "quantity", "units", "stock")):
+        return "quantity"
+    if any(k in c for k in ("count", "orders", "txn", "transaction", "number")):
+        return "count"
+    return "value"
+
+
+def _num(v: Any) -> float:
+    try:
+        if v is None:
+            return 0.0
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _looks_like_dates(col: str, rows: list[dict[str, Any]]) -> bool:
+    """True when a label column is time-like (so we plot a trend, not a
+    ranking) - judged by column name AND the shape of its values."""
+    if _DATE_COL_HINT.search(col or ""):
+        return True
+    hits = seen = 0
+    for r in rows[:20]:
+        v = r.get(col)
+        if v is None:
+            continue
+        seen += 1
+        if isinstance(v, str) and _DATE_VAL.match(v.strip()):
+            hits += 1
+    return seen > 0 and hits >= max(1, seen // 2)
+
+
+def _order_by_col(sql: str | None, cols: list[str]) -> str | None:
+    """Pull the column a query is ranked by out of its ORDER BY clause.
+    That column is the metric the user actually asked about - so the
+    chart must plot IT, not just the first numeric column. Handles
+    "ORDER BY t.col DESC", quoted names, and positional "ORDER BY 4"."""
+    if not sql:
+        return None
+    m = re.search(r"\border\s+by\s+(.+?)(?:\s+limit\b|\s*$)", sql, re.I | re.S)
+    if not m:
+        return None
+    first = m.group(1).split(",")[0].strip()
+    first = re.sub(r"\s+(asc|desc)\s*$", "", first, flags=re.I).strip()
+    first = first.strip('"').strip("'")
+    if "." in first:
+        first = first.split(".")[-1].strip('"').strip("'")
+    if first.isdigit():
+        idx = int(first) - 1
+        return cols[idx] if 0 <= idx < len(cols) else None
+    return first if first in cols else None
+
+
+def _build_chart_payload(
+    rows: list[dict[str, Any]],
+    sql: str | None = None,
+) -> dict[str, Any] | None:
+    """Build a SalesChart payload - the exact shape the frontend ChatChart
+    renders. Returns:
+      - kind 'summary' for a single numeric value,
+      - kind 'trend'   when the label column looks like dates,
+      - kind 'ranking' otherwise (label + value pairs).
+    The y-axis column is the one the query is ORDER BY-ed on when known
+    (so "top 5 by margin" plots margin, not sales); otherwise the first
+    numeric column. Returns None when there is nothing to plot."""
     if not rows:
         return None
     types = _infer_column_types(rows)
@@ -79,29 +150,63 @@ def _build_chart_payload(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         return None
     cols = list(types.keys())
     x_col = next((c for c in cols if types[c] == "text"), None)
-    y_col = next((c for c in cols if types[c] == "number"), None)
-    if x_col is None and cols:
-        x_col = cols[0]
+    ranked = _order_by_col(sql, cols)
+    if ranked and types.get(ranked) == "number":
+        y_col = ranked
+    else:
+        y_col = next((c for c in cols if types[c] == "number"), None)
     if y_col is None:
-        # Try the second column as a fallback numeric, but only if it
-        # isn't the same column we picked for x.
-        for c in cols:
-            if c != x_col and types[c] != "text":
-                y_col = c
-                break
-    if x_col is None or y_col is None or x_col == y_col:
         return None
-    total = len(rows)
-    truncated = total > _CHART_MAX_POINTS
+
+    # Single row with a number -> summary card (e.g. "total sales").
+    if len(rows) == 1:
+        return {
+            "kind": "summary",
+            "granularity": "monthly",
+            "totals": {
+                "total_sales": _num(rows[0].get(y_col)),
+                "orders": 1,
+                "customers": 0,
+            },
+            "series": [],
+            "y_label": _y_label_for(y_col),
+        }
+
+    if x_col is None or x_col == y_col:
+        x_col = next((c for c in cols if c != y_col), None)
+    if x_col is None:
+        return None
+
     capped = rows[:_CHART_MAX_POINTS]
+    points = [
+        {"name": str(r.get(x_col)), "value": _num(r.get(y_col))}
+        for r in capped
+    ]
+    total_val = sum(p["value"] for p in points)
+    y_label = _y_label_for(y_col)
+
+    if _looks_like_dates(x_col, capped):
+        return {
+            "kind": "trend",
+            "granularity": "monthly",
+            "totals": {"total_sales": total_val, "orders": len(points), "customers": 0},
+            "series": [
+                {"bucket": p["name"], "sales": p["value"], "orders": 0}
+                for p in points
+            ],
+            "y_label": y_label,
+        }
+
     return {
-        "kind": "bar" if total <= 30 else "line",
-        "x": x_col,
-        "y": y_col,
-        "labels": [str(r.get(x_col)) for r in capped],
-        "values": [r.get(y_col) for r in capped],
-        "total_points": total,
-        "truncated": truncated,
+        "kind": "ranking",
+        "granularity": "monthly",
+        "totals": {"total_sales": total_val, "orders": len(points), "customers": 0},
+        "series": [],
+        "items": [
+            {"name": p["name"], "sales": p["value"], "orders": 0}
+            for p in points
+        ],
+        "y_label": y_label,
     }
 
 
@@ -156,7 +261,7 @@ class SqlExecutorTool(Tool):
         # no-op against the 10 GB default. Removed. Row bounding is
         # handled by the outer LIMIT in _enforce_limit + _HARD_ROW_CAP.
 
-        chart = _build_chart_payload(result)
+        chart = _build_chart_payload(result, sql)
         updates: dict[str, Any] = {
             "sql_final": final_sql,
             "rows": result,

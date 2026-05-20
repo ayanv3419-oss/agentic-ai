@@ -1600,6 +1600,115 @@ DEFAULT_KPIS: list[dict[str, Any]] = [
 
 
 # ===========================================================================
+# DATA RE-POINTING (2026-05-20)
+# The shipped DEFAULT_KPIS above all target the legacy 2-table sales /
+# purchase schema. Real uploads land in the dynamic workbook tables:
+#   u_sales_transactions  -> net_sales, quantity, sku_id, brand, category,
+#                            payment_mode, transaction_date, final_product
+#   u_inventory_master    -> sku_id, unit_cost (joined for COGS / margin)
+# The block below re-points every KPI that maps cleanly to that data and
+# disables the ones that cannot be computed on it (no customer identity,
+# loyalty, GSTIN or per-bank columns; dataset-relative time windows would
+# need the time engine re-pointed first).
+# ===========================================================================
+
+_REPOINTED_SQL: dict[str, str] = {
+    "total_revenue":
+        "SELECT COALESCE(SUM(net_sales),0) AS value FROM u_sales_transactions",
+    "total_sales_count":
+        "SELECT COUNT(*) AS value FROM u_sales_transactions",
+    "average_sale_value":
+        "SELECT COALESCE(AVG(net_sales),0) AS value FROM u_sales_transactions",
+    "total_orders":
+        "SELECT COUNT(DISTINCT invoice_no) AS value FROM u_sales_transactions "
+        "WHERE invoice_no IS NOT NULL AND invoice_no <> ''",
+    "aov":
+        "SELECT CASE WHEN COUNT(DISTINCT invoice_no)=0 THEN 0 ELSE "
+        "COALESCE(SUM(net_sales),0)*1.0/COUNT(DISTINCT invoice_no) END AS value "
+        "FROM u_sales_transactions WHERE invoice_no IS NOT NULL AND invoice_no <> ''",
+    "total_products_sold":
+        "SELECT COUNT(DISTINCT sku_id) AS value FROM u_sales_transactions",
+    "total_purchases":
+        "SELECT COALESCE(SUM(s.quantity*i.unit_cost),0) AS value "
+        "FROM u_sales_transactions s JOIN u_inventory_master i ON s.sku_id=i.sku_id",
+    "gross_profit":
+        "SELECT (COALESCE(SUM(s.net_sales),0)-COALESCE(SUM(s.quantity*i.unit_cost),0)) "
+        "AS value FROM u_sales_transactions s "
+        "JOIN u_inventory_master i ON s.sku_id=i.sku_id",
+    "profit_margin":
+        "SELECT CASE WHEN COALESCE(SUM(s.net_sales),0)=0 THEN 0 ELSE "
+        "(SUM(s.net_sales)-SUM(s.quantity*i.unit_cost))*100.0/SUM(s.net_sales) END "
+        "AS value FROM u_sales_transactions s "
+        "JOIN u_inventory_master i ON s.sku_id=i.sku_id",
+    "cost_to_revenue_ratio":
+        "SELECT CASE WHEN COALESCE(SUM(s.net_sales),0)=0 THEN 0 ELSE "
+        "SUM(s.quantity*i.unit_cost)*1.0/SUM(s.net_sales) END AS value "
+        "FROM u_sales_transactions s JOIN u_inventory_master i ON s.sku_id=i.sku_id",
+    "top_product":
+        "SELECT final_product AS label, COALESCE(SUM(net_sales),0) AS value "
+        "FROM u_sales_transactions GROUP BY final_product ORDER BY value DESC LIMIT 1",
+    "bottom_product":
+        "SELECT final_product AS label, COALESCE(SUM(net_sales),0) AS value "
+        "FROM u_sales_transactions GROUP BY final_product ORDER BY value ASC LIMIT 1",
+    "highest_margin_products":
+        "SELECT s.final_product AS label, "
+        "ROUND((SUM(s.net_sales)-SUM(s.quantity*i.unit_cost))*100.0/SUM(s.net_sales),2) "
+        "AS value FROM u_sales_transactions s "
+        "JOIN u_inventory_master i ON s.sku_id=i.sku_id "
+        "GROUP BY s.final_product HAVING SUM(s.net_sales)>0 ORDER BY value DESC LIMIT 10",
+    "highest_profit_products":
+        "SELECT s.final_product AS label, "
+        "ROUND(SUM(s.net_sales)-SUM(s.quantity*i.unit_cost),2) AS value "
+        "FROM u_sales_transactions s JOIN u_inventory_master i ON s.sku_id=i.sku_id "
+        "GROUP BY s.final_product ORDER BY value DESC LIMIT 10",
+    "loss_making_products":
+        "SELECT s.final_product AS label, "
+        "ROUND(SUM(s.net_sales)-SUM(s.quantity*i.unit_cost),2) AS value "
+        "FROM u_sales_transactions s JOIN u_inventory_master i ON s.sku_id=i.sku_id "
+        "GROUP BY s.final_product "
+        "HAVING (SUM(s.net_sales)-SUM(s.quantity*i.unit_cost))<0 "
+        "ORDER BY value ASC LIMIT 10",
+    "sales_by_brand":
+        "SELECT brand AS label, COALESCE(SUM(net_sales),0) AS value "
+        "FROM u_sales_transactions WHERE brand IS NOT NULL "
+        "GROUP BY brand ORDER BY value DESC",
+    "sales_by_category":
+        "SELECT category AS label, COALESCE(SUM(net_sales),0) AS value "
+        "FROM u_sales_transactions WHERE category IS NOT NULL "
+        "GROUP BY category ORDER BY value DESC",
+    "top_brand":
+        "SELECT brand AS label, COALESCE(SUM(net_sales),0) AS value "
+        "FROM u_sales_transactions WHERE brand IS NOT NULL "
+        "GROUP BY brand ORDER BY value DESC LIMIT 1",
+    "top_category":
+        "SELECT category AS label, COALESCE(SUM(net_sales),0) AS value "
+        "FROM u_sales_transactions WHERE category IS NOT NULL "
+        "GROUP BY category ORDER BY value DESC LIMIT 1",
+    "peak_sales_day":
+        "SELECT transaction_date AS label, COALESCE(SUM(net_sales),0) AS value "
+        "FROM u_sales_transactions WHERE transaction_date IS NOT NULL "
+        "GROUP BY transaction_date ORDER BY value DESC LIMIT 1",
+    "sales_by_month":
+        "SELECT substr(transaction_date,1,7) AS label, "
+        "COALESCE(SUM(net_sales),0) AS value FROM u_sales_transactions "
+        "WHERE transaction_date IS NOT NULL GROUP BY label ORDER BY label ASC",
+    "payment_method_distribution":
+        "SELECT payment_mode AS label, COALESCE(SUM(net_sales),0) AS value "
+        "FROM u_sales_transactions WHERE payment_mode IS NOT NULL "
+        "GROUP BY payment_mode ORDER BY value DESC",
+}
+
+for _kpi in DEFAULT_KPIS:
+    if _kpi.get("id") in _REPOINTED_SQL:
+        _kpi["sql_template"] = _REPOINTED_SQL[_kpi["id"]]
+        _kpi["required_columns"] = []   # bypass legacy-schema column check
+        _kpi["enabled"] = True
+    else:
+        # Cannot be computed correctly on the current uploaded data shape.
+        _kpi["enabled"] = False
+
+
+# ===========================================================================
 # CRUD
 # ===========================================================================
 

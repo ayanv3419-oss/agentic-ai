@@ -30,7 +30,12 @@ Rules:
 5. Plain prose - no markdown headings, no bullet points unless the
    question literally asks for a list.
 6. If the rows are empty, say so plainly and suggest a refinement.
-7. Keep total length under 120 words."""
+7. Keep total length under 120 words.
+8. Margin / profit: if the rows carry no cost or unit-cost column, state
+   plainly that the data has no cost information so margin cannot be
+   computed. NEVER derive a margin by subtracting unrelated totals.
+9. All monetary amounts are Indian Rupees - write the "₹" symbol, never
+   "$" or the word "dollars"."""
 
 
 def _build_user(ctx: ToolContext, args: dict[str, Any]) -> str:

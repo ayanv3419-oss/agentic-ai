@@ -67,6 +67,14 @@ class Settings(BaseSettings):
     llm_temperature: float = Field(default=0.0, alias="LLM_TEMPERATURE")
     llm_max_tokens: int = Field(default=900, alias="LLM_MAX_TOKENS")
 
+    # --- LLM fallback ----------------------------------------------------
+    # Auto-failover provider. When the primary LLM is rate-limited, out of
+    # quota or unreachable, the SAME request is retried once against this
+    # provider. Leave the key blank to disable failover.
+    llm_fallback_base_url: str = Field(default="", alias="LLM_FALLBACK_BASE_URL")
+    llm_fallback_api_key: str = Field(default="", alias="LLM_FALLBACK_API_KEY")
+    llm_fallback_model: str = Field(default="", alias="LLM_FALLBACK_MODEL")
+
     # --- Cost / safety budgets ------------------------------------------
     max_loop_iterations: int = Field(default=8, alias="MAX_LOOP_ITERATIONS")
     cost_limit_usd: float = Field(default=1.0, alias="COST_LIMIT_USD")
@@ -1036,10 +1044,66 @@ async def unarchive_upload(batch_id: str) -> dict[str, Any]:
     }
 
 
+async def _disconnect_workbook(batch_id: str, meta: dict[str, Any]) -> dict[str, Any]:
+    """Disconnect a workbook dataset. Its rows live in dynamic u_* tables
+    tagged with a _batch_id column (not in sales/purchase). Delete every
+    row for this batch so the Coordinator no longer sees the data, then
+    mark the upload 'removed'."""
+    rows_removed = 0
+    async with get_connection() as db:
+        cur = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name LIKE 'u\\_%' ESCAPE '\\'"
+        )
+        tables = [dict(r).get("name") or "" for r in await cur.fetchall()]
+        await cur.close()
+        for t in tables:
+            if not t:
+                continue
+            cur = await db.execute(f"PRAGMA table_info({quoted(t)})")
+            cols = [dict(c).get("name") for c in await cur.fetchall()]
+            await cur.close()
+            if "_batch_id" not in cols:
+                continue
+            cur = await db.execute(
+                f'DELETE FROM {quoted(t)} WHERE _batch_id = ?', (batch_id,)
+            )
+            rows_removed += cur.rowcount or 0
+            await cur.close()
+        await db.execute(
+            "UPDATE uploads SET status='removed' WHERE batch_id = ?",
+            (batch_id,),
+        )
+        await db.commit()
+    file_removed = False
+    fp = meta.get("file_path")
+    if fp:
+        try:
+            p = Path(fp)
+            if p.exists() and p.is_file():
+                p.unlink()
+                file_removed = True
+        except Exception:
+            log.warning("failed to delete upload file: %s", fp, exc_info=True)
+    log.info(
+        "disconnect_upload (workbook): batch=%s rows_removed=%d file_removed=%s",
+        batch_id, rows_removed, file_removed,
+    )
+    return {
+        "batch_id": batch_id,
+        "rows_removed": int(rows_removed),
+        "file_removed": file_removed,
+        "table": meta.get("target") or "(workbook)",
+        "already_removed": False,
+        "status": "removed",
+    }
+
+
 async def disconnect_upload(batch_id: str) -> dict[str, Any]:
     """Remove a dataset permanently. Deletes:
       • All rows in sales/purchase AND sales_archive/purchase_archive
-        tagged with this batch_id (handles archived datasets correctly).
+        tagged with this batch_id (handles archived datasets correctly),
+        OR — for workbook datasets — every u_* row tagged with the batch.
       • The persisted source file on disk (if any).
     Marks the uploads row 'removed' (kept for audit history).
 
@@ -1049,8 +1113,6 @@ async def disconnect_upload(batch_id: str) -> dict[str, Any]:
     if meta is None:
         raise ValueError(f"unknown batch_id: {batch_id}")
     target = meta["target"]
-    if target not in ALLOWED_TABLES:
-        raise ValueError(f"upload metadata has invalid target: {target!r}")
     if meta["status"] == "removed":
         return {
             "batch_id": batch_id,
@@ -1060,6 +1122,9 @@ async def disconnect_upload(batch_id: str) -> dict[str, Any]:
             "already_removed": True,
             "status": "removed",
         }
+    # Workbook datasets live in dynamic u_* tables, not sales/purchase.
+    if target not in ALLOWED_TABLES:
+        return await _disconnect_workbook(batch_id, meta)
     async with get_connection() as db:
         cur = await db.execute(
             f'DELETE FROM {quoted(target)} WHERE batch_id = ?',

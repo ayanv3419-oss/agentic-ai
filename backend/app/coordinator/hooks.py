@@ -25,8 +25,12 @@ _log = logging.getLogger("coordinator.hooks")
 # MAX_ITERATIONS bounds the number of LLM rounds (each round may emit
 # multiple tool calls). MAX_TOOL_CALLS bounds total tool dispatches per
 # turn, catching the "single round emits 50 tools" failure mode.
-MAX_ITERATIONS = 10
-MAX_TOOL_CALLS = 20
+# MAX_ITERATIONS was 10 - too tight: multi-step questions (compare /
+# RCA / "hot sellers with margins") burned all 10 rounds before
+# reaching insightFmt, so the formatter was skipped and the answer
+# desynced from the chart. 16 leaves headroom for the final answer.
+MAX_ITERATIONS = 16
+MAX_TOOL_CALLS = 28
 
 
 @dataclass

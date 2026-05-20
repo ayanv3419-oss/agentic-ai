@@ -25,6 +25,10 @@ _log = logging.getLogger("coordinator.llm")
 
 NO_THINK = "/no_think"
 
+# Error kinds that mean "the provider failed, not our request" — safe to
+# retry the identical call on the fallback provider.
+_RETRYABLE = {"upstream", "network"}
+
 
 # ---------------------------------------------------------------------------
 # Wire types - shape compatible with the rest of the coordinator
@@ -84,6 +88,29 @@ def _model_understands_no_think(model: str | None) -> bool:
     if not model:
         return False
     return model.lower().startswith("qwen")
+
+
+def _model_needs_thinking_flag(model: str | None) -> bool:
+    """DashScope's Qwen3 reasoning models (qwen3-32b, qwen3.6-35b-a3b, ...)
+    reject non-streaming calls unless `enable_thinking` is explicitly false.
+    Commercial qwen-turbo/plus/flash/max don't need it; the Ollama
+    'qwen3:Nb' tag format is excluded — it handles thinking via /no_think."""
+    if not model:
+        return False
+    m = model.lower()
+    return m.startswith("qwen3") and ":" not in m
+
+
+def _floor_max_tokens(model: str | None, requested: int | None) -> int | None:
+    """Gemini 2.5 models spend part of the max_tokens budget on internal
+    'thinking'. A small cap (e.g. 900) gets fully consumed by thinking,
+    leaving nothing for the answer / tool calls — the call then returns
+    empty. Floor the cap generously for Gemini so both fit."""
+    if requested is None:
+        return None
+    if model and "gemini" in model.lower() and requested < 8192:
+        return 8192
+    return requested
 
 
 def ensure_no_think(
@@ -190,6 +217,7 @@ class LLMClient:
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        enable_fallback: bool = True,
     ) -> None:
         self.base_url = (base_url or settings.llm_base_url).rstrip("/")
         self.api_key = api_key or settings.llm_api_key or "ollama"
@@ -202,14 +230,81 @@ class LLMClient:
             timeout=httpx.Timeout(600.0, connect=10.0),
             max_retries=0,
         )
+        # Optional fallback provider — used automatically when the primary
+        # is rate-limited / out of quota / unreachable. The fallback client
+        # itself has no further fallback (enable_fallback=False).
+        self._fallback: "LLMClient | None" = None
+        if (enable_fallback and settings.llm_fallback_api_key
+                and settings.llm_fallback_base_url):
+            self._fallback = LLMClient(
+                base_url=settings.llm_fallback_base_url,
+                api_key=settings.llm_fallback_api_key,
+                model=settings.llm_fallback_model or self.model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                enable_fallback=False,
+            )
 
     async def aclose(self) -> None:
         try:
             await self._client.close()
         except Exception:
             _log.warning("LLM client close failed", exc_info=True)
+        if self._fallback is not None:
+            await self._fallback.aclose()
 
     async def complete(
+        self,
+        messages: list[LLMMessage] | list[dict[str, Any]],
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        force_json: bool = False,
+    ) -> LLMResponse:
+        """Plain completion WITH automatic failover: if the primary
+        provider is rate-limited / out of quota / unreachable, the same
+        request is retried once on the configured fallback provider."""
+        resp = await self._complete_once(
+            messages, temperature=temperature, max_tokens=max_tokens,
+            force_json=force_json,
+        )
+        if (resp.error and resp.error_kind in _RETRYABLE
+                and self._fallback is not None):
+            _log.warning(
+                "LLM primary failed (%s) — failing over to %s. detail: %s",
+                resp.error_kind, self._fallback.model, (resp.error or "")[:300],
+            )
+            return await self._fallback._complete_once(
+                messages, temperature=temperature, max_tokens=max_tokens,
+                force_json=force_json,
+            )
+        return resp
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> LLMToolResponse:
+        """Tool-calling completion WITH automatic failover (see complete)."""
+        resp = await self._complete_with_tools_once(
+            messages, tools=tools, temperature=temperature, max_tokens=max_tokens,
+        )
+        if (resp.error and resp.error_kind in _RETRYABLE
+                and self._fallback is not None):
+            _log.warning(
+                "LLM primary failed (%s) — failing over to %s. detail: %s",
+                resp.error_kind, self._fallback.model, (resp.error or "")[:300],
+            )
+            return await self._fallback._complete_with_tools_once(
+                messages, tools=tools, temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        return resp
+
+    async def _complete_once(
         self,
         messages: list[LLMMessage] | list[dict[str, Any]],
         *,
@@ -226,11 +321,14 @@ class LLMClient:
             "model": self.model,
             "messages": msgs,
             "temperature": self.temperature if temperature is None else temperature,
-            "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
+            "max_tokens": _floor_max_tokens(
+                self.model, self.max_tokens if max_tokens is None else max_tokens),
             "stream": False,
         }
         if force_json:
             kwargs["response_format"] = {"type": "json_object"}
+        if _model_needs_thinking_flag(self.model):
+            kwargs["extra_body"] = {"enable_thinking": False}
         try:
             resp = await self._client.chat.completions.create(**kwargs)
         except APIConnectionError as e:
@@ -293,7 +391,7 @@ class LLMClient:
             _log.exception("llm.complete_stream unexpected failure")
             return
 
-    async def complete_with_tools(
+    async def _complete_with_tools_once(
         self,
         messages: list[dict[str, Any]],
         *,
@@ -309,12 +407,15 @@ class LLMClient:
             "model": self.model,
             "messages": msgs,
             "temperature": self.temperature if temperature is None else temperature,
-            "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
+            "max_tokens": _floor_max_tokens(
+                self.model, self.max_tokens if max_tokens is None else max_tokens),
             "stream": False,
         }
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        if _model_needs_thinking_flag(self.model):
+            kwargs["extra_body"] = {"enable_thinking": False}
         try:
             resp = await self._client.chat.completions.create(**kwargs)
         except APIConnectionError as e:

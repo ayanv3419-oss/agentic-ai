@@ -1,7 +1,12 @@
 """
 Schema tool - returns a compact summary of every table the Coordinator
-can query: the static system tables (sales, purchase, KPIs, hierarchy)
-and any dynamically-ingested user tables (``u_*``).
+can query: the static system tables (sales, purchase) and any
+dynamically-ingested user tables (``u_*``).
+
+When the user has uploaded data, the u_* tables hold the REAL data and
+must be queried. The static sales/purchase tables are a legacy fallback
+that is often empty or holds stale test rows - the summary makes this
+explicit with row counts so the LLM never analyses the wrong table.
 """
 from __future__ import annotations
 
@@ -16,8 +21,22 @@ from app.infrastructure import (
 )
 
 
+async def _table_row_count(db: Any, name: str) -> int:
+    """Best-effort COUNT(*) for a table. Returns 0 on any error so the
+    schema summary never fails just because one table is unreadable."""
+    try:
+        cur = await db.execute(f"SELECT COUNT(*) AS n FROM {quoted(name)}")
+        row = await cur.fetchone()
+        await cur.close()
+        if row is None:
+            return 0
+        return int(dict(row).get("n", 0) or 0)
+    except Exception:
+        return 0
+
+
 async def _list_user_tables() -> list[dict[str, Any]]:
-    """Inspect SQLite for u_* (dynamic) tables + their columns."""
+    """Inspect SQLite for u_* (dynamic) tables + their columns + row counts."""
     out: list[dict[str, Any]] = []
     async with get_connection() as db:
         cur = await db.execute(
@@ -36,6 +55,7 @@ async def _list_user_tables() -> list[dict[str, Any]]:
             await cur2.close()
             out.append({
                 "table": name,
+                "row_count": await _table_row_count(db, name),
                 "columns": [
                     {"name": dict(c)["name"], "type": dict(c)["type"] or "TEXT"}
                     for c in cols
@@ -70,12 +90,48 @@ def _system_schema() -> list[dict[str, Any]]:
     ]
 
 
+def _metric_hints(user_tables: list[dict[str, Any]]) -> str:
+    """When the uploaded data has a sales-transactions table and an
+    inventory/cost table, emit the EXACT formula for realized margin so
+    the LLM never guesses. 'Realized margin' = profit on what actually
+    sold, after discounts. Detection is by column shape, so this adapts
+    to whatever the user named their sheets."""
+    def cols_of(t: dict[str, Any]) -> set[str]:
+        return {str(c["name"]).lower() for c in t.get("columns", [])}
+
+    sales_t: str | None = None
+    cost_t: str | None = None
+    for t in user_tables:
+        cl = cols_of(t)
+        if sales_t is None and {"net_sales", "quantity", "sku_id"} <= cl:
+            sales_t = t["table"]
+        if cost_t is None and {"unit_cost", "sku_id"} <= cl:
+            cost_t = t["table"]
+    if not sales_t or not cost_t:
+        return ""
+    return (
+        "\n\n## METRIC DEFINITIONS - use these EXACT formulas. "
+        "Do NOT invent your own margin / profit math.\n"
+        f'- Realized margin %: JOIN "{sales_t}" s to "{cost_t}" i '
+        "ON s.sku_id = i.sku_id, GROUP BY s.final_product, then\n"
+        "    margin_pct = (SUM(s.net_sales) - SUM(s.quantity * i.unit_cost)) "
+        "* 100.0 / SUM(s.net_sales)\n"
+        "  It is profit on what actually sold, after discounts. For "
+        "'top products by margin' ORDER BY margin_pct DESC.\n"
+        f'- Revenue / total sales: SUM(net_sales) from "{sales_t}".\n'
+        f'- Units sold: SUM(quantity) from "{sales_t}".\n'
+        f'- Cost of goods: SUM(s.quantity * i.unit_cost) via the join above.\n'
+        f'- Never say "no cost data" - unit_cost lives in "{cost_t}".'
+    )
+
+
 class SchemaTool(Tool):
     name = "Schema"
     description = (
-        "Return the full database schema: system tables (sales, purchase) "
-        "and any user-uploaded dynamic tables (u_*). Call this FIRST before "
-        "writing SQL so you know exactly which tables and columns exist."
+        "Return the full database schema WITH row counts. When the user "
+        "has uploaded data, the u_* tables are the REAL data to query - "
+        "the sales/purchase system tables are only a legacy fallback. "
+        "Call this FIRST before writing any SQL."
     )
     parameters_schema = {
         "type": "object",
@@ -102,27 +158,52 @@ class SchemaTool(Tool):
                     error=f"failed to list dynamic tables: {e}",
                 )
 
+        # Row counts for the system tables so the LLM can see at a glance
+        # whether sales/purchase actually hold data or are stale/empty.
+        sys_counts: dict[str, int] = {}
+        async with get_connection() as db:
+            for t in system:
+                sys_counts[t["table"]] = await _table_row_count(db, t["table"])
+
         summary_lines = ["# Database schema (sqlite)"]
+
+        if user_tables:
+            summary_lines.append(
+                "\n## PRIMARY DATA - the user's uploaded tables. "
+                "These hold the real business data. ALWAYS query THESE "
+                "tables to answer the question. Join them on shared keys "
+                "(e.g. invoice_no) when a question spans more than one."
+            )
+            for t in user_tables:
+                cols = ", ".join(
+                    f'"{c["name"]}":{c["type"]}' for c in t["columns"]
+                )
+                summary_lines.append(
+                    f'- "{t["table"]}" ({t["row_count"]} rows): {cols}'
+                )
+            summary_lines.append(
+                "\n## Legacy system tables - fallback ONLY. Do NOT query "
+                "these when PRIMARY tables exist above; they hold stale or "
+                "empty test data."
+            )
+
         for t in system:
             cols = ", ".join(
                 f'"{c["name"]}":{c["type"]}'
                 for c in t["columns"][6:]   # skip audit cols in the summary
             )
-            summary_lines.append(f'- "{t["table"]}" ({t["description"]}): {cols}')
-        if user_tables:
-            summary_lines.append("\n# User-uploaded dynamic tables (prefix u_)")
-            for t in user_tables:
-                cols = ", ".join(
-                    f'"{c["name"]}":{c["type"]}' for c in t["columns"]
-                )
-                summary_lines.append(f'- "{t["table"]}": {cols}')
-        else:
+            n = sys_counts.get(t["table"], 0)
+            summary_lines.append(
+                f'- "{t["table"]}" ({n} rows, {t["description"]}): {cols}'
+            )
+
+        if not user_tables:
             summary_lines.append(
                 "\n# No user-uploaded tables present yet. "
                 "Only system tables are available."
             )
 
-        text = "\n".join(summary_lines)
+        text = "\n".join(summary_lines) + _metric_hints(user_tables)
         return ToolOutcome(
             ok=True,
             output={
