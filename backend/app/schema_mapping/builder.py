@@ -32,6 +32,13 @@ class MetricSqlBuilder:
         r = self._resolved
         if not r.can_compute_margin:
             return None
+        # Sanitise the order/limit even though callers are trusted: this
+        # is a shared chokepoint and the values land in raw SQL.
+        direction = "ASC" if str(direction).strip().upper() == "ASC" else "DESC"
+        try:
+            limit = max(1, min(int(limit), 50))
+        except (TypeError, ValueError):
+            limit = 10
         rev = r.ref("revenue")
         qty = r.ref("quantity")
         cost = r.ref("unit_cost")

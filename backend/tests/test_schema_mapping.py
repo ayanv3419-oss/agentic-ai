@@ -16,8 +16,7 @@ _BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from app.schema_mapping.builder import MetricSqlBuilder
-from app.schema_mapping.resolver import ColumnRef, resolve_schema
+from app.schema_mapping import ColumnRef, MetricSqlBuilder, resolve_schema
 
 
 def _tbl(name: str, *cols: str) -> dict:
@@ -32,6 +31,12 @@ class TestConceptResolver:
         assert ref is not None
         assert ref.table == "u_sales"
         assert ref.column == "net_sales"
+
+    def test_empty_workbook_resolves_to_nothing(self):
+        resolved = resolve_schema([])
+        assert resolved.can_compute_margin is False
+        assert resolved.ref("revenue") is None
+        assert resolved.missing("revenue", "unit_cost") == ["revenue", "unit_cost"]
 
     def test_resolves_all_margin_core_concepts_from_demo_schema(self):
         tables = [
@@ -124,6 +129,19 @@ class TestMetricSqlBuilder:
         assert "ORDER BY margin_pct DESC" in sql
         assert "LIMIT 10" in sql
 
+    def test_no_sql_when_cost_table_lacks_the_sku_join_key(self):
+        # The inventory sheet has unit_cost but its key column ('barcode')
+        # is not a SKU synonym - so sku_key resolves only from the sales
+        # sheet and the cost table has no matching join column. The builder
+        # must NOT emit SQL that would fail at runtime with 'no such column'.
+        tables = [
+            _tbl("u_sales", "net_sales", "quantity", "sku_id", "final_product"),
+            _tbl("u_inv", "barcode", "unit_cost"),
+        ]
+        resolved = resolve_schema(tables)
+        assert resolved.can_compute_margin is False
+        assert MetricSqlBuilder(resolved).margin_ranking() is None
+
     def test_margin_ranking_returns_none_when_cost_unresolved(self):
         # No cost column anywhere -> margin cannot be computed -> no SQL,
         # so the caller (sqlWriter / _metric_hints) can degrade gracefully.
@@ -144,3 +162,17 @@ class TestMetricSqlBuilder:
         assert sql is not None
         assert "ORDER BY margin_pct ASC" in sql
         assert "LIMIT 5" in sql
+
+    def test_margin_ranking_sanitizes_direction_and_limit(self):
+        # The builder is a shared chokepoint - it must not splice an
+        # unrecognised direction or an out-of-range limit straight into
+        # the SQL, regardless of what a caller passes.
+        builder = MetricSqlBuilder(resolve_schema([
+            _tbl("u_sales_transactions", "net_sales", "quantity", "sku_id",
+                 "final_product"),
+            _tbl("u_inventory_master", "sku_id", "unit_cost"),
+        ]))
+        assert "ORDER BY margin_pct DESC" in builder.margin_ranking(
+            direction="garbage")
+        assert "LIMIT 50" in builder.margin_ranking(limit=9999)
+        assert "LIMIT 1" in builder.margin_ranking(limit=0)

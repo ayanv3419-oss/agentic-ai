@@ -17,13 +17,18 @@ class ColumnRef:
     column: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ResolvedSchema:
     """Outcome of resolving canonical concepts against a dataset. Each
     resolved concept maps to its ``ColumnRef``; unresolved concepts are
-    absent. Use ``ref()`` rather than touching the mapping directly."""
+    absent. Use ``ref()`` rather than touching the mapping directly.
+
+    ``eq=False`` keeps default identity equality/hash - a frozen
+    dataclass with a ``dict`` field would otherwise generate a
+    ``__hash__`` that raises ``TypeError`` when called."""
 
     _resolved: dict[str, ColumnRef]
+    _can_compute_margin: bool
 
     def ref(self, concept: str) -> ColumnRef | None:
         """The resolved column for ``concept``, or ``None`` if unresolved."""
@@ -39,9 +44,11 @@ class ResolvedSchema:
 
     @property
     def can_compute_margin(self) -> bool:
-        """True when every concept the realized-margin formula needs has
-        resolved."""
-        return all(c in self._resolved for c in _MARGIN_CORE)
+        """True only when the realized-margin SQL is actually buildable
+        for this dataset: every margin concept resolved, the sales-side
+        columns co-located in one table, and the SKU join key physically
+        present in BOTH that table and the (distinct) cost table."""
+        return self._can_compute_margin
 
 
 # The concepts the realized-margin / profit formulas are built from.
@@ -108,6 +115,44 @@ def _resolve_concept(
     return None
 
 
+def _columns_by_table(tables: list[dict]) -> dict[str, set[str]]:
+    """Map each table name to its set of lower-cased column names."""
+    return {
+        t["table"]: {
+            str(c.get("name", "")).lower() for c in t.get("columns", [])
+        }
+        for t in tables
+    }
+
+
+def _margin_computable(
+    resolved: dict[str, ColumnRef], tables: list[dict],
+) -> bool:
+    """Whether the realized-margin SQL can actually be built AND run.
+
+    Not merely "all margin concepts resolved": the builder emits a fixed
+    two-table join, so this also requires the sales-side concepts to
+    share one table, a distinct cost table, and the SKU join key to
+    physically exist in BOTH. Without this check the builder could emit
+    SQL that fails at runtime with 'no such column'.
+    """
+    if not all(c in resolved for c in _MARGIN_CORE):
+        return False
+    sales_t = resolved["revenue"].table
+    if (resolved["quantity"].table != sales_t
+            or resolved["product_label"].table != sales_t):
+        return False
+    cost_t = resolved["unit_cost"].table
+    if cost_t == sales_t:
+        # The builder's two-table join would self-join; the no-join
+        # single-table margin shape is out of scope for this slice.
+        return False
+    sku_col = resolved["sku_key"].column.lower()
+    cols = _columns_by_table(tables)
+    return (sku_col in cols.get(sales_t, set())
+            and sku_col in cols.get(cost_t, set()))
+
+
 def resolve_schema(tables: list[dict]) -> ResolvedSchema:
     """Resolve canonical concepts against the uploaded ``u_*`` tables.
 
@@ -119,4 +164,4 @@ def resolve_schema(tables: list[dict]) -> ResolvedSchema:
         for concept, candidates in _SYNONYMS.items()
         if (ref := _resolve_concept(tables, candidates)) is not None
     }
-    return ResolvedSchema(resolved)
+    return ResolvedSchema(resolved, _margin_computable(resolved, tables))
