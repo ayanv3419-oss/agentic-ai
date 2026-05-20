@@ -133,7 +133,7 @@ def _metric_hints(
     sku = resolved.ref("sku_key")
     revenue = f"SUM(s.{rev.column})"
     cogs = f"SUM(s.{qty.column} * i.{cost.column})"
-    join = (f'JOIN "{rev.table}" s to "{cost.table}" i '
+    join = (f'FROM "{rev.table}" s JOIN "{cost.table}" i '
             f"ON s.{sku.column} = i.{sku.column}")
     return (
         "\n\n## METRIC DEFINITIONS - use these EXACT formulas. "
