@@ -198,3 +198,66 @@ class TestMetricSqlBuilder:
             direction="garbage")
         assert "LIMIT 50" in builder.margin_ranking(limit=9999)
         assert "LIMIT 1" in builder.margin_ranking(limit=0)
+
+
+class TestSemanticSchemaMapping:
+    """Goal-5: the canonical-schema layer — confidence scoring, ambiguity
+    reporting, the full concept set, graceful partial resolution of
+    unknown workbook schemas."""
+
+    def test_canonical_name_scores_higher_confidence_than_synonym(self):
+        # 'revenue' column == the concept's canonical name -> 1.0;
+        # 'qty' is only a synonym of 'quantity' -> 0.75.
+        tables = [_tbl("u_x", "revenue", "qty", "sku_id", "final_product")]
+        resolved = resolve_schema(tables)
+        assert resolved.confidence("revenue") == 1.0
+        assert resolved.confidence("quantity") == 0.75
+        assert resolved.confidence("unit_cost") == 0.0   # unresolved
+
+    def test_ambiguous_concept_is_reported_not_guessed(self):
+        # two revenue synonyms, no canonical 'revenue' -> unresolved AND
+        # reported in ambiguities() with the competing columns.
+        tables = [_tbl("u_x", "net_sales", "total_sales", "qty")]
+        resolved = resolve_schema(tables)
+        assert resolved.is_resolved("revenue") is False
+        amb = resolved.ambiguities()
+        assert "revenue" in amb
+        assert set(amb["revenue"]) == {"net_sales", "total_sales"}
+
+    def test_resolves_dimensional_and_time_concepts(self):
+        tables = [_tbl("u_sales", "net_sales", "brand", "category",
+                       "payment_mode", "transaction_date", "region")]
+        resolved = resolve_schema(tables)
+        assert resolved.ref("brand") == ColumnRef("u_sales", "brand")
+        assert resolved.ref("category") == ColumnRef("u_sales", "category")
+        assert resolved.ref("payment_mode") == ColumnRef("u_sales", "payment_mode")
+        assert resolved.ref("transaction_date") == ColumnRef(
+            "u_sales", "transaction_date")
+        assert resolved.ref("region") == ColumnRef("u_sales", "region")
+
+    def test_resolves_all_helper(self):
+        resolved = resolve_schema([_tbl("u_sales", "net_sales", "quantity")])
+        assert resolved.resolves_all("revenue", "quantity") is True
+        assert resolved.resolves_all("revenue", "unit_cost") is False
+
+    def test_unknown_workbook_resolves_via_synonyms(self):
+        # A workbook sharing NONE of the demo's column names still maps -
+        # graceful semantic resolution, not a crash.
+        tables = [
+            _tbl("u_orders", "turnover", "article", "buyer"),
+            _tbl("u_stock", "article", "expense"),
+        ]
+        resolved = resolve_schema(tables)
+        assert resolved.ref("revenue") == ColumnRef("u_orders", "turnover")
+        assert resolved.ref("sku_key") == ColumnRef("u_orders", "article")
+        assert resolved.ref("customer") == ColumnRef("u_orders", "buyer")
+        assert resolved.ref("unit_cost") == ColumnRef("u_stock", "expense")
+
+    def test_summary_reports_resolved_unresolved_ambiguous(self):
+        tables = [_tbl("u_x", "net_sales", "total_sales", "brand")]
+        s = resolve_schema(tables).summary()
+        assert s["resolved"]["brand"]["column"] == "brand"
+        assert s["resolved"]["brand"]["confidence"] == 1.0
+        assert "revenue" in s["ambiguous"]          # net_sales + total_sales
+        assert "unit_cost" in s["unresolved"]
+        assert s["can_compute_margin"] is False

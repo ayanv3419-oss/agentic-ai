@@ -1,13 +1,26 @@
-"""Concept Resolver — maps canonical analytic concepts onto the actual
-columns of the uploaded dynamic (``u_*``) tables.
+"""Concept Resolver — the semantic schema-mapping layer.
+
+Maps a fixed catalog of canonical business concepts (revenue, quantity,
+brand, transaction_date, ...) onto the actual columns of an uploaded
+workbook, whatever that workbook named them. This is what lets the
+analytics + KPI layers run on arbitrary user schemas without hard-coding
+column names to one dataset.
 
 Pure and deterministic: the same tables in always yield the same
-``ResolvedSchema`` out. No DB or network access.
+``ResolvedSchema`` out — no DB or network access. Matching is by a
+curated synonym catalog ONLY — never fuzzy / substring — so an
+unrecognised or genuinely ambiguous column is reported as unresolved
+rather than mis-mapped. A wrong mapping silently corrupts every
+downstream number, so "unresolved + reported" always beats "guessed".
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+
+# ---------------------------------------------------------------------------
+# Column reference
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class ColumnRef:
@@ -17,30 +30,170 @@ class ColumnRef:
     column: str
 
 
+# ---------------------------------------------------------------------------
+# Canonical business schema — the concept catalog
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Concept:
+    """One canonical analytic concept. ``synonyms[0]`` is the canonical
+    column name; the rest are curated aliases. ``kind`` tells the
+    analytics / KPI layer how the concept may be used:
+        measure   — numeric, SUM/AVG-able
+        key       — a join / identity key
+        label     — a human-readable name to GROUP/label by
+        dimension — a categorical attribute to GROUP/filter by
+        date      — a date column, for time windows and trends
+    """
+
+    name: str
+    kind: str
+    synonyms: tuple[str, ...]
+
+
+def _c(name: str, kind: str, *aliases: str) -> Concept:
+    """Build a Concept; the canonical name is always the first candidate."""
+    return Concept(name, kind, (name, *aliases))
+
+
+# The catalog. Adding a concept here is the ONLY place a new business
+# concept needs to be declared — everything downstream discovers it.
+_CATALOG: dict[str, Concept] = {c.name: c for c in (
+    # --- financial measures ---
+    _c("revenue", "measure",
+       "net_sales", "sales_value", "sales_amount", "total_sales",
+       "total_amount", "net_amount", "sale_amount", "sales", "turnover",
+       "amount"),
+    _c("gross_sales", "measure",
+       "gross_amount", "gross_revenue", "gross_value", "mrp_value"),
+    _c("discount", "measure",
+       "discount_amount", "discount_value", "discount_amt", "disc"),
+    _c("unit_cost", "measure",
+       "cost_price", "cost", "buy_price", "purchase_price",
+       "cost_per_unit", "unit_buy_price", "expense"),
+    _c("selling_price", "measure",
+       "sell_price", "list_price", "mrp", "retail_price", "price"),
+    _c("quantity", "measure",
+       "qty", "units", "units_sold", "quantity_sold", "qty_sold",
+       "num_units"),
+    _c("stock_qty", "measure",
+       "stock_quantity", "stock", "on_hand", "qty_on_hand",
+       "inventory_qty", "available_qty"),
+    # --- keys ---
+    _c("sku_key", "key",
+       "sku_id", "sku", "item_code", "item_id", "product_code",
+       "product_id", "sku_code", "article"),
+    _c("invoice_id", "key",
+       "invoice_no", "invoice_number", "bill_no", "order_no", "order_id",
+       "txn_id", "transaction_id"),
+    # --- labels ---
+    _c("product_label", "label",
+       "final_product", "product_name", "product", "item_name", "item",
+       "description", "product_title"),
+    _c("customer", "label",
+       "customer_name", "party_name", "buyer", "client", "customer_id"),
+    # --- dimensions ---
+    _c("brand", "dimension",
+       "brand_name", "make", "manufacturer"),
+    _c("category", "dimension",
+       "product_category", "category_name", "cat", "segment"),
+    _c("subcategory", "dimension",
+       "sub_category", "sub_cat", "subcat"),
+    _c("region", "dimension",
+       "zone", "area", "territory"),
+    _c("city", "dimension",
+       "town", "city_name"),
+    _c("store", "dimension",
+       "store_name", "outlet", "branch", "shop", "store_id"),
+    _c("payment_mode", "dimension",
+       "payment_type", "payment_method", "pay_mode", "tender", "payment"),
+    # --- time ---
+    _c("transaction_date", "date",
+       "date", "txn_date", "order_date", "sale_date", "invoice_date",
+       "bill_date", "sales_date"),
+)}
+
+#: Every canonical concept name, declaration order.
+CANONICAL_CONCEPTS: tuple[str, ...] = tuple(_CATALOG)
+
+#: The concepts the realized-margin / profit formulas are built from.
+_MARGIN_CORE: tuple[str, ...] = (
+    "revenue", "quantity", "sku_key", "unit_cost", "product_label",
+)
+
+# Confidence assigned to each match kind.
+_CONF_CANONICAL = 1.0   # column literally named like the concept
+_CONF_SYNONYM = 0.75    # column matched a curated alias
+
+
+def concepts_of_kind(kind: str) -> tuple[str, ...]:
+    """The canonical concept names of a given kind (measure/key/label/
+    dimension/date) — used by the KPI layer to pick group-bys / measures."""
+    return tuple(c.name for c in _CATALOG.values() if c.kind == kind)
+
+
+# ---------------------------------------------------------------------------
+# Resolution result types
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Resolution:
+    """How one concept resolved against a dataset."""
+
+    concept: str
+    column: ColumnRef
+    confidence: float       # _CONF_CANONICAL or _CONF_SYNONYM
+    match: str              # "canonical" | "synonym"
+
+
 @dataclass(frozen=True, eq=False)
 class ResolvedSchema:
-    """Outcome of resolving canonical concepts against a dataset. Each
-    resolved concept maps to its ``ColumnRef``; unresolved concepts are
-    absent. Use ``ref()`` rather than touching the mapping directly.
+    """The schema-abstraction layer — a frozen, deterministic mapping of
+    canonical concepts onto a dataset's real columns, plus the confidence
+    of each mapping and a record of any concept that was too ambiguous to
+    map. Downstream code reads concepts, never raw column names.
 
-    ``eq=False`` keeps default identity equality/hash - a frozen
-    dataclass with a ``dict`` field would otherwise generate a
-    ``__hash__`` that raises ``TypeError`` when called."""
+    ``eq=False`` keeps default identity equality/hash; a frozen dataclass
+    with dict fields would otherwise generate a ``__hash__`` that raises."""
 
-    _resolved: dict[str, ColumnRef]
+    _resolved: dict[str, Resolution]
+    _ambiguous: dict[str, tuple[str, ...]]
     _can_compute_margin: bool
+
+    # -- concept access ----------------------------------------------------
 
     def ref(self, concept: str) -> ColumnRef | None:
         """The resolved column for ``concept``, or ``None`` if unresolved."""
+        r = self._resolved.get(concept)
+        return r.column if r is not None else None
+
+    def resolution(self, concept: str) -> Resolution | None:
+        """The full Resolution (column + confidence + match kind), or None."""
         return self._resolved.get(concept)
 
     def is_resolved(self, concept: str) -> bool:
         """Whether ``concept`` resolved to a column in this dataset."""
         return concept in self._resolved
 
+    def confidence(self, concept: str) -> float:
+        """Confidence of ``concept``'s mapping; 0.0 when unresolved."""
+        r = self._resolved.get(concept)
+        return r.confidence if r is not None else 0.0
+
+    def resolves_all(self, *concepts: str) -> bool:
+        """True only if every named concept resolved — the precondition
+        check for any metric/KPI that needs them all."""
+        return all(c in self._resolved for c in concepts)
+
     def missing(self, *concepts: str) -> list[str]:
-        """Which of the given ``concepts`` did NOT resolve, in argument order."""
+        """Which of the given ``concepts`` did NOT resolve, in order."""
         return [c for c in concepts if c not in self._resolved]
+
+    def ambiguities(self) -> dict[str, tuple[str, ...]]:
+        """Concepts that matched two or more columns with no clear winner,
+        mapped to the competing column names — for an informative
+        'could not tell which column is X' message instead of a guess."""
+        return dict(self._ambiguous)
 
     @property
     def can_compute_margin(self) -> bool:
@@ -50,55 +203,47 @@ class ResolvedSchema:
         present in BOTH that table and the (distinct) cost table."""
         return self._can_compute_margin
 
-
-# The concepts the realized-margin / profit formulas are built from.
-_MARGIN_CORE: tuple[str, ...] = (
-    "revenue", "quantity", "sku_key", "unit_cost", "product_label",
-)
-
-# concept -> ordered candidate column names. The concept's own name comes
-# first (the "canonical" column name); curated synonyms follow. Earlier
-# candidate = preferred.
-_SYNONYMS: dict[str, tuple[str, ...]] = {
-    "revenue": (
-        "revenue", "net_sales", "sales_value", "sales_amount",
-        "total_sales", "net_amount", "sale_amount", "sales",
-    ),
-    "quantity": (
-        "quantity", "qty", "units", "units_sold", "quantity_sold",
-        "qty_sold", "num_units",
-    ),
-    "sku_key": (
-        "sku_key", "sku_id", "sku", "item_code", "item_id",
-        "product_code", "product_id", "sku_code",
-    ),
-    "unit_cost": (
-        "unit_cost", "cost_price", "cost", "buy_price", "purchase_price",
-        "cost_per_unit", "unit_buy_price",
-    ),
-    "product_label": (
-        "product_label", "final_product", "product_name", "product",
-        "item_name", "item", "description", "product_title",
-    ),
-}
+    def summary(self) -> dict:
+        """Plain-data report of how the upload was understood — for the
+        /health endpoint, logs, or telling the user about their schema."""
+        return {
+            "resolved": {
+                c: {
+                    "table": r.column.table,
+                    "column": r.column.column,
+                    "confidence": r.confidence,
+                    "match": r.match,
+                }
+                for c, r in self._resolved.items()
+            },
+            "unresolved": [c for c in CANONICAL_CONCEPTS
+                           if c not in self._resolved],
+            "ambiguous": {c: list(cols)
+                          for c, cols in self._ambiguous.items()},
+            "can_compute_margin": self._can_compute_margin,
+        }
 
 
-def _resolve_concept(
-    tables: list[dict], candidates: tuple[str, ...],
-) -> ColumnRef | None:
+# ---------------------------------------------------------------------------
+# Resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_one(
+    concept: Concept, tables: list[dict],
+) -> tuple[Resolution | None, tuple[str, ...]]:
     """Resolve one concept against the dataset.
 
-    Gathers every distinct column name that matches a candidate, then:
-      - the canonical name (``candidates[0]``) wins outright if present;
-      - otherwise a single distinct match resolves;
-      - two or more distinct synonym matches with no canonical name are
-        ambiguous and left unresolved - the resolver never guesses.
+    Returns ``(Resolution | None, ambiguous_columns)``:
+      - the canonical name wins outright -> confidence 1.0;
+      - a single distinct synonym match -> confidence 0.75;
+      - 2+ distinct synonym matches with no canonical winner -> unresolved,
+        and the competing column names are returned for an ambiguity report.
 
     The same column name appearing in several tables counts once (a
     denormalised key like ``sku_id``), bound to its first occurrence.
     """
-    canonical = candidates[0]
-    allowed = set(candidates)
+    canonical = concept.synonyms[0]
+    allowed = set(concept.synonyms)
     matches: dict[str, ColumnRef] = {}   # lower-cased name -> first ref
     for t in tables:
         for col in t.get("columns", []):
@@ -107,12 +252,21 @@ def _resolve_concept(
             if low in allowed and low not in matches:
                 matches[low] = ColumnRef(t["table"], name)
     if not matches:
-        return None
+        return None, ()
     if canonical in matches:
-        return matches[canonical]
+        return (
+            Resolution(concept.name, matches[canonical],
+                       _CONF_CANONICAL, "canonical"),
+            (),
+        )
     if len(matches) == 1:
-        return next(iter(matches.values()))
-    return None
+        ref = next(iter(matches.values()))
+        return (
+            Resolution(concept.name, ref, _CONF_SYNONYM, "synonym"),
+            (),
+        )
+    # 2+ synonym matches, no canonical winner -> ambiguous; never guess.
+    return None, tuple(sorted(matches))
 
 
 def _columns_by_table(tables: list[dict]) -> dict[str, set[str]]:
@@ -126,7 +280,7 @@ def _columns_by_table(tables: list[dict]) -> dict[str, set[str]]:
 
 
 def _margin_computable(
-    resolved: dict[str, ColumnRef], tables: list[dict],
+    resolved: dict[str, Resolution], tables: list[dict],
 ) -> bool:
     """Whether the realized-margin SQL can actually be built AND run.
 
@@ -138,30 +292,39 @@ def _margin_computable(
     """
     if not all(c in resolved for c in _MARGIN_CORE):
         return False
-    sales_t = resolved["revenue"].table
-    if (resolved["quantity"].table != sales_t
-            or resolved["product_label"].table != sales_t):
+    sales_t = resolved["revenue"].column.table
+    if (resolved["quantity"].column.table != sales_t
+            or resolved["product_label"].column.table != sales_t):
         return False
-    cost_t = resolved["unit_cost"].table
+    cost_t = resolved["unit_cost"].column.table
     if cost_t == sales_t:
         # The builder's two-table join would self-join; the no-join
         # single-table margin shape is out of scope for this slice.
         return False
-    sku_col = resolved["sku_key"].column.lower()
+    sku_col = resolved["sku_key"].column.column.lower()
     cols = _columns_by_table(tables)
     return (sku_col in cols.get(sales_t, set())
             and sku_col in cols.get(cost_t, set()))
 
 
 def resolve_schema(tables: list[dict]) -> ResolvedSchema:
-    """Resolve canonical concepts against the uploaded ``u_*`` tables.
+    """Resolve every canonical concept against the uploaded ``u_*`` tables.
 
     ``tables`` is the shape ``SchemaTool._list_user_tables()`` produces:
     ``[{"table": str, "columns": [{"name": str, "type": str}, ...]}, ...]``.
+
+    Graceful by construction: an unknown or ambiguous workbook simply
+    yields a partially-resolved schema — concepts that map are usable,
+    the rest are reported via ``missing()`` / ``ambiguities()``.
     """
-    resolved = {
-        concept: ref
-        for concept, candidates in _SYNONYMS.items()
-        if (ref := _resolve_concept(tables, candidates)) is not None
-    }
-    return ResolvedSchema(resolved, _margin_computable(resolved, tables))
+    resolved: dict[str, Resolution] = {}
+    ambiguous: dict[str, tuple[str, ...]] = {}
+    for concept in _CATALOG.values():
+        res, amb = _resolve_one(concept, tables)
+        if res is not None:
+            resolved[concept.name] = res
+        elif amb:
+            ambiguous[concept.name] = amb
+    return ResolvedSchema(
+        resolved, ambiguous, _margin_computable(resolved, tables),
+    )
