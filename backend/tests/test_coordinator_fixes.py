@@ -205,10 +205,11 @@ async def test_protocol_satisfied_when_insightfmt_is_mid_batch():
 
     schema_tool = _RecordingTool("Schema")
     insight_tool = _RecordingTool("insightFmt", sets_final=True)
+    dryrun_tool = _RecordingTool("SqlDryRun")
     sql_tool = _RecordingTool("SqlExecutor")
 
     reg = ToolRegistry()
-    for t in (schema_tool, insight_tool, sql_tool):
+    for t in (schema_tool, insight_tool, dryrun_tool, sql_tool):
         reg.register(t)
 
     # Allow the test tool names through restriction_guard.
@@ -222,7 +223,10 @@ async def test_protocol_satisfied_when_insightfmt_is_mid_batch():
             tool_calls=[
                 LLMToolCall(id="a", name="Schema", arguments={}),
                 LLMToolCall(id="b", name="insightFmt", arguments={}),
-                LLMToolCall(id="c", name="SqlExecutor", arguments={"sql": "SELECT 1"}),
+                # SqlDryRun before SqlExecutor — the sql_dryrun_guard
+                # pre-hook now blocks SqlExecutor without a passing dry-run.
+                LLMToolCall(id="c", name="SqlDryRun", arguments={}),
+                LLMToolCall(id="d", name="SqlExecutor", arguments={"sql": "SELECT 1"}),
             ],
             tokens_in=10,
             tokens_out=5,

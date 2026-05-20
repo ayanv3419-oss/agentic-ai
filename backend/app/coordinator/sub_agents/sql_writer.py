@@ -94,7 +94,13 @@ def _build_user_prompt(ctx: ToolContext, args: dict[str, Any]) -> str:
 _PROFIT_METRIC_RE = re.compile(r"\b(margin|profit|profitab\w*)\b", re.I)
 _MARGIN_WORD_RE = re.compile(r"\bmargin\b", re.I)
 _WORST_RE = re.compile(r"\b(worst|lowest|least|bottom|poor|weak|low)\b", re.I)
-_TOPN_RE = re.compile(r"\b(\d{1,3})\b")
+# Prefer a number adjacent to a ranking word ("top 5"); fall back to the
+# first bare 1-3 digit number only if there is no ranking-anchored one.
+_TOPN_RE = re.compile(
+    r"\b(?:top|bottom|best|worst|highest|lowest|first|last)\s+(\d{1,3})\b",
+    re.I,
+)
+_BARE_NUM_RE = re.compile(r"\b(\d{1,3})\b")
 
 # Ranking evidence - the question must clearly want a product leaderboard.
 _RANKING_RE = re.compile(
@@ -137,9 +143,10 @@ _DISQUALIFY_RE = re.compile(
 
 
 def _ranking_limit(text: str) -> int:
-    """Pull an explicit 'top N' count from the text; default 10, clamped
-    to 1..50. Years are excluded earlier by the disqualifier check."""
-    m = _TOPN_RE.search(text)
+    """Pull an explicit 'top N' count from the text. Prefers a number
+    anchored to a ranking word ('top 5') over a stray number elsewhere
+    in the question ('store 7'). Default 10, clamped to 1..50."""
+    m = _TOPN_RE.search(text) or _BARE_NUM_RE.search(text)
     if not m:
         return 10
     try:

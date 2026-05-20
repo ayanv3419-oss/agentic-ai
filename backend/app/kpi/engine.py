@@ -280,10 +280,11 @@ async def execute_kpi(kpi: KpiRow) -> KpiResult:
     # Dashboard summary shape: pull total_sales as primary
     elif "total_sales" in first:
         result.value = _coerce_number(first.get("total_sales"))
-    # label+value shape (top customer / top product): primary value is first row's value
-    elif "value" in first:
+    # Single-row label+value (top customer / top product): the one row's
+    # value IS the scalar. A MULTI-row label+value set is a ranking /
+    # distribution — leave result.value None; the data lives in rows.
+    elif "value" in first and len(rows) == 1:
         result.value = _coerce_number(first["value"])
-    # Distribution shape — leave value None, rows carry the data
     else:
         result.value = None
 

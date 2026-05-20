@@ -213,6 +213,16 @@ def _parse_date_str(s: str) -> str | None:
     return None
 
 
+def _to_number_str(value: Any) -> Any:
+    """Strip thousands separators + surrounding whitespace from a string
+    value so it parses as a number; non-strings pass through unchanged.
+    Mirrors the comma-stripping ``_infer_column_type`` does — so a
+    "1,200" column inferred REAL also COERCES instead of becoming NULL."""
+    if isinstance(value, str):
+        return value.strip().replace(",", "")
+    return value
+
+
 def _coerce(value: Any, sql_type: str) -> Any:
     """Convert a python value into something SQLite-friendly for the
     inferred column type."""
@@ -231,12 +241,12 @@ def _coerce(value: Any, sql_type: str) -> Any:
         return str(value)
     if sql_type == "INTEGER":
         try:
-            return int(float(value))
+            return int(float(_to_number_str(value)))
         except (TypeError, ValueError):
             return None
     if sql_type == "REAL":
         try:
-            return float(value)
+            return float(_to_number_str(value))
         except (TypeError, ValueError):
             return None
     return value

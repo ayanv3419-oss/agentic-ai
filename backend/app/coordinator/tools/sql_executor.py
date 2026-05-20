@@ -34,7 +34,9 @@ def _enforce_limit(sql: str, default_limit: int) -> str:
     the outer LIMIT just trims). The redundant-LIMIT case is harmless.
     """
     cleaned = sql.rstrip().rstrip(";").strip()
-    return f"SELECT * FROM ({cleaned}) LIMIT {default_limit}"
+    # Newlines around the wrap so a trailing line-comment (`-- ...`) inside
+    # `cleaned` cannot comment out the closing paren or the outer LIMIT.
+    return f"SELECT * FROM (\n{cleaned}\n) LIMIT {default_limit}"
 
 
 def _infer_column_types(
@@ -80,12 +82,15 @@ def _y_label_for(col: str) -> str:
     c = (col or "").lower()
     if "pct" in c or "percent" in c:
         return "percent"
-    if any(k in c for k in ("amount", "total", "sales", "revenue", "price", "value", "cost")):
-        return "sales"
+    # Quantity / count are checked BEFORE the currency keywords so a
+    # column like `total_units` or `total_orders` is not mislabelled as
+    # currency by the broad `total` match.
     if any(k in c for k in ("qty", "quantity", "units", "stock")):
         return "quantity"
-    if any(k in c for k in ("count", "orders", "txn", "transaction", "number")):
+    if any(k in c for k in ("count", "orders", "txn", "number")):
         return "count"
+    if any(k in c for k in ("amount", "total", "sales", "revenue", "price", "value", "cost")):
+        return "sales"
     return "value"
 
 

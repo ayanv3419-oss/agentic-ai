@@ -31,9 +31,11 @@ Rules:
    question literally asks for a list.
 6. If the rows are empty, say so plainly and suggest a refinement.
 7. Keep total length under 120 words.
-8. Margin / profit: if the rows carry no cost or unit-cost column, state
-   plainly that the data has no cost information so margin cannot be
-   computed. NEVER derive a margin by subtracting unrelated totals.
+8. Margin / profit: discuss margin or profit ONLY if the user's question
+   explicitly asks about them. Whether they can be computed is stated by
+   the 'Data capability' line below - trust ONLY that line. NEVER infer
+   'no cost data' from a query result that simply did not select a cost
+   column, and never derive a margin by subtracting unrelated totals.
 9. All monetary amounts are Indian Rupees - write the "₹" symbol, never
    "$" or the word "dollars"."""
 
@@ -55,6 +57,21 @@ def _build_user(ctx: ToolContext, args: dict[str, Any]) -> str:
         parts.append("Insights:\n" + "\n".join(state.insights))
     if state.causal_tree:
         parts.append(f"Causal tree: {state.causal_tree}")
+    # Cost/margin availability comes from the resolved schema of the
+    # uploaded dataset - NOT from whether this query happened to select a
+    # cost column. This is what stops the false "no cost data" claim.
+    rs = state.resolved_schema
+    if rs is not None:
+        if rs.can_compute_margin:
+            parts.append(
+                "Data capability: the uploaded dataset HAS cost data - "
+                "margin and profit ARE computable for it."
+            )
+        else:
+            parts.append(
+                "Data capability: the uploaded dataset has no usable cost "
+                "column - margin and profit cannot be computed."
+            )
     parts.append("\nWrite the final answer now.")
     return "\n".join(parts)
 

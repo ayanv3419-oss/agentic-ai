@@ -87,6 +87,28 @@ def restriction_guard(state: TurnState, call: ToolCall) -> HookOutcome:
     return HookOutcome()
 
 
+def sql_dryrun_guard(state: TurnState, call: ToolCall) -> HookOutcome:
+    """SqlExecutor must be preceded by a SqlDryRun that PASSED this turn.
+    The system prompt mandates it; this enforces it so a hallucinating
+    LLM cannot run SQL that was never dry-run validated."""
+    if call.name != "SqlExecutor":
+        return HookOutcome()
+    if any(r.name == "SqlDryRun" and r.status == "ok"
+           for r in state.tool_results):
+        return HookOutcome()
+    return HookOutcome(
+        skip=True,
+        reason="SqlExecutor called before a passing SqlDryRun",
+        forced_result=ToolOutcome(
+            ok=False,
+            error=(
+                "SqlExecutor is blocked: you must call SqlDryRun first and "
+                "only run SqlExecutor after SqlDryRun reports the SQL valid."
+            ),
+        ),
+    )
+
+
 def log_call(state: TurnState, call: ToolCall) -> None:
     _log.info(
         "tool.call turn=%s iter=%d name=%s args=%s",
@@ -107,7 +129,7 @@ PreHook = Callable[[TurnState, ToolCall], HookOutcome]
 PostHook = Callable[[TurnState, ToolCall, ToolResult], None]
 
 
-PRE_HOOKS: list[PreHook] = [restriction_guard, cost_guard]
+PRE_HOOKS: list[PreHook] = [restriction_guard, cost_guard, sql_dryrun_guard]
 POST_HOOKS: list[PostHook] = [log_result]
 
 
@@ -138,4 +160,5 @@ __all__ = [
     "restriction_guard",
     "run_post_hooks",
     "run_pre_hooks",
+    "sql_dryrun_guard",
 ]
