@@ -1,0 +1,146 @@
+"""TDD tests for the schema-mapping deep modules (slice 1 of agentic-ai#1).
+
+Concept Resolver + Metric SQL Builder. Both are pure modules, so these
+are plain sync tests - no server, LLM, or DB. Closest prior art:
+test_coordinator_fixes.py::TestEnforceLimit (pure-function tests).
+
+Run:
+    cd backend && python -m pytest tests/test_schema_mapping.py -v
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_BACKEND_DIR = Path(__file__).resolve().parents[1]
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+
+from app.schema_mapping.builder import MetricSqlBuilder
+from app.schema_mapping.resolver import ColumnRef, resolve_schema
+
+
+def _tbl(name: str, *cols: str) -> dict:
+    """A u_* table in the shape SchemaTool._list_user_tables() produces."""
+    return {"table": name, "columns": [{"name": c, "type": "TEXT"} for c in cols]}
+
+
+class TestConceptResolver:
+    def test_resolves_revenue_from_net_sales_column(self):
+        resolved = resolve_schema([_tbl("u_sales", "net_sales", "quantity")])
+        ref = resolved.ref("revenue")
+        assert ref is not None
+        assert ref.table == "u_sales"
+        assert ref.column == "net_sales"
+
+    def test_resolves_all_margin_core_concepts_from_demo_schema(self):
+        tables = [
+            _tbl("u_sales_transactions", "invoice_no", "net_sales",
+                 "quantity", "sku_id", "final_product", "brand"),
+            _tbl("u_inventory_master", "sku_id", "unit_cost", "stock_qty"),
+        ]
+        resolved = resolve_schema(tables)
+        assert resolved.ref("revenue") == ColumnRef("u_sales_transactions", "net_sales")
+        assert resolved.ref("quantity") == ColumnRef("u_sales_transactions", "quantity")
+        assert resolved.ref("sku_key") == ColumnRef("u_sales_transactions", "sku_id")
+        assert resolved.ref("unit_cost") == ColumnRef("u_inventory_master", "unit_cost")
+        assert resolved.ref("product_label") == ColumnRef(
+            "u_sales_transactions", "final_product")
+        assert resolved.can_compute_margin is True
+
+    def test_resolves_a_renamed_workbook_via_synonyms(self):
+        # Same concepts, none of the demo's column names.
+        tables = [
+            _tbl("u_orders", "sales_value", "units", "item_code", "item_name"),
+            _tbl("u_stock", "item_code", "cost_price"),
+        ]
+        resolved = resolve_schema(tables)
+        assert resolved.ref("revenue") == ColumnRef("u_orders", "sales_value")
+        assert resolved.ref("quantity") == ColumnRef("u_orders", "units")
+        assert resolved.ref("sku_key") == ColumnRef("u_orders", "item_code")
+        assert resolved.ref("unit_cost") == ColumnRef("u_stock", "cost_price")
+        assert resolved.ref("product_label") == ColumnRef("u_orders", "item_name")
+        assert resolved.can_compute_margin is True
+
+    def test_missing_concept_is_unresolved_and_reported(self):
+        # Sales data, but no cost column anywhere - margin is uncomputable.
+        tables = [
+            _tbl("u_orders", "net_sales", "quantity", "sku_id", "final_product"),
+        ]
+        resolved = resolve_schema(tables)
+        assert resolved.ref("unit_cost") is None
+        assert resolved.is_resolved("revenue") is True
+        assert resolved.is_resolved("unit_cost") is False
+        assert resolved.can_compute_margin is False
+        assert resolved.missing("revenue", "unit_cost") == ["unit_cost"]
+
+    def test_ambiguous_concept_is_left_unresolved(self):
+        # Two columns both match 'revenue' synonyms and neither is the
+        # canonical 'revenue' name - the resolver must not pick one.
+        tables = [
+            _tbl("u_orders", "net_sales", "total_sales", "quantity",
+                 "sku_id", "final_product"),
+            _tbl("u_stock", "sku_id", "unit_cost"),
+        ]
+        resolved = resolve_schema(tables)
+        assert resolved.ref("revenue") is None
+        assert resolved.can_compute_margin is False
+        # the unambiguous concepts still resolve
+        assert resolved.ref("quantity") == ColumnRef("u_orders", "quantity")
+        assert resolved.ref("unit_cost") == ColumnRef("u_stock", "unit_cost")
+
+    def test_exact_canonical_name_preferred_over_synonym(self):
+        # Both a canonical 'revenue' column and a 'net_sales' synonym are
+        # present - the canonical name wins, and it is NOT treated as an
+        # ambiguous two-match case.
+        tables = [
+            _tbl("u_orders", "revenue", "net_sales", "quantity",
+                 "sku_id", "final_product"),
+            _tbl("u_stock", "sku_id", "unit_cost"),
+        ]
+        resolved = resolve_schema(tables)
+        assert resolved.ref("revenue") == ColumnRef("u_orders", "revenue")
+        assert resolved.can_compute_margin is True
+
+
+class TestMetricSqlBuilder:
+    def test_margin_ranking_sql_from_resolved_schema(self):
+        tables = [
+            _tbl("u_sales_transactions", "net_sales", "quantity", "sku_id",
+                 "final_product"),
+            _tbl("u_inventory_master", "sku_id", "unit_cost"),
+        ]
+        sql = MetricSqlBuilder(resolve_schema(tables)).margin_ranking()
+        assert sql is not None
+        # margin % computed on SUM totals, never averaged per-row ratios
+        assert "SUM(s.net_sales)" in sql
+        assert "SUM(s.quantity * i.unit_cost)" in sql
+        assert "* 100.0 / SUM(s.net_sales)" in sql
+        assert "AS margin_pct" in sql
+        # sales joined to inventory on the resolved sku key
+        assert 'FROM "u_sales_transactions" s' in sql
+        assert 'JOIN "u_inventory_master" i ON s.sku_id = i.sku_id' in sql
+        assert "GROUP BY s.final_product" in sql
+        assert "ORDER BY margin_pct DESC" in sql
+        assert "LIMIT 10" in sql
+
+    def test_margin_ranking_returns_none_when_cost_unresolved(self):
+        # No cost column anywhere -> margin cannot be computed -> no SQL,
+        # so the caller (sqlWriter / _metric_hints) can degrade gracefully.
+        tables = [
+            _tbl("u_orders", "net_sales", "quantity", "sku_id", "final_product"),
+        ]
+        sql = MetricSqlBuilder(resolve_schema(tables)).margin_ranking()
+        assert sql is None
+
+    def test_margin_ranking_direction_and_limit_are_parametrized(self):
+        tables = [
+            _tbl("u_sales_transactions", "net_sales", "quantity", "sku_id",
+                 "final_product"),
+            _tbl("u_inventory_master", "sku_id", "unit_cost"),
+        ]
+        sql = MetricSqlBuilder(resolve_schema(tables)).margin_ranking(
+            direction="ASC", limit=5)
+        assert sql is not None
+        assert "ORDER BY margin_pct ASC" in sql
+        assert "LIMIT 5" in sql
