@@ -91,24 +91,62 @@ def _system_schema() -> list[dict[str, Any]]:
 
 
 def _metric_hints(user_tables: list[dict[str, Any]]) -> str:
-    """When the uploaded data has a sales-transactions table and an
-    inventory/cost table, emit the EXACT formula for realized margin so
-    the LLM never guesses. 'Realized margin' = profit on what actually
-    sold, after discounts. Detection is by column shape, so this adapts
-    to whatever the user named their sheets."""
+    """Emit margin / profit guidance for the LLM, based on the uploaded
+    data's column shape.
+
+    When the data has a sales table exposing ``net_sales``, ``quantity``,
+    ``sku_id`` AND ``final_product``, plus a cost table exposing
+    ``unit_cost`` and ``sku_id``, emit a '## METRIC DEFINITIONS' block
+    with the EXACT formulas (margin %, gross profit, profit-by-group,
+    profit ranking) so the LLM copies them verbatim instead of guessing.
+
+    ``final_product`` is required because every formula GROUPs/labels on
+    it - detecting only the numeric columns and then hard-coding
+    ``final_product`` in the SQL is the bug that produced 'no such
+    column'.
+
+    When that shape is ABSENT (but data IS uploaded), emit a
+    '## DATA CAPABILITY' note instead, naming what is missing, so the LLM
+    states plainly that margin/profit cannot be computed rather than
+    emitting SQL that fails. Returns '' only when no user tables exist."""
     def cols_of(t: dict[str, Any]) -> set[str]:
         return {str(c["name"]).lower() for c in t.get("columns", [])}
 
+    if not user_tables:
+        return ""
+
     sales_t: str | None = None
     cost_t: str | None = None
+    has_unit_cost = False
     for t in user_tables:
         cl = cols_of(t)
-        if sales_t is None and {"net_sales", "quantity", "sku_id"} <= cl:
+        if "unit_cost" in cl:
+            has_unit_cost = True
+        if sales_t is None and {
+            "net_sales", "quantity", "sku_id", "final_product",
+        } <= cl:
             sales_t = t["table"]
         if cost_t is None and {"unit_cost", "sku_id"} <= cl:
             cost_t = t["table"]
+
     if not sales_t or not cost_t:
-        return ""
+        # Margin / profit cannot be computed on this dataset. Tell the LLM
+        # explicitly so it does not improvise a query that will fail.
+        if not has_unit_cost:
+            reason = "no unit-cost column was found in any uploaded table"
+        elif not sales_t:
+            reason = ("no sales table exposing net_sales, quantity, sku_id "
+                      "and final_product was found")
+        else:
+            reason = "the sales and cost tables share no sku_id key"
+        return (
+            "\n\n## DATA CAPABILITY - margin, profit and cost-of-goods "
+            "CANNOT be computed for this dataset: " + reason + ". "
+            "If the user asks about margin or profit, state plainly that "
+            "the uploaded data carries no cost information - do NOT write "
+            "a margin or profit query."
+        )
+
     return (
         "\n\n## METRIC DEFINITIONS - use these EXACT formulas. "
         "Do NOT invent your own margin / profit math.\n"
@@ -118,6 +156,15 @@ def _metric_hints(user_tables: list[dict[str, Any]]) -> str:
         "* 100.0 / SUM(s.net_sales)\n"
         "  It is profit on what actually sold, after discounts. For "
         "'top products by margin' ORDER BY margin_pct DESC.\n"
+        f'- Gross / total profit (ONE number, no GROUP BY): '
+        f'SUM(s.net_sales) - SUM(s.quantity * i.unit_cost), JOIN "{sales_t}" '
+        f's to "{cost_t}" i ON s.sku_id = i.sku_id.\n'
+        "- Profit by month / category / brand: the SAME "
+        "SUM(s.net_sales) - SUM(s.quantity * i.unit_cost) difference, "
+        "GROUP BY the relevant column (for monthly, group on the month "
+        "part of the date column).\n"
+        "- Profit amount per product (ranking): the same difference, "
+        "GROUP BY s.final_product, ORDER BY it DESC.\n"
         f'- Revenue / total sales: SUM(net_sales) from "{sales_t}".\n'
         f'- Units sold: SUM(quantity) from "{sales_t}".\n'
         f'- Cost of goods: SUM(s.quantity * i.unit_cost) via the join above.\n'

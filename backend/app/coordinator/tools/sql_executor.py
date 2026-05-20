@@ -74,8 +74,12 @@ _DATE_VAL = re.compile(r"^\d{4}([-/]\d{1,2}){0,2}$")
 
 def _y_label_for(col: str) -> str:
     """Map a numeric column name to a y-axis semantic label. The frontend
-    treats 'sales' as currency (₹) and anything else as a plain count."""
+    formats 'sales' as currency (₹), 'percent' with a trailing %, and
+    anything else as a plain number. Percent is checked first so a
+    margin_pct column is labelled %, not currency."""
     c = (col or "").lower()
+    if "pct" in c or "percent" in c:
+        return "percent"
     if any(k in c for k in ("amount", "total", "sales", "revenue", "price", "value", "cost")):
         return "sales"
     if any(k in c for k in ("qty", "quantity", "units", "stock")):
@@ -215,8 +219,8 @@ class SqlExecutorTool(Tool):
     description = (
         "Execute a validated SELECT and return rows. Will refuse any "
         "non-SELECT. Adds a LIMIT if the query doesn't have one. Also "
-        "builds a simple chart payload (bar/line) when the result looks "
-        "plottable."
+        "builds a chart payload (summary / trend / ranking) when the "
+        "result looks plottable."
     )
     parameters_schema = {
         "type": "object",

@@ -29,6 +29,13 @@ NO_THINK = "/no_think"
 # retry the identical call on the fallback provider.
 _RETRYABLE = {"upstream", "network"}
 
+# Provider HTTP status codes that mean the REQUEST was bad, not the
+# provider — retrying (here or on the fallback) fails identically, so
+# these are NOT retryable. 401/403 surface as "auth"; the rest as
+# "client". 429 (rate limit) and 5xx stay "upstream" → retryable.
+_AUTH_STATUS = {401, 403}
+_NON_RETRYABLE_STATUS = {400, 404, 405, 409, 410, 413, 414, 415, 422}
+
 
 # ---------------------------------------------------------------------------
 # Wire types - shape compatible with the rest of the coordinator
@@ -46,7 +53,7 @@ class LLMResponse(BaseModel):
     tokens_out: int = 0
     finish_reason: str | None = None
     error: str | None = None
-    error_kind: str | None = None     # "auth" | "upstream" | "network" | "parse" | "unknown"
+    error_kind: str | None = None     # "auth" | "client" | "upstream" | "network" | "parse" | "unknown"
 
 
 class LLMToolCall(BaseModel):
@@ -201,6 +208,25 @@ def _err_tool_response(msg: str, kind: str) -> LLMToolResponse:
     return LLMToolResponse(error=msg, error_kind=kind)
 
 
+def _classify_api_error(exc: APIError) -> str:
+    """Map an OpenAI APIError to an error_kind by HTTP status. 4xx request
+    errors are permanent (retrying on the fallback fails the same way) so
+    they land outside _RETRYABLE; 429 and 5xx are transient upstream
+    failures the fallback provider may absorb."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "code", None)
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status = None
+    if status in _AUTH_STATUS:
+        return "auth"
+    if status in _NON_RETRYABLE_STATUS:
+        return "client"
+    return "upstream"
+
+
 # ---------------------------------------------------------------------------
 # LLMClient - wraps AsyncOpenAI pointed at Ollama
 # ---------------------------------------------------------------------------
@@ -339,7 +365,10 @@ class LLMClient:
         except APITimeoutError as e:
             return _err_response(f"LLM request timed out at {self.base_url}: {e}", "network")
         except APIError as e:
-            return _err_response(f"LLM API error from {self.base_url} ({self.model}): {e}", "upstream")
+            return _err_response(
+                f"LLM API error from {self.base_url} ({self.model}): {e}",
+                _classify_api_error(e),
+            )
         except Exception as e:
             _log.exception("llm.complete unexpected failure")
             return _err_response(f"{type(e).__name__}: {e}", "unknown")
@@ -369,14 +398,22 @@ class LLMClient:
             for m in messages
         ]
         msgs = ensure_no_think(msgs, model=self.model)
+        # Mirror the non-streaming path's provider fixes: Gemini needs a
+        # max_tokens floor and DashScope Qwen3 needs enable_thinking=False.
+        # Streaming has no failover — a fallback cannot un-yield chunks
+        # already sent to the caller.
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": msgs,
+            "temperature": self.temperature if temperature is None else temperature,
+            "max_tokens": _floor_max_tokens(
+                self.model, self.max_tokens if max_tokens is None else max_tokens),
+            "stream": True,
+        }
+        if _model_needs_thinking_flag(self.model):
+            kwargs["extra_body"] = {"enable_thinking": False}
         try:
-            stream = await self._client.chat.completions.create(
-                model=self.model,
-                messages=msgs,
-                temperature=self.temperature if temperature is None else temperature,
-                max_tokens=self.max_tokens if max_tokens is None else max_tokens,
-                stream=True,
-            )
+            stream = await self._client.chat.completions.create(**kwargs)
             async for chunk in stream:
                 try:
                     delta = chunk.choices[0].delta.content or ""
@@ -432,7 +469,7 @@ class LLMClient:
             body = getattr(e, "body", None) or getattr(e, "response", None)
             return _err_tool_response(
                 f"LLM API error from {self.base_url} (model={self.model}, status={status}): {detail} body={str(body)[:300]}",
-                "upstream",
+                _classify_api_error(e),
             )
         except Exception as e:
             _log.exception("llm.complete_with_tools unexpected failure")

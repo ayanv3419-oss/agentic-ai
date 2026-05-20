@@ -78,29 +78,122 @@ def _build_user_prompt(ctx: ToolContext, args: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-# --- Deterministic margin path -------------------------------------------
-# The LLM writes margin SQL inconsistently (~half the runs use the wrong
-# join or average per-row ratios). Margin is too important to leave to
-# chance, so when the question is about margin AND the schema defines the
-# realized-margin metric, we build the canonical SQL directly - no LLM.
+# --- Deterministic profit/margin RANKING path ----------------------------
+# The LLM writes margin/profit ranking SQL inconsistently (~half the runs
+# use the wrong COGS join or average per-row ratios). Those product
+# RANKING queries are pinned here - the same correct SQL every time.
+#
+# This path is deliberately NARROW. It fires ONLY for a clear product
+# ranking by margin-% or by profit-amount. Everything else - total/gross
+# profit, profit trends, profit grouped by month/category, or anything
+# carrying an explicit time window - falls through to the LLM (guided by
+# the METRIC DEFINITIONS block in the schema). A naive `\b(margin|profit)\b`
+# match used to hijack all of those and answer the wrong shape.
 
-_MARGIN_RE = re.compile(r"\b(margin|profit|profitab\w*)\b", re.I)
+_PROFIT_METRIC_RE = re.compile(r"\b(margin|profit|profitab\w*)\b", re.I)
+_MARGIN_WORD_RE = re.compile(r"\bmargin\b", re.I)
 _WORST_RE = re.compile(r"\b(worst|lowest|least|bottom|poor|weak|low)\b", re.I)
 _METRIC_TABLES_RE = re.compile(
     r'JOIN\s+"([^"]+)"\s+s\s+to\s+"([^"]+)"\s+i', re.I
 )
 _TOPN_RE = re.compile(r"\b(\d{1,3})\b")
 
+# Ranking evidence - the question must clearly want a product leaderboard.
+_RANKING_RE = re.compile(
+    r"\b(top|bottom|best|worst|highest|lowest|leading|most|least"
+    r"|rank|ranked|ranking|leaderboard)\b"
+    r"|\bby\s+(margin|profit)\b",
+    re.I,
+)
 
-def _deterministic_margin_sql(
-    question: str, intent: str, schema: str | None,
+# Disqualifiers - any of these means the question is NOT a flat product
+# ranking (it wants a total, a trend, a different grouping, or a time
+# slice the pinned SQL cannot express). On any hit, fall through to the
+# LLM. Over-disqualifying is safe: the LLM still answers correctly.
+_DISQUALIFY_RE = re.compile(
+    # grouping by something other than product
+    r"\bby\s+(month|months|year|years|day|days|week|weeks|quarter|quarters"
+    r"|date|dates|category|categories|brand|brands|region|regions|location"
+    r"|locations|department|departments|segment|segments|store|stores"
+    r"|customer|customers)\b"
+    r"|\b(monthly|weekly|daily|yearly|quarterly)\b"
+    r"|\bper\s+(month|year|day|week|quarter|date|category|brand|region"
+    r"|location|store|customer)\b"
+    # ranking by a NON-product dimension - the pinned SQL groups by
+    # product, so a category / brand / region ranking is the wrong shape
+    r"|\b(categor(?:y|ies)|subcategor(?:y|ies)|brands?|regions?"
+    r"|departments?|segments?|locations?|stores?|customers?)\b"
+    # trend
+    r"|\b(trend|trends|over\s+time|time\s+series|growth)\b"
+    # totals / aggregates
+    r"|\b(total|overall|gross|combined|aggregate|sum|average|avg|mean)\b"
+    # explicit time window
+    r"|\b(today|yesterday|tomorrow)\b"
+    r"|\b(this|last|past|next|previous)\s+(week|month|quarter|year|day)s?\b"
+    r"|\blast\s+\d+\s+(day|days|week|weeks|month|months|year|years)\b"
+    r"|\b(19|20)\d{2}\b"
+    r"|\b(january|february|march|april|june|july|august|september"
+    r"|october|november|december)\b",
+    re.I,
+)
+
+
+def _ranking_limit(text: str) -> int:
+    """Pull an explicit 'top N' count from the text; default 10, clamped
+    to 1..50. Years are excluded earlier by the disqualifier check."""
+    m = _TOPN_RE.search(text)
+    if not m:
+        return 10
+    try:
+        return max(1, min(int(m.group(1)), 50))
+    except (TypeError, ValueError):
+        return 10
+
+
+def _margin_ranking_intent(
+    question: str, intent: str, route: str | None,
 ) -> str | None:
-    """When the question is about margin/profit AND the schema carries the
-    realized-margin metric definition, return the canonical SQL directly.
-    No LLM, no guessing - the same correct query every time. Returns None
-    when this path does not apply (falls through to the LLM writer)."""
-    text = f"{question or ''} {intent or ''}"
-    if not _MARGIN_RE.search(text):
+    """Decide whether the question is a clear product ranking by a
+    profit/margin metric. Returns:
+      - 'margin'  -> rank products by realized margin %
+      - 'profit'  -> rank products by profit amount
+      - None      -> not a clear ranking; fall through to the LLM
+
+    Hybrid rule: fire ONLY when there is ranking evidence AND no
+    disqualifying cue (other grouping, trend, totals, explicit time
+    window). 'margin' wins over 'profit' when both words appear, since
+    'profit margin' is a percentage metric."""
+    q = question or ""
+    combined = f"{q} {intent or ''}"
+    if not _PROFIT_METRIC_RE.search(combined):
+        return None
+    has_ranking = (
+        bool(_RANKING_RE.search(combined)) or (route or "").upper() == "RANKING"
+    )
+    if not has_ranking:
+        return None
+    # Disqualifiers are vetoes - check the USER's words only. The LLM's
+    # free-text `intent` loosely uses 'total' / 'sum' / 'average' even
+    # when describing a ranking, and that would wrongly veto it.
+    if _DISQUALIFY_RE.search(q):
+        return None
+    return "margin" if _MARGIN_WORD_RE.search(combined) else "profit"
+
+
+def _deterministic_ranking_sql(
+    question: str, intent: str, route: str | None, schema: str | None,
+) -> str | None:
+    """When the question is a clear product ranking by margin-% or by
+    profit-amount AND the schema carries the realized-margin metric
+    definition, return the canonical SQL directly - no LLM, no guessing.
+    Returns None when this path does not apply (falls through to the LLM).
+
+    The schema-defined column names (final_product, net_sales, quantity,
+    sku_id, unit_cost) are safe to hard-code here: SchemaTool only emits
+    the '## METRIC DEFINITIONS' block - this path's precondition - after
+    confirming every one of those columns exists."""
+    shape = _margin_ranking_intent(question, intent, route)
+    if shape is None:
         return None
     if not schema or "## METRIC DEFINITIONS" not in schema:
         return None
@@ -108,18 +201,34 @@ def _deterministic_margin_sql(
     if not m:
         return None
     sales_t, inv_t = m.group(1), m.group(2)
+    text = f"{question or ''} {intent or ''}"
     direction = "ASC" if _WORST_RE.search(text) else "DESC"
-    n = _TOPN_RE.search(text)
-    limit = max(1, min(int(n.group(1)), 50)) if n else 10
-    return (
+    limit = _ranking_limit(text)
+    base = (
         "SELECT s.final_product, "
         "ROUND(SUM(s.net_sales), 2) AS total_net_sales, "
         "ROUND(SUM(s.quantity * i.unit_cost), 2) AS total_cogs, "
-        "ROUND((SUM(s.net_sales) - SUM(s.quantity * i.unit_cost)) * 100.0 "
-        "/ SUM(s.net_sales), 2) AS margin_pct "
-        f'FROM "{sales_t}" s JOIN "{inv_t}" i ON s.sku_id = i.sku_id '
-        "GROUP BY s.final_product HAVING SUM(s.net_sales) > 0 "
-        f"ORDER BY margin_pct {direction} LIMIT {limit}"
+    )
+    join = f'FROM "{sales_t}" s JOIN "{inv_t}" i ON s.sku_id = i.sku_id '
+    if shape == "margin":
+        # Realized margin %. HAVING guards against divide-by-zero revenue.
+        return (
+            base
+            + "ROUND((SUM(s.net_sales) - SUM(s.quantity * i.unit_cost)) "
+            "* 100.0 / SUM(s.net_sales), 2) AS margin_pct "
+            + join
+            + "GROUP BY s.final_product HAVING SUM(s.net_sales) > 0 "
+            + f"ORDER BY margin_pct {direction} LIMIT {limit}"
+        )
+    # Profit amount. No HAVING - loss-making products are valid rows and
+    # must surface for 'worst profit' (direction ASC).
+    return (
+        base
+        + "ROUND(SUM(s.net_sales) - SUM(s.quantity * i.unit_cost), 2) "
+        "AS profit_amount "
+        + join
+        + "GROUP BY s.final_product "
+        + f"ORDER BY profit_amount {direction} LIMIT {limit}"
     )
 
 
@@ -157,19 +266,20 @@ class SqlWriterAgent(Tool):
         if llm is None:
             return ToolOutcome(ok=False, error="sqlWriter requires an LLM client.")
 
-        # Deterministic path: margin/profit questions get the exact pinned
-        # SQL, never the LLM's improvisation.
+        # Deterministic path: a clear product ranking by margin-% or
+        # profit-amount gets the exact pinned SQL, never the LLM's
+        # improvisation. Everything else falls through to the LLM.
         state = ctx.state
         schema = args.get("schema_summary") or state.schema_summary
-        pinned = _deterministic_margin_sql(
-            state.question, str(args.get("intent") or ""), schema,
+        pinned = _deterministic_ranking_sql(
+            state.question, str(args.get("intent") or ""), state.route, schema,
         )
         if pinned is not None:
             return ToolOutcome(
                 ok=True,
                 output={
                     "sql": pinned,
-                    "rationale": "Realized-margin metric - pinned canonical formula.",
+                    "rationale": "Pinned canonical SQL for a profit/margin product ranking.",
                 },
                 state_updates={"sql_draft": pinned},
             )

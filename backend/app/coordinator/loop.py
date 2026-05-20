@@ -8,8 +8,9 @@ Coordinator loop. Drives the agentic cycle:
     5. Reflect, repeat. Stop when the LLM emits no more tool calls or
        the iteration cap is hit, then emit final + turn.end.
 
-Caps: 10 LLM rounds (MAX_ITERATIONS) AND 20 total tool calls
-(MAX_TOOL_CALLS). Either trips, the loop ends.
+Caps: MAX_ITERATIONS LLM rounds AND MAX_TOOL_CALLS total tool calls
+(both defined in hooks.py - the single source of truth). Either trips,
+the loop ends.
 """
 from __future__ import annotations
 
@@ -29,7 +30,7 @@ from app.coordinator.tools.registry import ToolRegistry
 _log = logging.getLogger("coordinator.loop")
 
 
-SYSTEM_PROMPT = """You are the Coordinator for MetricAi, an analytics
+SYSTEM_PROMPT = f"""You are the Coordinator for MetricAi, an analytics
 agent that answers natural-language questions about the user's uploaded
 business data stored in SQLite.
 
@@ -74,8 +75,8 @@ Strict rules:
     further tool calls.
   - You MUST NOT call SqlExecutor without first calling SqlDryRun on the
     same SQL.
-  - Hard caps: 10 LLM rounds AND 20 total tool calls per turn. Either
-    trips, the turn ends - so plan ahead.
+  - Hard caps: {MAX_ITERATIONS} LLM rounds AND {MAX_TOOL_CALLS} total
+    tool calls per turn. Either trips, the turn ends - so plan ahead.
   - When in doubt, ask for fewer rows (smaller LIMIT) rather than more.
   - Margin / profit: only compute margin when the data has a real cost
     or unit-cost column. NEVER fake a margin by subtracting one table's

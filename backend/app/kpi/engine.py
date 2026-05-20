@@ -179,6 +179,35 @@ def _validate_sql_safety(sql: str) -> str | None:
     return None
 
 
+def _friendly_kpi_error(exc: Exception, kpi_id: str) -> str:
+    """Translate a raw SQL failure into a message that names the missing
+    capability, instead of leaking 'no such table/column'.
+
+    KPIs ship with SQL pinned to a specific uploaded-data shape
+    (u_sales_transactions / u_inventory_master). When the current dataset
+    does not match that shape the KPI cannot be computed — the user
+    should see *why*, not a SQLite error string."""
+    import re
+
+    msg = str(exc)
+    table = re.search(r"no such table:\s*([A-Za-z0-9_]+)", msg, re.I)
+    if table:
+        return (
+            f"KPI '{kpi_id}' cannot be computed on the current data — it "
+            f"requires a '{table.group(1)}' table, which this dataset does "
+            f"not have. Upload data with that table to enable this metric."
+        )
+    column = re.search(r"no such column:\s*([A-Za-z0-9_.]+)", msg, re.I)
+    if column:
+        return (
+            f"KPI '{kpi_id}' cannot be computed on the current data — it "
+            f"requires a '{column.group(1)}' column, which this dataset "
+            f"does not have. Upload data with that field to enable this "
+            f"metric."
+        )
+    return f"{type(exc).__name__}: {exc}"
+
+
 async def execute_kpi(kpi: KpiRow) -> KpiResult:
     """Run a single KPI. Never raises — errors land on result.error."""
     result = KpiResult(
@@ -232,7 +261,7 @@ async def execute_kpi(kpi: KpiRow) -> KpiResult:
         rows = await fetch_all(sql_to_run)
     except Exception as e:
         _log.exception("kpi execute failed: %s", kpi.id)
-        result.error = f"{type(e).__name__}: {e}"
+        result.error = _friendly_kpi_error(e, kpi.id)
         return result
 
     result.rows = rows

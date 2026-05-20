@@ -101,6 +101,7 @@ core_system → kpi / hierarchy / vector / monitoring / enrichment / database / 
 | C3 | LLM-generated SQL executed with keyword-denylist only (no parameterization) | HIGH |
 | C4 | Response cache unbounded flat JSON file (no TTL, no eviction) | HIGH |
 | C5 | `analytics_engine.py` is a 57 KB monolith | HIGH |
+| C6 | Margin/profit logic and the 22 re-pointed KPIs assume a fixed workbook schema (`u_sales_transactions`/`u_inventory_master` with `net_sales`, `quantity`, `sku_id`, `unit_cost`, `final_product`). Other schemas degrade gracefully — the LLM is told margin is unavailable and KPIs return a capability message — but cannot compute these metrics. | MEDIUM |
 
 See `PRODUCTION_READINESS_REPORT.md` for full list and remediation plan.
 
