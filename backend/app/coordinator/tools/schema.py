@@ -19,6 +19,7 @@ from app.infrastructure import (
     get_connection,
     quoted,
 )
+from app.schema_mapping import ResolvedSchema, resolve_schema
 
 
 async def _table_row_count(db: Any, name: str) -> int:
@@ -90,85 +91,68 @@ def _system_schema() -> list[dict[str, Any]]:
     ]
 
 
-def _metric_hints(user_tables: list[dict[str, Any]]) -> str:
-    """Emit margin / profit guidance for the LLM, based on the uploaded
-    data's column shape.
+def _metric_hints(
+    user_tables: list[dict[str, Any]], resolved: ResolvedSchema,
+) -> str:
+    """Emit margin / profit guidance for the LLM from the resolved schema.
 
-    When the data has a sales table exposing ``net_sales``, ``quantity``,
-    ``sku_id`` AND ``final_product``, plus a cost table exposing
-    ``unit_cost`` and ``sku_id``, emit a '## METRIC DEFINITIONS' block
-    with the EXACT formulas (margin %, gross profit, profit-by-group,
-    profit ranking) so the LLM copies them verbatim instead of guessing.
+    When the realized-margin formula is computable on this dataset
+    (``resolved.can_compute_margin``), emit a '## METRIC DEFINITIONS'
+    block with the EXACT formulas, written with the ACTUAL resolved
+    column names so it adapts to whatever the workbook called them.
 
-    ``final_product`` is required because every formula GROUPs/labels on
-    it - detecting only the numeric columns and then hard-coding
-    ``final_product`` in the SQL is the bug that produced 'no such
-    column'.
-
-    When that shape is ABSENT (but data IS uploaded), emit a
-    '## DATA CAPABILITY' note instead, naming what is missing, so the LLM
-    states plainly that margin/profit cannot be computed rather than
-    emitting SQL that fails. Returns '' only when no user tables exist."""
-    def cols_of(t: dict[str, Any]) -> set[str]:
-        return {str(c["name"]).lower() for c in t.get("columns", [])}
-
+    Otherwise emit a '## DATA CAPABILITY' note naming what is missing, so
+    the LLM states plainly that margin/profit cannot be computed rather
+    than emitting SQL that fails. Returns '' when no user tables exist."""
     if not user_tables:
         return ""
 
-    sales_t: str | None = None
-    cost_t: str | None = None
-    has_unit_cost = False
-    for t in user_tables:
-        cl = cols_of(t)
-        if "unit_cost" in cl:
-            has_unit_cost = True
-        if sales_t is None and {
-            "net_sales", "quantity", "sku_id", "final_product",
-        } <= cl:
-            sales_t = t["table"]
-        if cost_t is None and {"unit_cost", "sku_id"} <= cl:
-            cost_t = t["table"]
-
-    if not sales_t or not cost_t:
-        # Margin / profit cannot be computed on this dataset. Tell the LLM
-        # explicitly so it does not improvise a query that will fail.
-        if not has_unit_cost:
-            reason = "no unit-cost column was found in any uploaded table"
-        elif not sales_t:
-            reason = ("no sales table exposing net_sales, quantity, sku_id "
-                      "and final_product was found")
+    if not resolved.can_compute_margin:
+        # Margin / profit cannot be computed. Tell the LLM explicitly so
+        # it does not improvise a query that will fail.
+        missing = resolved.missing(
+            "revenue", "quantity", "sku_key", "unit_cost", "product_label",
+        )
+        if missing:
+            reason = "no column matches these concepts: " + ", ".join(missing)
         else:
-            reason = "the sales and cost tables share no sku_id key"
+            reason = ("the sales and cost data share no common key column "
+                      "to join on")
         return (
             "\n\n## DATA CAPABILITY - margin, profit and cost-of-goods "
             "CANNOT be computed for this dataset: " + reason + ". "
             "If the user asks about margin or profit, state plainly that "
-            "the uploaded data carries no cost information - do NOT write "
-            "a margin or profit query."
+            "the uploaded data lacks the needed columns - do NOT write a "
+            "margin or profit query."
         )
 
+    rev = resolved.ref("revenue")
+    qty = resolved.ref("quantity")
+    cost = resolved.ref("unit_cost")
+    prod = resolved.ref("product_label")
+    sku = resolved.ref("sku_key")
+    revenue = f"SUM(s.{rev.column})"
+    cogs = f"SUM(s.{qty.column} * i.{cost.column})"
+    join = (f'JOIN "{rev.table}" s to "{cost.table}" i '
+            f"ON s.{sku.column} = i.{sku.column}")
     return (
         "\n\n## METRIC DEFINITIONS - use these EXACT formulas. "
         "Do NOT invent your own margin / profit math.\n"
-        f'- Realized margin %: JOIN "{sales_t}" s to "{cost_t}" i '
-        "ON s.sku_id = i.sku_id, GROUP BY s.final_product, then\n"
-        "    margin_pct = (SUM(s.net_sales) - SUM(s.quantity * i.unit_cost)) "
-        "* 100.0 / SUM(s.net_sales)\n"
+        f"- Realized margin %: {join}, GROUP BY s.{prod.column}, then\n"
+        f"    margin_pct = ({revenue} - {cogs}) * 100.0 / {revenue}\n"
         "  It is profit on what actually sold, after discounts. For "
         "'top products by margin' ORDER BY margin_pct DESC.\n"
-        f'- Gross / total profit (ONE number, no GROUP BY): '
-        f'SUM(s.net_sales) - SUM(s.quantity * i.unit_cost), JOIN "{sales_t}" '
-        f's to "{cost_t}" i ON s.sku_id = i.sku_id.\n'
-        "- Profit by month / category / brand: the SAME "
-        "SUM(s.net_sales) - SUM(s.quantity * i.unit_cost) difference, "
-        "GROUP BY the relevant column (for monthly, group on the month "
-        "part of the date column).\n"
-        "- Profit amount per product (ranking): the same difference, "
-        "GROUP BY s.final_product, ORDER BY it DESC.\n"
-        f'- Revenue / total sales: SUM(net_sales) from "{sales_t}".\n'
-        f'- Units sold: SUM(quantity) from "{sales_t}".\n'
-        f'- Cost of goods: SUM(s.quantity * i.unit_cost) via the join above.\n'
-        f'- Never say "no cost data" - unit_cost lives in "{cost_t}".'
+        f"- Gross / total profit (ONE number, no GROUP BY): "
+        f"{revenue} - {cogs}, {join}.\n"
+        f"- Profit by month / category / brand: the SAME "
+        f"{revenue} - {cogs} difference, GROUP BY the relevant column "
+        "(for monthly, group on the month part of the date column).\n"
+        f"- Profit amount per product (ranking): the same difference, "
+        f"GROUP BY s.{prod.column}, ORDER BY it DESC.\n"
+        f'- Revenue / total sales: {revenue} from "{rev.table}".\n'
+        f'- Units sold: SUM(s.{qty.column}) from "{rev.table}".\n'
+        f"- Cost of goods: {cogs} via the join above.\n"
+        f'- Never say "no cost data" - unit cost lives in "{cost.table}".'
     )
 
 
@@ -250,7 +234,10 @@ class SchemaTool(Tool):
                 "Only system tables are available."
             )
 
-        text = "\n".join(summary_lines) + _metric_hints(user_tables)
+        # Resolve canonical analytic concepts onto this dataset's columns
+        # once; sqlWriter's deterministic ranking path reuses the result.
+        resolved = resolve_schema(user_tables)
+        text = "\n".join(summary_lines) + _metric_hints(user_tables, resolved)
         return ToolOutcome(
             ok=True,
             output={
@@ -258,7 +245,7 @@ class SchemaTool(Tool):
                 "system_tables": system,
                 "user_tables": user_tables,
             },
-            state_updates={"schema_summary": text},
+            state_updates={"schema_summary": text, "resolved_schema": resolved},
         )
 
 

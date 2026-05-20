@@ -163,6 +163,28 @@ class TestMetricSqlBuilder:
         assert "ORDER BY margin_pct ASC" in sql
         assert "LIMIT 5" in sql
 
+    def test_profit_ranking_sql_from_resolved_schema(self):
+        tables = [
+            _tbl("u_sales_transactions", "net_sales", "quantity", "sku_id",
+                 "final_product"),
+            _tbl("u_inventory_master", "sku_id", "unit_cost"),
+        ]
+        sql = MetricSqlBuilder(resolve_schema(tables)).profit_ranking()
+        assert sql is not None
+        # profit AMOUNT = revenue minus COGS, on SUM totals
+        assert "SUM(s.net_sales) - SUM(s.quantity * i.unit_cost)" in sql
+        assert "AS profit_amount" in sql
+        assert "ORDER BY profit_amount DESC" in sql
+        # no HAVING - loss-making products must still surface
+        assert "HAVING" not in sql
+        assert 'JOIN "u_inventory_master" i ON s.sku_id = i.sku_id' in sql
+
+    def test_profit_ranking_returns_none_when_cost_unresolved(self):
+        tables = [
+            _tbl("u_orders", "net_sales", "quantity", "sku_id", "final_product"),
+        ]
+        assert MetricSqlBuilder(resolve_schema(tables)).profit_ranking() is None
+
     def test_margin_ranking_sanitizes_direction_and_limit(self):
         # The builder is a shared chokepoint - it must not splice an
         # unrecognised direction or an out-of-range limit straight into

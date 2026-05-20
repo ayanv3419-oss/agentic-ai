@@ -7,51 +7,89 @@ identifiers vary.
 """
 from __future__ import annotations
 
-from app.schema_mapping.resolver import ResolvedSchema
+from app.schema_mapping.resolver import ColumnRef, ResolvedSchema
 
 
 class MetricSqlBuilder:
-    """Builds canonical metric SQL from a resolved schema."""
+    """Builds canonical metric SQL from a resolved schema. A metric whose
+    required concepts are unresolved yields ``None`` so the caller can
+    degrade gracefully instead of running a query that would fail."""
 
     def __init__(self, resolved: ResolvedSchema) -> None:
         self._resolved = resolved
 
-    def margin_ranking(
-        self, *, direction: str = "DESC", limit: int = 10,
-    ) -> str | None:
-        """Realized-margin-% product ranking. Margin is profit on what
-        actually sold, after discounts, computed on SUM totals.
+    # -- shared helpers ----------------------------------------------------
 
-        ``direction`` is the ORDER BY direction ("DESC" for best, "ASC"
-        for worst); ``limit`` caps the rows. Both come from trusted
-        internal callers (the deterministic routing path / KPI registry).
-
-        Returns ``None`` when the dataset lacks a concept the formula
-        needs, so the caller can degrade gracefully instead of running a
-        query that would fail."""
+    def _margin_refs(self) -> tuple[ColumnRef, ...] | None:
+        """The (revenue, quantity, unit_cost, product_label, sku_key) column
+        refs, or ``None`` when realized margin/profit cannot be computed on
+        this dataset."""
         r = self._resolved
         if not r.can_compute_margin:
             return None
-        # Sanitise the order/limit even though callers are trusted: this
-        # is a shared chokepoint and the values land in raw SQL.
-        direction = "ASC" if str(direction).strip().upper() == "ASC" else "DESC"
+        return tuple(
+            r.ref(c) for c in
+            ("revenue", "quantity", "unit_cost", "product_label", "sku_key")
+        )
+
+    @staticmethod
+    def _clean_order(direction: str, limit: int) -> tuple[str, int]:
+        """Sanitise the ORDER BY direction + LIMIT. They land in raw SQL
+        and the builder is a shared chokepoint, so never trust them blindly."""
+        d = "ASC" if str(direction).strip().upper() == "ASC" else "DESC"
         try:
-            limit = max(1, min(int(limit), 50))
+            n = max(1, min(int(limit), 50))
         except (TypeError, ValueError):
-            limit = 10
-        rev = r.ref("revenue")
-        qty = r.ref("quantity")
-        cost = r.ref("unit_cost")
-        prod = r.ref("product_label")
-        sku = r.ref("sku_key")
+            n = 10
+        return d, n
+
+    # -- metrics -----------------------------------------------------------
+
+    def margin_ranking(
+        self, *, direction: str = "DESC", limit: int = 10,
+    ) -> str | None:
+        """Realized-margin-% product ranking — profit on what actually sold,
+        after discounts, computed on SUM totals. ``None`` when the dataset
+        lacks a concept the formula needs."""
+        refs = self._margin_refs()
+        if refs is None:
+            return None
+        rev, qty, cost, prod, sku = refs
+        direction, limit = self._clean_order(direction, limit)
+        revenue = f"SUM(s.{rev.column})"
+        cogs = f"SUM(s.{qty.column} * i.{cost.column})"
         return (
             f"SELECT s.{prod.column}, "
-            f"ROUND(SUM(s.{rev.column}), 2) AS total_net_sales, "
-            f"ROUND(SUM(s.{qty.column} * i.{cost.column}), 2) AS total_cogs, "
-            f"ROUND((SUM(s.{rev.column}) - SUM(s.{qty.column} * i.{cost.column})) "
-            f"* 100.0 / SUM(s.{rev.column}), 2) AS margin_pct "
+            f"ROUND({revenue}, 2) AS total_net_sales, "
+            f"ROUND({cogs}, 2) AS total_cogs, "
+            f"ROUND(({revenue} - {cogs}) * 100.0 / {revenue}, 2) AS margin_pct "
             f'FROM "{rev.table}" s JOIN "{cost.table}" i '
             f"ON s.{sku.column} = i.{sku.column} "
-            f"GROUP BY s.{prod.column} HAVING SUM(s.{rev.column}) > 0 "
+            f"GROUP BY s.{prod.column} HAVING {revenue} > 0 "
             f"ORDER BY margin_pct {direction} LIMIT {limit}"
+        )
+
+    def profit_ranking(
+        self, *, direction: str = "DESC", limit: int = 10,
+    ) -> str | None:
+        """Profit-AMOUNT product ranking — revenue minus cost of goods, per
+        product, on SUM totals. No HAVING filter: loss-making products are
+        valid rows and must surface for 'worst profit'. ``None`` when the
+        dataset lacks a concept the formula needs."""
+        refs = self._margin_refs()
+        if refs is None:
+            return None
+        rev, qty, cost, prod, sku = refs
+        direction, limit = self._clean_order(direction, limit)
+        revenue = f"SUM(s.{rev.column})"
+        cogs = f"SUM(s.{qty.column} * i.{cost.column})"
+        return (
+            f"SELECT s.{prod.column}, "
+            f"ROUND({revenue}, 2) AS total_net_sales, "
+            f"ROUND({cogs}, 2) AS total_cogs, "
+            f"ROUND({revenue} - {cogs}, 2) AS profit_amount "
+            f'FROM "{rev.table}" s JOIN "{cost.table}" i '
+            f"ON s.{sku.column} = i.{sku.column} "
+            f"GROUP BY s.{prod.column} "
+            f"ORDER BY profit_amount {direction} LIMIT {limit}"
         )

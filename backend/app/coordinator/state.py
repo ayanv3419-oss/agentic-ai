@@ -14,6 +14,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schema_mapping.resolver import ResolvedSchema
+
 
 ToolStatus = Literal["pending", "running", "ok", "error", "skipped"]
 
@@ -91,6 +93,9 @@ class TurnState(BaseModel):
     time_window: dict[str, Any] | None = None  # set by TimeKPI tool
     entities: list[dict[str, Any]] = Field(default_factory=list)
     schema_summary: str | None = None
+    # Concept->column resolution for the uploaded data; set by SchemaTool,
+    # consumed by sqlWriter's deterministic ranking path.
+    resolved_schema: ResolvedSchema | None = None
 
     # SQL + data ---------------------------------------------------------
     sql_draft: str | None = None

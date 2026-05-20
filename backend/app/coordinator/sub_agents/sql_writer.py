@@ -13,6 +13,7 @@ from typing import Any
 
 from app.coordinator.llm import LLMClient, parse_strict_json
 from app.coordinator.tools.base import Tool, ToolContext, ToolOutcome
+from app.schema_mapping import MetricSqlBuilder, ResolvedSchema
 
 
 _SYSTEM = """You are sqlWriter, a sub-agent of the Coordinator.
@@ -93,9 +94,6 @@ def _build_user_prompt(ctx: ToolContext, args: dict[str, Any]) -> str:
 _PROFIT_METRIC_RE = re.compile(r"\b(margin|profit|profitab\w*)\b", re.I)
 _MARGIN_WORD_RE = re.compile(r"\bmargin\b", re.I)
 _WORST_RE = re.compile(r"\b(worst|lowest|least|bottom|poor|weak|low)\b", re.I)
-_METRIC_TABLES_RE = re.compile(
-    r'JOIN\s+"([^"]+)"\s+s\s+to\s+"([^"]+)"\s+i', re.I
-)
 _TOPN_RE = re.compile(r"\b(\d{1,3})\b")
 
 # Ranking evidence - the question must clearly want a product leaderboard.
@@ -181,55 +179,30 @@ def _margin_ranking_intent(
 
 
 def _deterministic_ranking_sql(
-    question: str, intent: str, route: str | None, schema: str | None,
+    question: str,
+    intent: str,
+    route: str | None,
+    resolved: ResolvedSchema | None,
 ) -> str | None:
     """When the question is a clear product ranking by margin-% or by
-    profit-amount AND the schema carries the realized-margin metric
-    definition, return the canonical SQL directly - no LLM, no guessing.
-    Returns None when this path does not apply (falls through to the LLM).
+    profit-amount AND the dataset's columns resolve to the realized-margin
+    concepts, return the canonical SQL directly - no LLM, no guessing.
 
-    The schema-defined column names (final_product, net_sales, quantity,
-    sku_id, unit_cost) are safe to hard-code here: SchemaTool only emits
-    the '## METRIC DEFINITIONS' block - this path's precondition - after
-    confirming every one of those columns exists."""
+    The SQL is built by MetricSqlBuilder from the RESOLVED column names,
+    so it adapts to whatever the uploaded workbook named its columns.
+    Returns None when this path does not apply (falls through to the LLM)."""
     shape = _margin_ranking_intent(question, intent, route)
     if shape is None:
         return None
-    if not schema or "## METRIC DEFINITIONS" not in schema:
+    if resolved is None or not resolved.can_compute_margin:
         return None
-    m = _METRIC_TABLES_RE.search(schema)
-    if not m:
-        return None
-    sales_t, inv_t = m.group(1), m.group(2)
     text = f"{question or ''} {intent or ''}"
     direction = "ASC" if _WORST_RE.search(text) else "DESC"
     limit = _ranking_limit(text)
-    base = (
-        "SELECT s.final_product, "
-        "ROUND(SUM(s.net_sales), 2) AS total_net_sales, "
-        "ROUND(SUM(s.quantity * i.unit_cost), 2) AS total_cogs, "
-    )
-    join = f'FROM "{sales_t}" s JOIN "{inv_t}" i ON s.sku_id = i.sku_id '
+    builder = MetricSqlBuilder(resolved)
     if shape == "margin":
-        # Realized margin %. HAVING guards against divide-by-zero revenue.
-        return (
-            base
-            + "ROUND((SUM(s.net_sales) - SUM(s.quantity * i.unit_cost)) "
-            "* 100.0 / SUM(s.net_sales), 2) AS margin_pct "
-            + join
-            + "GROUP BY s.final_product HAVING SUM(s.net_sales) > 0 "
-            + f"ORDER BY margin_pct {direction} LIMIT {limit}"
-        )
-    # Profit amount. No HAVING - loss-making products are valid rows and
-    # must surface for 'worst profit' (direction ASC).
-    return (
-        base
-        + "ROUND(SUM(s.net_sales) - SUM(s.quantity * i.unit_cost), 2) "
-        "AS profit_amount "
-        + join
-        + "GROUP BY s.final_product "
-        + f"ORDER BY profit_amount {direction} LIMIT {limit}"
-    )
+        return builder.margin_ranking(direction=direction, limit=limit)
+    return builder.profit_ranking(direction=direction, limit=limit)
 
 
 class SqlWriterAgent(Tool):
@@ -270,9 +243,9 @@ class SqlWriterAgent(Tool):
         # profit-amount gets the exact pinned SQL, never the LLM's
         # improvisation. Everything else falls through to the LLM.
         state = ctx.state
-        schema = args.get("schema_summary") or state.schema_summary
         pinned = _deterministic_ranking_sql(
-            state.question, str(args.get("intent") or ""), state.route, schema,
+            state.question, str(args.get("intent") or ""), state.route,
+            state.resolved_schema,
         )
         if pinned is not None:
             return ToolOutcome(
