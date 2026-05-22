@@ -20,7 +20,7 @@ from app.coordinator.loop import run_loop
 from app.coordinator.memory import append_turn
 from app.coordinator.state import TurnState
 from app.coordinator.tools.registry import ToolRegistry, get_registry
-from app.coordinator.sub_agents import register_sub_agents
+# register_sub_agents removed — sub-agents are internal to capabilities (Phase 2)
 from app.infrastructure import cache_key_for, get_cached, put_cached
 
 
@@ -28,10 +28,11 @@ _log = logging.getLogger("coordinator.runner")
 
 
 def _ensure_sub_agents_registered(registry: ToolRegistry) -> None:
-    needed = {"sqlWriter", "rcaReasoner", "insightFmt"}
-    if needed.issubset(set(registry.names())):
-        return
-    register_sub_agents(registry)
+    # Phase 2: sub-agents (sqlWriter, rcaReasoner, insightFmt) are called
+    # internally by capabilities — they are NOT registered in the public
+    # registry and must NOT be exposed to the LLM. This function is now a
+    # no-op kept for backward-compatibility with any external callers.
+    pass
 
 
 async def run_query_turn(

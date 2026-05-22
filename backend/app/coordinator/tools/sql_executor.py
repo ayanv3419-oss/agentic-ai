@@ -143,6 +143,8 @@ def _order_by_col(sql: str | None, cols: list[str]) -> str | None:
 def _build_chart_payload(
     rows: list[dict[str, Any]],
     sql: str | None = None,
+    granularity: str | None = None,
+    aggregation_type: str | None = None,
 ) -> dict[str, Any] | None:
     """Build a SalesChart payload - the exact shape the frontend ChatChart
     renders. Returns:
@@ -151,7 +153,12 @@ def _build_chart_payload(
       - kind 'ranking' otherwise (label + value pairs).
     The y-axis column is the one the query is ORDER BY-ed on when known
     (so "top 5 by margin" plots margin, not sales); otherwise the first
-    numeric column. Returns None when there is nothing to plot."""
+    numeric column. Returns None when there is nothing to plot.
+
+    ``granularity`` is the value resolved by the Granularity tool (e.g.
+    "month", "week", "day") — used instead of the old hard-coded "monthly".
+    Defaults to "auto" when not provided so the frontend can decide.
+    """
     if not rows:
         return None
     types = _infer_column_types(rows)
@@ -167,14 +174,59 @@ def _build_chart_payload(
     if y_col is None:
         return None
 
+    # Determine chart granularity. Prefer the value set by the Granularity
+    # tool (e.g. "monthly", "weekly"). When it is absent, infer from the
+    # x-axis bucket values so the frontend receives a concrete value instead
+    # of the sentinel "auto" (which it cannot safely handle in a switch).
+    _GRAN_MAP = {"month": "monthly", "week": "weekly", "day": "daily",
+                 "year": "yearly", "monthly": "monthly", "weekly": "weekly",
+                 "daily": "daily", "yearly": "yearly"}
+    gran: str | None = _GRAN_MAP.get((granularity or "").lower())
+    if gran is None and x_col:
+        # Infer from the first x-value: YYYY → yearly, YYYY-MM → monthly,
+        # YYYY-MM-DD → daily (frontend will further distinguish weekly).
+        first_x = str(rows[0].get(x_col, "")) if rows else ""
+        import re as _re2
+        if _re2.match(r"^\d{4}$", first_x):
+            gran = "yearly"
+        elif _re2.match(r"^\d{4}-\d{2}$", first_x):
+            gran = "monthly"
+        elif _re2.match(r"^\d{4}-\d{2}-\d{2}", first_x):
+            gran = "daily"
+        # Still None → frontend inferGranularity() will handle it via null
+
+    # Compute an honest total from the actual result rows.
+    def _total_numeric() -> float:
+        return sum(_num(r.get(y_col)) for r in rows)
+
     # Single row with a number -> summary card (e.g. "total sales").
+    # Exception: if the x_col looks like a category/label (not a date,
+    # not a number) and the SQL had LIMIT 1 or ORDER BY, treat as a
+    # degenerate ranking and emit ranking kind so the frontend knows
+    # this is a "top 1" result rather than an aggregate total.
     if len(rows) == 1:
+        x_val = str(rows[0].get(x_col, "")) if x_col else ""
+        import re as _re3
+        if x_col and types.get(x_col) == "text" and not _re3.match(r"^\d", x_val):
+            # Single-row ranking result (e.g. LIMIT 1 on brand/category)
+            # Emit as ranking so the frontend shows a bar item, not a big number.
+            return {
+                "kind": "ranking",
+                "granularity": gran,
+                "totals": {"total_sales": _num(rows[0].get(y_col)), "orders": 0, "customers": 0},
+                "series": [],
+                "items": [{"name": x_val, "sales": _num(rows[0].get(y_col)), "orders": 0}],
+                "y_label": _y_label_for(y_col),
+            }
         return {
             "kind": "summary",
-            "granularity": "monthly",
+            "granularity": gran,
             "totals": {
                 "total_sales": _num(rows[0].get(y_col)),
-                "orders": 1,
+                # orders / customers kept as 0 — frontend requires these
+                # fields; we cannot compute real values from a SELECT result
+                # without knowing the original invoice/customer columns.
+                "orders": 0,
                 "customers": 0,
             },
             "series": [],
@@ -191,14 +243,22 @@ def _build_chart_payload(
         {"name": str(r.get(x_col)), "value": _num(r.get(y_col))}
         for r in capped
     ]
-    total_val = sum(p["value"] for p in points)
+    # Compute the headline total correctly based on the KPI's aggregation type.
+    # percent / ratio metrics (e.g. margin %) must show the AVERAGE across
+    # items — summing them (e.g. 95% + 96% + ... = 955%) is meaningless.
+    # sum / count / currency metrics keep the plain sum.
+    _agg = (aggregation_type or "sum").lower()
+    if _agg in ("percent", "ratio", "avg") and points:
+        total_val = sum(p["value"] for p in points) / len(points)
+    else:
+        total_val = sum(p["value"] for p in points)
     y_label = _y_label_for(y_col)
 
     if _looks_like_dates(x_col, capped):
         return {
             "kind": "trend",
-            "granularity": "monthly",
-            "totals": {"total_sales": total_val, "orders": len(points), "customers": 0},
+            "granularity": gran,
+            "totals": {"total_sales": total_val, "orders": 0, "customers": 0},
             "series": [
                 {"bucket": p["name"], "sales": p["value"], "orders": 0}
                 for p in points
@@ -208,8 +268,8 @@ def _build_chart_payload(
 
     return {
         "kind": "ranking",
-        "granularity": "monthly",
-        "totals": {"total_sales": total_val, "orders": len(points), "customers": 0},
+        "granularity": gran,
+        "totals": {"total_sales": total_val, "orders": 0, "customers": 0},
         "series": [],
         "items": [
             {"name": p["name"], "sales": p["value"], "orders": 0}
@@ -270,7 +330,15 @@ class SqlExecutorTool(Tool):
         # no-op against the 10 GB default. Removed. Row bounding is
         # handled by the outer LIMIT in _enforce_limit + _HARD_ROW_CAP.
 
-        chart = _build_chart_payload(result, sql)
+        # Pass the granularity from state (set by Granularity tool) so the
+        # chart payload reflects the actual time bucket, not a hard-coded
+        # "monthly".
+        _kpi_hint = getattr(ctx.state, "kpi_hint", None) or {}
+        chart = _build_chart_payload(
+            result, sql,
+            granularity=ctx.state.granularity,
+            aggregation_type=_kpi_hint.get("aggregation_type"),
+        )
         updates: dict[str, Any] = {
             "sql_final": final_sql,
             "rows": result,

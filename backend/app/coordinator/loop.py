@@ -34,64 +34,59 @@ SYSTEM_PROMPT = f"""You are the Coordinator for MetricAi, an analytics
 agent that answers natural-language questions about the user's uploaded
 business data stored in SQLite.
 
-DATA SOURCE - read this carefully:
-  - The Schema tool reports every table WITH its row count.
-  - When the schema lists "PRIMARY DATA" tables (the user's uploaded
-    u_* tables), you MUST write your SQL against THOSE tables. They hold
-    the real data.
-  - The "sales" / "purchase" system tables are a legacy fallback. Do
-    NOT query them when PRIMARY tables exist - they are stale or empty.
-  - Always call Schema first and base your table choice on the row
-    counts you see there.
+You have exactly FOUR capabilities. Use them in order:
 
-You have access to 8 tools and 3 sub-agents. The 8 tools are
-deterministic helpers; the 3 sub-agents wrap LLM calls.
+  1. understand_question  — ALWAYS call this first, no arguments needed.
+       Internally runs: intent classification, time-window resolution,
+       chart granularity, and entity resolution (brand/product names).
+       Returns: route, time_window, granularity, matched entities.
 
-Tools:
-  - Schema       (always call this first if you need to write SQL)
-  - RouteClass   (classify the question)
-  - Granularity  (pick the time bucket)
-  - TimeKPI      (resolve the time window + KPI hints)
-  - EntityLoc    (resolve named entities)
-  - SqlDryRun    (validate SQL before running it)
-  - SqlExecutor  (run a validated SELECT)
-  - CausalTree   (decompose a metric into movers for RCA)
+  2. run_data_query(intent)  — fetch data from the database.
+       Pass a plain-English description of the query you want.
+       Internally runs: schema lookup, SQL writing, validation, execution.
+       Returns: result rows + chart payload.
+       Call this ONCE per distinct query. For RCA you may call it twice
+       (current period first, then prior period).
 
-Sub-agents:
-  - sqlWriter    (write a SELECT from intent + schema)
-  - rcaReasoner  (narrate a causal_tree as plain English)
-  - insightFmt   (compose the final user-facing answer)
+  3. explain_change(dimension)  — for RCA / "why did X drop" questions.
+       Call AFTER run_data_query for both periods.
+       Pass the prior-period rows as prior_rows.
+       Returns: causal tree + plain-English root-cause explanation.
 
-Process every question as follows:
-  1. RouteClass + TimeKPI early so you know intent + window.
-  2. Schema before sqlWriter.
-  3. sqlWriter -> SqlDryRun -> SqlExecutor.
-  4. For RCA routes: also run SqlExecutor for the prior period, then
-     CausalTree, then rcaReasoner.
-  5. Always finish with insightFmt to produce the final answer.
+  4. write_answer()  — ALWAYS call this last.
+       Composes the final user-facing answer from everything collected.
+       Calling this ends the turn — do NOT call anything after it.
 
-Strict rules:
-  - You MUST end the turn by calling insightFmt and then producing no
-    further tool calls.
-  - You MUST NOT call SqlExecutor without first calling SqlDryRun on the
-    same SQL.
+Standard flows:
+
+  KPI / RANKING / TREND question:
+    understand_question → run_data_query(intent) → write_answer
+
+  RCA / "why" question:
+    understand_question
+    → run_data_query(intent="current period data by <dimension>")
+    → run_data_query(intent="prior period data by <dimension>")
+    → explain_change(dimension=..., prior_rows=<prior period rows>)
+    → write_answer
+
+  Conversational / CHAT question (no data needed):
+    understand_question → write_answer
+
+Rules:
+  - ALWAYS call understand_question first. ALWAYS call write_answer last.
+  - run_data_query handles SQL writing, validation and execution for you —
+    just describe what you want in plain English. SQL retry is automatic.
+  - For margin / profit: run_data_query will use the correct formula
+    automatically if the data supports it. If it says margin cannot be
+    computed, trust that — do not retry with improvised math.
+  - ZERO ROWS = STOP. If run_data_query returns row_count=0 or contains
+    a "NO_DATA" field, the table has no data for that period. Do NOT
+    call run_data_query again with different filters or entity names.
+    Call write_answer immediately and tell the user no data is available.
+  - NEVER invent or add party/customer name filters unless the user
+    explicitly named a specific customer in their question.
   - Hard caps: {MAX_ITERATIONS} LLM rounds AND {MAX_TOOL_CALLS} total
-    tool calls per turn. Either trips, the turn ends - so plan ahead.
-  - When in doubt, ask for fewer rows (smaller LIMIT) rather than more.
-  - Margin / profit: only compute margin when the data has a real cost
-    or unit-cost column. NEVER fake a margin by subtracting one table's
-    total from another's - mismatched totals produce nonsense. If no
-    cost column exists, still call insightFmt and have it state plainly
-    that the data has no cost information, so margin cannot be computed.
-  - If a SQL attempt fails twice, do not keep retrying the same shape -
-    call insightFmt with what you have and explain the limitation.
-  - Run SqlExecutor as FEW times as possible - one query that answers
-    the whole question is ideal. NEVER re-run a query you already ran;
-    reuse the rows you already have. Extra queries waste rounds and
-    leave no budget for insightFmt, which desyncs the chart from the
-    answer. The chart shown to the user is built from your LAST
-    SqlExecutor call - make sure that call is the one that answers the
-    question."""
+    capability calls per turn. Plan for 3-5 calls on typical questions."""
 
 
 def _initial_messages(state: TurnState) -> list[dict[str, Any]]:
@@ -189,7 +184,7 @@ async def run_loop(
             if not state.final_answer:
                 # Surface the real reason so we can diagnose — don't hide it
                 # behind a hard-coded "check Ollama" string (we're not always
-                # on Ollama; production uses Together.ai).
+                # on Ollama; production uses OpenRouter).
                 short = (resp.error or "unknown error").splitlines()[0][:300]
                 state = state.apply(
                     final_answer=(
@@ -243,7 +238,9 @@ async def run_loop(
                     "error": result.error,
                 },
             ))
-            if call.name == "insightFmt" and result.status == "ok":
+            # write_answer is the terminal capability — it calls insightFmt
+            # internally. Once it succeeds the turn is done.
+            if call.name == "write_answer" and result.status == "ok":
                 state = state.apply(finished=True)
 
     return state

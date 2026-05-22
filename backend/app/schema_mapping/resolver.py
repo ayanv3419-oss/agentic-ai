@@ -107,6 +107,13 @@ _CATALOG: dict[str, Concept] = {c.name: c for c in (
        "store_name", "outlet", "branch", "shop", "store_id"),
     _c("payment_mode", "dimension",
        "payment_type", "payment_method", "pay_mode", "tender", "payment"),
+    _c("user_group", "dimension",
+       "customer_group", "age_group", "customer_segment", "segment",
+       "buyer_type", "shopper_type"),
+    _c("color", "dimension",
+       "colour", "color_name", "shade"),
+    _c("size", "dimension",
+       "shoe_size", "clothing_size", "size_label", "size_code"),
     # --- time ---
     _c("transaction_date", "date",
        "date", "txn_date", "order_date", "sale_date", "invoice_date",
@@ -228,6 +235,64 @@ class ResolvedSchema:
 # Resolution
 # ---------------------------------------------------------------------------
 
+import re as _re
+
+
+def _col_key(name: str) -> str:
+    """Normalise a column name for synonym matching.
+
+    Replaces spaces, hyphens and other non-alphanumeric separators with
+    underscores so that "Product Name", "product-name" and "product_name"
+    all produce the key "product_name" and match the catalog entry.
+    Lowercased for case-insensitive comparison.
+
+    We keep the original ``name`` in the ColumnRef so downstream SQL
+    always uses the column's real name (with spaces / capitalisation).
+    """
+    return _re.sub(r"[\s\-]+", "_", name.lower()).strip("_")
+
+
+def _collect_matches(concept: Concept, tables: list[dict]) -> dict[str, ColumnRef]:
+    """Collect synonym matches for a concept — per-key first-occurrence map.
+
+    Returns ``{normalised_key: ColumnRef}`` for Phase 1 (same deduplication
+    used by ``_resolve_one``).  Each normalised key maps to the first table
+    that provides a column with that name.
+    """
+    allowed = set(concept.synonyms)
+    matches: dict[str, ColumnRef] = {}
+    for t in tables:
+        for col in t.get("columns", []):
+            name = str(col.get("name", ""))
+            key = _col_key(name)
+            if key in allowed and key not in matches:
+                matches[key] = ColumnRef(t["table"], name)
+    return matches
+
+
+def _collect_all_table_matches(concept: Concept, tables: list[dict]) -> list[ColumnRef]:
+    """Collect EVERY synonym match across EVERY table (no deduplication).
+
+    Used by the Phase 2 co-location pass which needs to find whether the
+    concept appears in the primary sales table, even when an identically-
+    named column in an earlier (alphabetically) table already won Phase 1.
+    Returns one ColumnRef per (table, column) pair that matched.
+    """
+    allowed = set(concept.synonyms)
+    result: list[ColumnRef] = []
+    seen: set[tuple[str, str]] = set()
+    for t in tables:
+        for col in t.get("columns", []):
+            name = str(col.get("name", ""))
+            key = _col_key(name)
+            if key in allowed:
+                pair = (t["table"], name)
+                if pair not in seen:
+                    seen.add(pair)
+                    result.append(ColumnRef(t["table"], name))
+    return result
+
+
 def _resolve_one(
     concept: Concept, tables: list[dict],
 ) -> tuple[Resolution | None, tuple[str, ...]]:
@@ -241,16 +306,13 @@ def _resolve_one(
 
     The same column name appearing in several tables counts once (a
     denormalised key like ``sku_id``), bound to its first occurrence.
+
+    Column names are normalised before matching (spaces/hyphens → underscores,
+    lowercased) so "Product Name", "product-name", and "product_name" all hit
+    the same catalog synonym.
     """
     canonical = concept.synonyms[0]
-    allowed = set(concept.synonyms)
-    matches: dict[str, ColumnRef] = {}   # lower-cased name -> first ref
-    for t in tables:
-        for col in t.get("columns", []):
-            name = str(col.get("name", ""))
-            low = name.lower()
-            if low in allowed and low not in matches:
-                matches[low] = ColumnRef(t["table"], name)
+    matches = _collect_matches(concept, tables)
     if not matches:
         return None, ()
     if canonical in matches:
@@ -307,24 +369,94 @@ def _margin_computable(
             and sku_col in cols.get(cost_t, set()))
 
 
+_CONF_COLOCATION = 0.85   # higher than synonym, lower than canonical
+
+
 def resolve_schema(tables: list[dict]) -> ResolvedSchema:
     """Resolve every canonical concept against the uploaded ``u_*`` tables.
 
     ``tables`` is the shape ``SchemaTool._list_user_tables()`` produces:
     ``[{"table": str, "columns": [{"name": str, "type": str}, ...]}, ...]``.
 
+    Two-phase resolution
+    --------------------
+    Phase 1 (standard): first canonical match wins; single synonym wins;
+    multiple synonyms with no canonical → ambiguous.
+
+    Phase 2 (co-location): uploaded data often comes from a single Excel
+    workbook split into many sheets, so the same business column (e.g.
+    ``category``) appears in multiple tables with different quality.  The
+    alphabetically-first canonical match is not always correct — e.g.
+    ``u_item_details.category`` might be all-NULL while the real column is
+    ``u_sales_transactions.category``.
+
+    To fix this, Phase 2 identifies the **primary sales table** — the table
+    that holds ``transaction_date`` (the unambiguous anchor).  For every
+    concept that is either:
+      (a) ambiguous (no winner in Phase 1), OR
+      (b) currently resolved to a table OTHER than the primary sales table
+    Phase 2 checks whether ANY synonym match lands in the primary table.
+    If one does, we use that match instead and mark it with confidence
+    _CONF_COLOCATION (0.85 — above synonym, below canonical).  This keeps
+    all the analytics measures, dimensions, and keys on the same table so
+    SQL never needs a cross-sheet join to answer a basic question.
+
+    Concepts whose nature is not sales-transactional (unit_cost, stock_qty,
+    selling_price …) live only in the inventory table and are NOT dragged to
+    the sales table because they simply have no column there.
+
     Graceful by construction: an unknown or ambiguous workbook simply
     yields a partially-resolved schema — concepts that map are usable,
     the rest are reported via ``missing()`` / ``ambiguities()``.
     """
+    # ---- Phase 1: standard resolution ------------------------------------
     resolved: dict[str, Resolution] = {}
     ambiguous: dict[str, tuple[str, ...]] = {}
+    # Also keep per-concept full match lists for Phase 2 (no deduplication,
+    # so we can find the primary-table match even when another table's column
+    # of the same name already won Phase 1).
+    all_table_matches: dict[str, list[ColumnRef]] = {}
+
     for concept in _CATALOG.values():
+        all_table_matches[concept.name] = _collect_all_table_matches(concept, tables)
         res, amb = _resolve_one(concept, tables)
         if res is not None:
             resolved[concept.name] = res
         elif amb:
             ambiguous[concept.name] = amb
+
+    # ---- Phase 2: co-location preference ---------------------------------
+    # Identify the primary sales table via the transaction_date concept —
+    # it is canonical and unambiguous in well-formed workbooks.
+    primary_table: str | None = None
+    if "transaction_date" in resolved:
+        primary_table = resolved["transaction_date"].column.table
+
+    if primary_table:
+        for concept in _CATALOG.values():
+            cname = concept.name
+            # Skip if already correctly resolved to the primary table.
+            if (cname in resolved
+                    and resolved[cname].column.table == primary_table):
+                continue
+
+            # Search the FULL (un-deduplicated) match list for any hit in
+            # the primary table.  This finds u_sales_transactions.category
+            # even when u_item_details.category already won Phase 1.
+            primary_ref: ColumnRef | None = next(
+                (ref for ref in all_table_matches.get(cname, [])
+                 if ref.table == primary_table),
+                None,
+            )
+            if primary_ref is None:
+                continue  # concept has no column in the primary table → leave as-is
+
+            # Override: use the primary-table match.
+            resolved[cname] = Resolution(
+                cname, primary_ref, _CONF_COLOCATION, "co-location",
+            )
+            ambiguous.pop(cname, None)
+
     return ResolvedSchema(
         resolved, ambiguous, _margin_computable(resolved, tables),
     )

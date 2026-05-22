@@ -15,6 +15,31 @@ from app.coordinator.tools.base import Tool, ToolContext, ToolOutcome
 from app.time_engine import resolve_dataset_date_tokens
 
 
+# ---------------------------------------------------------------------------
+# Word-to-digit normalization — handles "last three months" etc.
+# ---------------------------------------------------------------------------
+
+_WORD_TO_DIGIT: dict[str, str] = {
+    "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8",
+    "nine": "9", "ten": "10", "eleven": "11", "twelve": "12",
+}
+
+# Matches a number word surrounded by word boundaries.
+_WORD_NUM_RE = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in _WORD_TO_DIGIT) + r")\b",
+    re.I,
+)
+
+
+def _normalize_numbers(text: str) -> str:
+    """Replace number words with digits so regex patterns work uniformly.
+    E.g. "last three months" → "last 3 months"."""
+    return _WORD_NUM_RE.sub(
+        lambda m: _WORD_TO_DIGIT[m.group(1).lower()], text
+    )
+
+
 _RELATIVE_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\byesterday\b", re.I),               "yesterday"),
     (re.compile(r"\btoday\b", re.I),                   "today"),
@@ -26,6 +51,7 @@ _RELATIVE_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\blast\s+quarter\b", re.I),          "last_quarter"),
     (re.compile(r"\bthis\s+year\b", re.I),             "this_year"),
     (re.compile(r"\blast\s+year\b", re.I),             "last_year"),
+    # Accept both digits AND number-words (after _normalize_numbers).
     (re.compile(r"\blast\s+(\d+)\s+days?\b", re.I),    "last_n_days"),
     (re.compile(r"\blast\s+(\d+)\s+weeks?\b", re.I),   "last_n_weeks"),
     (re.compile(r"\blast\s+(\d+)\s+months?\b", re.I),  "last_n_months"),
@@ -141,10 +167,15 @@ class TimeKPITool(Tool):
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolOutcome:
         question = args.get("question") or ctx.state.question or ""
         anchor = await _dataset_today()
+
+        # Normalize number-words to digits so "last three months" matches
+        # the same patterns as "last 3 months".
+        question_norm = _normalize_numbers(question)
+
         chosen_token: str | None = None
         chosen_match: re.Match | None = None
         for pat, token in _RELATIVE_PATTERNS:
-            m = pat.search(question)
+            m = pat.search(question_norm)
             if m:
                 chosen_token = token
                 chosen_match = m
@@ -172,7 +203,9 @@ class TimeKPITool(Tool):
         return ToolOutcome(
             ok=True,
             output={"time_window": tw, "kpi_hints": kpi_hints},
-            state_updates={"time_window": tw},
+            # kpi_hints written to state so downstream tools can read them
+            # without re-parsing the question.
+            state_updates={"time_window": tw, "kpi_hints": kpi_hints},
         )
 
 

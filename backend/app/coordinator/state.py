@@ -91,11 +91,19 @@ class TurnState(BaseModel):
     route: str | None = None              # set by RouteClass tool
     granularity: str | None = None        # set by Granularity tool
     time_window: dict[str, Any] | None = None  # set by TimeKPI tool
+    kpi_hints: list[str] = Field(default_factory=list)  # set by TimeKPI tool
     entities: list[dict[str, Any]] = Field(default_factory=list)
     schema_summary: str | None = None
     # Concept->column resolution for the uploaded data; set by SchemaTool,
     # consumed by sqlWriter's deterministic ranking path.
     resolved_schema: ResolvedSchema | None = None
+
+    # KPI match result — set by run_data_query before calling sqlWriter.
+    # Contains the matched KPI's metadata (id, name, formula, aggregation_type,
+    # output_type, description, confidence). Used by sqlWriter to write
+    # formula-correct SQL and by SqlExecutor to compute chart totals correctly
+    # (e.g. average instead of sum for percent/ratio metrics).
+    kpi_hint: dict[str, Any] | None = None
 
     # SQL + data ---------------------------------------------------------
     sql_draft: str | None = None

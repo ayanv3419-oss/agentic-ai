@@ -1336,7 +1336,14 @@ function seriesToItems(
 
 function TimeSeriesChart({ chart }: { chart: SalesChart }) {
   const series = chart.series ?? []
-  const granularity: Granularity = chart.granularity ?? inferGranularity(series)
+  // Validate the backend-supplied granularity — "auto" or unknown values
+  // fall through to inferGranularity so the x-axis always shows correct labels.
+  const _VALID_GRAN = new Set<string>(['daily', 'weekly', 'monthly', 'yearly'])
+  const granularity: Granularity = (
+    chart.granularity && _VALID_GRAN.has(chart.granularity)
+      ? chart.granularity as Granularity
+      : inferGranularity(series)
+  )
   const tickConfig = getXAxisTickConfig(series.length, granularity)
   const baseHeight = 176
   const chartHeight = baseHeight + Math.max(0, tickConfig.height - 32)

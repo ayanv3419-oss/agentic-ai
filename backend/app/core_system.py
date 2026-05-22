@@ -2178,14 +2178,15 @@ async def _startup() -> None:
     except Exception:
         _app_log.exception("enrichment bootstrap failed (continuing)")
 
-    # Coordinator registry (8 tools + 3 sub-agents).
+    # Coordinator registry — Phase 2: 4 capabilities only.
+    # Sub-agents (sqlWriter, rcaReasoner, insightFmt) are called internally
+    # by the capabilities and must NOT appear in the public registry — the
+    # LLM must not be able to call them directly.
     try:
         from app.coordinator.tools import build_default_registry
-        from app.coordinator.sub_agents import register_sub_agents
         registry = build_default_registry()
-        register_sub_agents(registry)
         _app_log.info(
-            "coordinator registry: %d tools+sub-agents registered: %s",
+            "coordinator registry: %d capabilities registered: %s",
             len(registry.names()), registry.names(),
         )
         _app_log.info("financial DB ready at %s", settings.financial_db_path)

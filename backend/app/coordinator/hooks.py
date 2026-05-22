@@ -64,49 +64,99 @@ def cost_guard(state: TurnState, call: ToolCall) -> HookOutcome:
 
 
 def restriction_guard(state: TurnState, call: ToolCall) -> HookOutcome:
-    """Block any tool name we don't expose. Defense in depth - the
-    OpenAI tools list already limits choices, but the LLM could
-    hallucinate a name."""
+    """Block any capability name we don't expose. Defense in depth — the
+    OpenAI tools list already limits choices, but the LLM could hallucinate
+    a name (e.g. calling a raw Phase-1 tool directly).
+
+    Phase 2: only the 4 capabilities are allowed. Raw tools (Schema,
+    RouteClass, SqlExecutor, etc.) and sub-agents (sqlWriter, insightFmt, …)
+    are internal implementation details — they are never dispatched by the
+    LLM directly.
+    """
     _ALLOWED = {
-        "Schema", "RouteClass", "Granularity", "TimeKPI", "EntityLoc",
-        "SqlDryRun", "SqlExecutor", "CausalTree",
-        "sqlWriter", "rcaReasoner", "insightFmt",
+        "understand_question",
+        "run_data_query",
+        "explain_change",
+        "write_answer",
     }
     if call.name not in _ALLOWED:
         return HookOutcome(
             skip=True,
-            reason=f"tool {call.name!r} is not in the allowed set",
+            reason=f"capability {call.name!r} is not in the allowed set",
             forced_result=ToolOutcome(
                 ok=False,
                 error=(
-                    f"Tool {call.name!r} is not registered. "
-                    f"Allowed: {sorted(_ALLOWED)}"
+                    f"'{call.name}' is not a valid capability. "
+                    f"Use one of: {sorted(_ALLOWED)}"
                 ),
             ),
         )
     return HookOutcome()
 
 
+def _norm_sql(sql: str) -> str:
+    """Collapse whitespace + lowercase for stable SQL comparison."""
+    return " ".join(sql.strip().rstrip(";").strip().split()).lower()
+
+
 def sql_dryrun_guard(state: TurnState, call: ToolCall) -> HookOutcome:
-    """SqlExecutor must be preceded by a SqlDryRun that PASSED this turn.
-    The system prompt mandates it; this enforces it so a hallucinating
-    LLM cannot run SQL that was never dry-run validated."""
+    """SqlExecutor must run the exact SQL that a passing SqlDryRun validated
+    this turn.
+
+    Two-part check:
+      1. At least one SqlDryRun result with status='ok' exists this turn.
+      2. The SQL argument passed to SqlExecutor matches the SQL stored in
+         state.sql_draft (which SqlDryRun writes on success).
+
+    This prevents a hallucinating LLM from:
+      - Running SqlExecutor with no prior dry-run at all.
+      - Dry-running SQL-A and then executing SQL-B (bait-and-switch).
+    """
     if call.name != "SqlExecutor":
         return HookOutcome()
-    if any(r.name == "SqlDryRun" and r.status == "ok"
-           for r in state.tool_results):
-        return HookOutcome()
-    return HookOutcome(
-        skip=True,
-        reason="SqlExecutor called before a passing SqlDryRun",
-        forced_result=ToolOutcome(
-            ok=False,
-            error=(
-                "SqlExecutor is blocked: you must call SqlDryRun first and "
-                "only run SqlExecutor after SqlDryRun reports the SQL valid."
-            ),
-        ),
+
+    # Check 1: was there any passing SqlDryRun this turn?
+    dryrun_passed = any(
+        r.name == "SqlDryRun" and r.status == "ok"
+        for r in state.tool_results
     )
+    if not dryrun_passed:
+        return HookOutcome(
+            skip=True,
+            reason="SqlExecutor called before a passing SqlDryRun",
+            forced_result=ToolOutcome(
+                ok=False,
+                error=(
+                    "SqlExecutor is blocked: you must call SqlDryRun first "
+                    "and only run SqlExecutor after SqlDryRun reports the SQL "
+                    "valid."
+                ),
+            ),
+        )
+
+    # Check 2: does the SQL to execute match what was validated?
+    sql_to_run = str(call.arguments.get("sql") or "").strip()
+    sql_validated = state.sql_draft or ""
+
+    if sql_to_run and sql_validated:
+        if _norm_sql(sql_to_run) != _norm_sql(sql_validated):
+            return HookOutcome(
+                skip=True,
+                reason=(
+                    "SqlExecutor SQL does not match the SqlDryRun-validated "
+                    "SQL - re-run SqlDryRun on the updated SQL first"
+                ),
+                forced_result=ToolOutcome(
+                    ok=False,
+                    error=(
+                        "SqlExecutor is blocked: the SQL you supplied differs "
+                        "from the SQL that passed SqlDryRun. Call SqlDryRun "
+                        "again on the new SQL, then call SqlExecutor."
+                    ),
+                ),
+            )
+
+    return HookOutcome()
 
 
 def log_call(state: TurnState, call: ToolCall) -> None:
@@ -129,7 +179,9 @@ PreHook = Callable[[TurnState, ToolCall], HookOutcome]
 PostHook = Callable[[TurnState, ToolCall, ToolResult], None]
 
 
-PRE_HOOKS: list[PreHook] = [restriction_guard, cost_guard, sql_dryrun_guard]
+PRE_HOOKS: list[PreHook] = [restriction_guard, cost_guard]
+# sql_dryrun_guard removed from pre-hooks: SqlDryRun is now called
+# structurally inside RunDataQueryCapability — it cannot be bypassed.
 POST_HOOKS: list[PostHook] = [log_result]
 
 

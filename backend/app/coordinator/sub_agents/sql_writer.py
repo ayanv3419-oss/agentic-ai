@@ -23,21 +23,50 @@ the user's question against the database described in the schema. You
 NEVER execute SQL. You NEVER produce DDL, INSERT, UPDATE or DELETE.
 
 Rules:
-1. Use only tables/columns that appear in the supplied schema.
+1. Use ONLY tables/columns that appear in the supplied schema. Never
+   invent column names. If a column is not listed in the schema, it
+   does not exist.
 2. Always quote identifiers that contain spaces or special characters
    with double quotes (e.g. "Total Amount", "Party Name").
-3. Apply the supplied time window if relevant - filter on the "Date"
-   column with start_iso/end_iso (or the analogous date column in a
-   user table).
-4. Prefer SUM / COUNT / GROUP BY for aggregate questions.
-5. Add ORDER BY DESC and LIMIT for ranking questions.
-6. NEVER wrap the SQL in markdown fences in the final JSON.
-7. METRIC DEFINITIONS ARE MANDATORY. If the schema (or the MANDATORY
-   FORMULAS block) defines a metric the question asks about - margin,
-   profit, revenue, units sold, cost of goods - you MUST build your SQL
+3. TIME FILTERING: apply the supplied time window (start_iso / end_iso)
+   using the date column shown in the SCHEMA for that table. Do NOT
+   assume it is called "Date". Look for the date/transaction-date column
+   in the schema listing and use its exact name.
+   Example: if the schema shows "Transaction Date":TEXT, use
+   WHERE "Transaction Date" BETWEEN '<start_iso>' AND '<end_iso>'.
+4. ENTITY FILTERING: only add WHERE filters for entities that are
+   explicit restrictions in the question (e.g. "show me Adidas sales").
+   If the question asks WHICH/WHAT (e.g. "which brand performs best?"),
+   do NOT filter — GROUP BY that dimension instead and return all values.
+   When you do filter:
+   - Multiple values of the SAME kind → use IN (...) — never AND for
+     the same column (a row cannot match two values simultaneously).
+     Example: brand=Adidas, brand=Nike → WHERE brand_col IN ('Adidas','Nike')
+   - Different kinds → combine with AND.
+     Example: brand=Adidas, category=Shoes → WHERE brand_col='Adidas' AND category_col='Shoes'
+   Use the EXACT value string from the entity — do not approximate.
+   If entities look irrelevant to the core question, omit the filter.
+5. Prefer SUM / COUNT / GROUP BY for aggregate questions.
+6. RANKING QUESTIONS ('which brand/category/product sold most/best/top'):
+   - Always return at LEAST 10 rows — NEVER use LIMIT 1. The writer agent
+     identifies the winner from the full result. LIMIT 1 produces a Summary
+     card with no chart. Use LIMIT 15 as the default for ranking questions.
+   - Always use ORDER BY <metric> DESC with GROUP BY <dimension>.
+7. REVENUE COLUMN: always use "net_sales" for revenue / total sales questions.
+   Do NOT use "gross_sales" — that is pre-discount gross, not actual revenue.
+   The correct revenue column is net_sales in u_sales_transactions.
+8. NEVER wrap the SQL in markdown fences in the final JSON.
+9. DATE RANGE AWARENESS: if the supplied time window would plausibly cover
+   a period outside a table's data range, write the SQL without a date
+   filter (or with a broader range) and let the results speak. For a
+   "growth" or "trend" question, use the full available date range and
+   compute period-over-period inside the SQL using GROUP BY strftime().
+10. METRIC DEFINITIONS ARE MANDATORY. If the schema (or the MANDATORY
+   FORMULAS block) defines a metric the question asks about — margin,
+   profit, revenue, units sold, cost of goods — you MUST build your SQL
    from that exact formula: same JOIN, same SUM(...) expressions, same
    column names. Copy it verbatim. NEVER average per-row ratios
-   (AVG(margin)) - always compute on SUM totals exactly as written.
+   (AVG(margin)) — always compute on SUM totals exactly as written.
    NEVER substitute a formula of your own.
 
 Respond with valid JSON only, exactly this shape:
@@ -55,7 +84,10 @@ def _build_user_prompt(ctx: ToolContext, args: dict[str, Any]) -> str:
     if state.time_window:
         parts.append(f"Time window: {state.time_window}")
     if state.entities:
-        parts.append(f"Entities (top 20): {state.entities[:20]}")
+        parts.append(
+            "Entities resolved by EntityLoc — add a WHERE filter for each:\n"
+            + str(state.entities[:20])
+        )
     schema = args.get("schema_summary") or state.schema_summary
     if schema:
         # Surface metric definitions FIRST and emphatically - otherwise the
@@ -72,6 +104,26 @@ def _build_user_prompt(ctx: ToolContext, args: dict[str, Any]) -> str:
     intent = args.get("intent") or ""
     if intent:
         parts.append(f"\nDesired output: {intent}")
+
+    # KPI hint — set by run_data_query when the question matches a registered
+    # KPI. Provides the correct formula concept and aggregation type so
+    # sqlWriter does not invent its own math.
+    kpi_hint = getattr(state, "kpi_hint", None)
+    if kpi_hint:
+        parts.append(
+            f"\nKPI CONTEXT (confidence={kpi_hint.get('confidence', 0):.2f}): "
+            f"This question is about '{kpi_hint['name']}' "
+            f"(output_type={kpi_hint['output_type']}, "
+            f"aggregation={kpi_hint['aggregation_type']}).\n"
+            f"Formula concept: {kpi_hint['formula']}\n"
+            f"Description: {kpi_hint['description']}\n"
+            f"IMPORTANT: adapt this formula to the ACTUAL column names in the "
+            f"schema above. Do NOT copy column names from the formula literally "
+            f"if the schema uses different names. The formula is a concept guide, "
+            f"not a literal SQL snippet. For 'percent'/'ratio' KPIs, compute the "
+            f"ratio correctly (do not just SUM percent values)."
+        )
+
     parts.append(
         "\nReturn JSON: "
         '{"sql": "SELECT ...", "rationale": "<one short sentence>"}'
