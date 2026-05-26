@@ -129,22 +129,13 @@ def _system_schema() -> list[dict[str, Any]]:
     ]
 
 
-def _metric_hints(
-    user_tables: list[dict[str, Any]], resolved: ResolvedSchema,
-) -> str:
-    """Emit margin / profit guidance for the LLM from the resolved schema.
+def _margin_hints(resolved: ResolvedSchema) -> str:
+    """Emit the ## METRIC DEFINITIONS block (margin / profit / revenue).
 
-    When the realized-margin formula is computable on this dataset
-    (``resolved.can_compute_margin``), emit a '## METRIC DEFINITIONS'
-    block with the EXACT formulas, written with the ACTUAL resolved
-    column names so it adapts to whatever the workbook called them.
-
-    Otherwise emit a '## DATA CAPABILITY' note naming what is missing, so
-    the LLM states plainly that margin/profit cannot be computed rather
-    than emitting SQL that fails. Returns '' when no user tables exist."""
-    if not user_tables:
-        return ""
-
+    Returns either the full formula block when margin is computable, or
+    a DATA CAPABILITY note describing what is missing. Callers always
+    concatenate this block to the schema summary; it never returns ''.
+    """
     if not resolved.can_compute_margin:
         # Margin / profit cannot be computed. Tell the LLM explicitly so
         # it does not improvise a query that will fail.
@@ -192,6 +183,120 @@ def _metric_hints(
         f"- Cost of goods: {cogs} via the join above.\n"
         f'- Never say "no cost data" - unit cost lives in "{cost.table}".'
     )
+
+
+def _inventory_hints(resolved: ResolvedSchema) -> str:
+    """Emit the ## INVENTORY METRICS block (or a DATA CAPABILITY note).
+
+    Velocity-based inventory status requires stock_qty + sku_key from the
+    inventory side, plus quantity + transaction_date from the sales side
+    so we can compute average daily sales and recency. When stock_qty
+    resolves but the velocity inputs do not, we emit a smaller capability
+    note instead so the LLM does not improvise.
+    """
+    stock = resolved.ref("stock_qty")
+    if stock is None:
+        return ""
+
+    sku = resolved.ref("sku_key")
+    qty = resolved.ref("quantity")
+    txn_date = resolved.ref("transaction_date")
+
+    if sku is None or qty is None or txn_date is None:
+        return (
+            "\n\n## INVENTORY DATA CAPABILITY - current stock is queryable "
+            f"from \"{stock.table}\".{stock.column}, but velocity-based "
+            "inventory status (low / dead / overstocked) CANNOT be "
+            "derived: this dataset is missing one of "
+            "quantity / sku_key / transaction_date on the sales side. "
+            "Do NOT improvise a velocity formula. If asked about dead "
+            "stock or low stock, state plainly that the upload lacks the "
+            "sales-velocity columns needed to compute it."
+        )
+
+    # We have everything: emit explicit SQL the LLM can copy verbatim.
+    inv_t = stock.table
+    sales_t = qty.table
+    stk = f'"{stock.column}"'
+    sku_col = f'"{sku.column}"'
+    qcol = f'"{qty.column}"'
+    dcol = f'"{txn_date.column}"'
+
+    # Common CTEs computing per-SKU velocity + dataset max date so the
+    # individual SQL blocks below stay short and copy-pasteable.
+    velocity_cte = (
+        f"WITH ds AS (SELECT MAX({dcol}) AS max_date FROM \"{sales_t}\"),\n"
+        f"     v AS (\n"
+        f"       SELECT s.{sku_col} AS sku,\n"
+        f"              SUM(s.{qcol}) * 1.0 / NULLIF(\n"
+        f"                JULIANDAY(MAX(s.{dcol})) - JULIANDAY(MIN(s.{dcol})) + 1, 0\n"
+        f"              ) AS avg_daily_sales,\n"
+        f"              MAX(s.{dcol}) AS last_sale_date\n"
+        f"       FROM \"{sales_t}\" s\n"
+        f"       GROUP BY s.{sku_col}\n"
+        f"     )"
+    )
+
+    return (
+        "\n\n## INVENTORY METRICS - use these EXACT formulas. Inventory "
+        "status is VELOCITY-BASED (dead = no sales in last 30 days; "
+        "low = days_of_cover < 7; overstocked = days_of_cover > 60; else ok). "
+        f"Do NOT use any \"status\" / \"availability\" column literally — "
+        "the workbook value (if any) is unreliable. Always derive status "
+        "from sales velocity.\n"
+        f"\n- Current stock per SKU:\n"
+        f"    SELECT {sku_col}, {stk} FROM \"{inv_t}\";\n"
+        f"\n- Days of cover per SKU (stock / avg daily sales):\n"
+        f"    {velocity_cte}\n"
+        f"    SELECT i.{sku_col},\n"
+        f"           i.{stk} AS stock,\n"
+        f"           v.avg_daily_sales,\n"
+        f"           i.{stk} * 1.0 / NULLIF(v.avg_daily_sales, 0) AS days_of_cover\n"
+        f"    FROM \"{inv_t}\" i LEFT JOIN v ON v.sku = i.{sku_col};\n"
+        f"\n- Inventory status per SKU (velocity-based):\n"
+        f"    {velocity_cte}\n"
+        f"    SELECT i.{sku_col},\n"
+        f"           CASE\n"
+        f"             WHEN v.last_sale_date IS NULL\n"
+        f"               OR JULIANDAY((SELECT max_date FROM ds))\n"
+        f"                  - JULIANDAY(v.last_sale_date) > 30 THEN 'dead'\n"
+        f"             WHEN i.{stk} * 1.0 / NULLIF(v.avg_daily_sales, 0) < 7 THEN 'low'\n"
+        f"             WHEN i.{stk} * 1.0 / NULLIF(v.avg_daily_sales, 0) > 60 THEN 'overstocked'\n"
+        f"             ELSE 'ok'\n"
+        f"           END AS inventory_status\n"
+        f"    FROM \"{inv_t}\" i LEFT JOIN v ON v.sku = i.{sku_col}, ds;\n"
+        f"\n- Count of LOW-stock SKUs (copy verbatim):\n"
+        f"    {velocity_cte}\n"
+        f"    SELECT COUNT(*) AS low_stock_skus\n"
+        f"    FROM \"{inv_t}\" i JOIN v ON v.sku = i.{sku_col}\n"
+        f"    WHERE i.{stk} * 1.0 / NULLIF(v.avg_daily_sales, 0) < 7;\n"
+        f"\n- Count of DEAD-stock SKUs (copy verbatim):\n"
+        f"    {velocity_cte}\n"
+        f"    SELECT COUNT(*) AS dead_stock_skus\n"
+        f"    FROM \"{inv_t}\" i LEFT JOIN v ON v.sku = i.{sku_col}, ds\n"
+        f"    WHERE v.last_sale_date IS NULL\n"
+        f"       OR JULIANDAY((SELECT max_date FROM ds))\n"
+        f"          - JULIANDAY(v.last_sale_date) > 30;\n"
+        f"\n- Count of OVERSTOCKED SKUs (copy verbatim):\n"
+        f"    {velocity_cte}\n"
+        f"    SELECT COUNT(*) AS overstocked_skus\n"
+        f"    FROM \"{inv_t}\" i JOIN v ON v.sku = i.{sku_col}\n"
+        f"    WHERE i.{stk} * 1.0 / NULLIF(v.avg_daily_sales, 0) > 60;"
+    )
+
+
+def _metric_hints(
+    user_tables: list[dict[str, Any]], resolved: ResolvedSchema,
+) -> str:
+    """Emit margin/profit + inventory guidance for the LLM from the resolved
+    schema. Each block is built with ACTUAL resolved column names so the SQL
+    snippets adapt to whatever the workbook named its columns.
+
+    Returns '' when no user tables exist.
+    """
+    if not user_tables:
+        return ""
+    return _margin_hints(resolved) + _inventory_hints(resolved)
 
 
 class SchemaTool(Tool):
