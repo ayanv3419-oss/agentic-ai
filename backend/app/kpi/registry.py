@@ -35,6 +35,13 @@ _log = logging.getLogger("agentic_ai.kpi.registry")
 
 KPI_TABLE = "kpi_registry"
 
+# Tier values:
+#   "deterministic" - SQL is either a @builder: call (preferred, portable
+#                     across workbook schemas) or a hand-pinned u_*-table
+#                     SQL string that runs reliably on the current data.
+#   "legacy"        - SQL still targets the legacy sales/purchase tables.
+#                     Skipped by the engine when those tables are empty
+#                     instead of raising 'no such column'.
 _DDL = f"""
 CREATE TABLE IF NOT EXISTS {KPI_TABLE} (
     id                 TEXT PRIMARY KEY,
@@ -49,6 +56,7 @@ CREATE TABLE IF NOT EXISTS {KPI_TABLE} (
     chart_supported    INTEGER NOT NULL DEFAULT 0,
     aliases            TEXT NOT NULL DEFAULT '[]',
     enabled            INTEGER NOT NULL DEFAULT 1,
+    tier               TEXT NOT NULL DEFAULT 'deterministic',
     created_at         TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
 )
@@ -74,6 +82,7 @@ class KpiRow:
     chart_supported: bool
     aliases: list[str]
     enabled: bool = True
+    tier: str = "deterministic"
     created_at: str = ""
     updated_at: str = ""
 
@@ -92,6 +101,7 @@ class KpiRow:
             chart_supported=bool(row.get("chart_supported", 0)),
             aliases=json.loads(row.get("aliases") or "[]"),
             enabled=bool(row.get("enabled", 1)),
+            tier=str(row.get("tier") or "deterministic"),
             created_at=row.get("created_at") or "",
             updated_at=row.get("updated_at") or "",
         )
@@ -1726,50 +1736,53 @@ DEFAULT_KPIS: list[dict[str, Any]] = [
 
 
 # ===========================================================================
-# DATA RE-POINTING (2026-05-20)
+# DATA RE-POINTING (2026-05-20 — extended 2026-05-27)
 # The shipped DEFAULT_KPIS above all target the legacy 2-table sales /
 # purchase schema. Real uploads land in the dynamic workbook tables:
 #   u_sales_transactions  -> net_sales, quantity, sku_id, brand, category,
 #                            payment_mode, transaction_date, final_product
 #   u_inventory_master    -> sku_id, unit_cost (joined for COGS / margin)
-# The block below re-points every KPI that maps cleanly to that data and
-# disables the ones that cannot be computed on it (no customer identity,
-# loyalty, GSTIN or per-bank columns; dataset-relative time windows would
-# need the time engine re-pointed first).
+#
+# Two-tier repointing:
+#   1. @builder:<method> — high-value KPIs are pointed at a
+#      MetricSqlBuilder method (e.g. "@builder:total_revenue"). The
+#      engine resolves the current upload's schema on demand and asks
+#      the builder for the SQL, so the KPI runs correctly on any
+#      workbook whose columns the resolver recognises. Strict-on-
+#      metrics: if a required concept doesn't resolve the engine
+#      reports it; never wrong numbers.
+#   2. legacy SQL string — kept as a fallback when the same KPI shape
+#      is hard to express in the builder; tagged tier='deterministic'
+#      because the SQL is still pinned to u_* tables.
+#
+# Every KPI not in either map is tier='legacy' and disabled — its
+# legacy-table SQL would either fail or compute on empty data.
 # ===========================================================================
 
 _REPOINTED_SQL: dict[str, str] = {
-    "total_revenue":
-        "SELECT COALESCE(SUM(net_sales),0) AS value FROM u_sales_transactions",
-    "total_sales_count":
-        "SELECT COUNT(*) AS value FROM u_sales_transactions",
-    "average_sale_value":
-        "SELECT COALESCE(AVG(net_sales),0) AS value FROM u_sales_transactions",
-    "total_orders":
-        "SELECT COUNT(DISTINCT invoice_no) AS value FROM u_sales_transactions "
-        "WHERE invoice_no IS NOT NULL AND invoice_no <> ''",
+    # Sales metrics — all via the builder.
+    "total_revenue":              "@builder:total_revenue",
+    "total_sales_count":          "@builder:total_sales_count",
+    "average_sale_value":         "@builder:average_sale_value",
+    "total_orders":               "@builder:total_orders",
+    "total_products_sold":        "@builder:total_products_sold",
+    # AOV cannot be derived through a single builder method (it depends
+    # on whether invoice_id resolved). Express directly until a builder
+    # method exists. Tier-deterministic: still pinned to u_* tables.
     "aov":
         "SELECT CASE WHEN COUNT(DISTINCT invoice_no)=0 THEN 0 ELSE "
         "COALESCE(SUM(net_sales),0)*1.0/COUNT(DISTINCT invoice_no) END AS value "
         "FROM u_sales_transactions WHERE invoice_no IS NOT NULL AND invoice_no <> ''",
-    "total_products_sold":
-        "SELECT COUNT(DISTINCT sku_id) AS value FROM u_sales_transactions",
     "total_purchases":
         "SELECT COALESCE(SUM(s.quantity*i.unit_cost),0) AS value "
         "FROM u_sales_transactions s JOIN u_inventory_master i ON s.sku_id=i.sku_id",
-    "gross_profit":
-        "SELECT (COALESCE(SUM(s.net_sales),0)-COALESCE(SUM(s.quantity*i.unit_cost),0)) "
-        "AS value FROM u_sales_transactions s "
-        "JOIN u_inventory_master i ON s.sku_id=i.sku_id",
-    "profit_margin":
-        "SELECT CASE WHEN COALESCE(SUM(s.net_sales),0)=0 THEN 0 ELSE "
-        "(SUM(s.net_sales)-SUM(s.quantity*i.unit_cost))*100.0/SUM(s.net_sales) END "
-        "AS value FROM u_sales_transactions s "
-        "JOIN u_inventory_master i ON s.sku_id=i.sku_id",
-    "cost_to_revenue_ratio":
-        "SELECT CASE WHEN COALESCE(SUM(s.net_sales),0)=0 THEN 0 ELSE "
-        "SUM(s.quantity*i.unit_cost)*1.0/SUM(s.net_sales) END AS value "
-        "FROM u_sales_transactions s JOIN u_inventory_master i ON s.sku_id=i.sku_id",
+    # Profit metrics.
+    "gross_profit":               "@builder:gross_profit",
+    "profit_margin":              "@builder:profit_margin_pct",
+    "cost_to_revenue_ratio":      "@builder:cost_to_revenue_ratio",
+    # Top/bottom product rankings — direct SQL retained (the builder's
+    # *_ranking methods return multi-column shapes, not the
+    # label+value pair the registry needs for these KPIs).
     "top_product":
         "SELECT final_product AS label, COALESCE(SUM(net_sales),0) AS value "
         "FROM u_sales_transactions GROUP BY final_product ORDER BY value DESC LIMIT 1",
@@ -1794,44 +1807,160 @@ _REPOINTED_SQL: dict[str, str] = {
         "GROUP BY s.final_product "
         "HAVING (SUM(s.net_sales)-SUM(s.quantity*i.unit_cost))<0 "
         "ORDER BY value ASC LIMIT 10",
-    "sales_by_brand":
-        "SELECT brand AS label, COALESCE(SUM(net_sales),0) AS value "
-        "FROM u_sales_transactions WHERE brand IS NOT NULL "
-        "GROUP BY brand ORDER BY value DESC",
-    "sales_by_category":
-        "SELECT category AS label, COALESCE(SUM(net_sales),0) AS value "
-        "FROM u_sales_transactions WHERE category IS NOT NULL "
-        "GROUP BY category ORDER BY value DESC",
-    "top_brand":
-        "SELECT brand AS label, COALESCE(SUM(net_sales),0) AS value "
-        "FROM u_sales_transactions WHERE brand IS NOT NULL "
-        "GROUP BY brand ORDER BY value DESC LIMIT 1",
-    "top_category":
-        "SELECT category AS label, COALESCE(SUM(net_sales),0) AS value "
-        "FROM u_sales_transactions WHERE category IS NOT NULL "
-        "GROUP BY category ORDER BY value DESC LIMIT 1",
-    "peak_sales_day":
-        "SELECT transaction_date AS label, COALESCE(SUM(net_sales),0) AS value "
-        "FROM u_sales_transactions WHERE transaction_date IS NOT NULL "
-        "GROUP BY transaction_date ORDER BY value DESC LIMIT 1",
-    "sales_by_month":
-        "SELECT substr(transaction_date,1,7) AS label, "
-        "COALESCE(SUM(net_sales),0) AS value FROM u_sales_transactions "
-        "WHERE transaction_date IS NOT NULL GROUP BY label ORDER BY label ASC",
-    "payment_method_distribution":
-        "SELECT payment_mode AS label, COALESCE(SUM(net_sales),0) AS value "
-        "FROM u_sales_transactions WHERE payment_mode IS NOT NULL "
-        "GROUP BY payment_mode ORDER BY value DESC",
+    # Dimension breakdowns — all via the builder.
+    "sales_by_brand":             "@builder:sales_by_brand",
+    "sales_by_category":          "@builder:sales_by_category",
+    "top_brand":                  "@builder:top_brand",
+    "top_category":               "@builder:top_category",
+    "peak_sales_day":             "@builder:peak_sales_day",
+    "sales_by_month":             "@builder:sales_by_month",
+    "payment_method_distribution": "@builder:payment_method_distribution",
 }
+
+def _is_already_u_table_sql(sql: str) -> bool:
+    """A KPI whose SQL already targets u_* tables (e.g. cherry-picked
+    inventory KPIs that were rewritten in-place) is tier='deterministic'
+    even if it has no _REPOINTED_SQL entry."""
+    s = (sql or "").lower()
+    return "u_sales_transactions" in s or "u_inventory_master" in s
+
 
 for _kpi in DEFAULT_KPIS:
     if _kpi.get("id") in _REPOINTED_SQL:
         _kpi["sql_template"] = _REPOINTED_SQL[_kpi["id"]]
         _kpi["required_columns"] = []   # bypass legacy-schema column check
         _kpi["enabled"] = True
+        _kpi["tier"] = "deterministic"
+    elif _is_already_u_table_sql(_kpi.get("sql_template", "")):
+        # Cherry-picked inventory/sales KPIs that already point at u_*
+        # tables — leave the SQL alone, just tag the tier and keep enabled.
+        _kpi["required_columns"] = []
+        _kpi["enabled"] = True
+        _kpi["tier"] = "deterministic"
     else:
         # Cannot be computed correctly on the current uploaded data shape.
+        # Tag as legacy so the engine skips them gracefully instead of
+        # surfacing 'no such column' errors when the sales/purchase
+        # tables are empty.
         _kpi["enabled"] = False
+        _kpi["tier"] = "legacy"
+
+
+# Inventory KPIs added via the builder. Concept-portable across workbooks
+# that resolve stock_qty + sku_key + quantity + transaction_date. The
+# engine will report "missing concept X" when something is unresolved
+# instead of running wrong SQL — see MetricNotComputable in the builder.
+_INVENTORY_BUILDER_KPIS: list[dict[str, Any]] = [
+    {
+        "id": "count_low_stock",
+        "kpi_name": "Count of Low-Stock SKUs",
+        "kpi_category": "inventory",
+        "description": (
+            "Number of SKUs whose days-of-cover (stock_qty / avg daily "
+            "sales) is under 7."
+        ),
+        "formula_expression": "COUNT(SKU WHERE days_of_cover < 7)",
+        "required_columns": [],
+        "sql_template": "@builder:count_low_stock_skus",
+        "aggregation_type": "count",
+        "output_type": "count",
+        "chart_supported": False,
+        "aliases": [
+            "low stock count", "running low", "needs restock",
+            "low stock items", "reorder list",
+        ],
+        "tier": "deterministic",
+    },
+    {
+        "id": "count_dead_stock",
+        "kpi_name": "Count of Dead-Stock SKUs",
+        "kpi_category": "inventory",
+        "description": (
+            "Number of SKUs with no sales in the last 30 days (or no "
+            "sales ever)."
+        ),
+        "formula_expression": "COUNT(SKU WHERE last_sale_date < max_date - 30 days)",
+        "required_columns": [],
+        "sql_template": "@builder:count_dead_stock_skus",
+        "aggregation_type": "count",
+        "output_type": "count",
+        "chart_supported": False,
+        "aliases": [
+            "dead stock count", "stale skus", "no-sale items",
+            "non-moving stock",
+        ],
+        "tier": "deterministic",
+    },
+    {
+        "id": "count_overstocked",
+        "kpi_name": "Count of Overstocked SKUs",
+        "kpi_category": "inventory",
+        "description": (
+            "Number of SKUs whose days-of-cover exceeds 60."
+        ),
+        "formula_expression": "COUNT(SKU WHERE days_of_cover > 60)",
+        "required_columns": [],
+        "sql_template": "@builder:count_overstocked_skus",
+        "aggregation_type": "count",
+        "output_type": "count",
+        "chart_supported": False,
+        "aliases": [
+            "overstocked count", "excess inventory", "overstock count",
+        ],
+        "tier": "deterministic",
+    },
+    {
+        "id": "days_of_cover_avg",
+        "kpi_name": "Average Days of Cover",
+        "kpi_category": "inventory",
+        "description": (
+            "Mean days-of-cover across all SKUs with positive sales "
+            "velocity."
+        ),
+        "formula_expression": "AVG(stock_qty / avg_daily_sales)",
+        "required_columns": [],
+        "sql_template": "@builder:days_of_cover_avg",
+        "aggregation_type": "avg",
+        "output_type": "count",
+        "chart_supported": False,
+        "aliases": [
+            "days of cover", "average days of cover", "doc",
+            "weeks of cover",
+        ],
+        "tier": "deterministic",
+    },
+    {
+        "id": "total_stock_value",
+        "kpi_name": "Total Stock Value",
+        "kpi_category": "inventory",
+        "description": (
+            "Inventory value at cost: SUM(stock_qty x unit_cost)."
+        ),
+        "formula_expression": "SUM(stock_qty * unit_cost)",
+        "required_columns": [],
+        "sql_template": "@builder:total_stock_value",
+        "aggregation_type": "sum",
+        "output_type": "currency",
+        "chart_supported": False,
+        "aliases": [
+            "stock value", "inventory value", "on-hand value",
+            "inventory at cost",
+        ],
+        "tier": "deterministic",
+    },
+]
+# Replace any pre-existing entry with the builder version (keeps the
+# DEFAULT_KPIS list as the single source of truth).
+_existing_ids = {k["id"] for k in DEFAULT_KPIS}
+for _inv in _INVENTORY_BUILDER_KPIS:
+    _inv.setdefault("enabled", True)
+    if _inv["id"] in _existing_ids:
+        for i, _k in enumerate(DEFAULT_KPIS):
+            if _k["id"] == _inv["id"]:
+                DEFAULT_KPIS[i] = _inv
+                break
+    else:
+        DEFAULT_KPIS.append(_inv)
 
 
 # ===========================================================================
@@ -1839,11 +1968,25 @@ for _kpi in DEFAULT_KPIS:
 # ===========================================================================
 
 async def init_kpi_table() -> None:
-    """Create the kpi_registry table and indexes. Idempotent."""
+    """Create the kpi_registry table and indexes. Idempotent.
+
+    Also runs a small migration that adds the ``tier`` column to
+    pre-existing tables — older deployments do not have it, and the new
+    KpiRow / engine code assume it is present.
+    """
     async with aiosqlite.connect(db_path()) as db:
         await db.execute(_DDL)
         for stmt in _INDEX_DDL:
             await db.execute(stmt)
+        # Migration: add tier column when missing (older deployments).
+        cur = await db.execute(f"PRAGMA table_info({KPI_TABLE})")
+        cols = {row[1] for row in await cur.fetchall()}
+        await cur.close()
+        if "tier" not in cols:
+            await db.execute(
+                f"ALTER TABLE {KPI_TABLE} "
+                f"ADD COLUMN tier TEXT NOT NULL DEFAULT 'deterministic'"
+            )
         await db.commit()
 
 
@@ -1904,6 +2047,7 @@ async def upsert_kpi(kpi: dict[str, Any]) -> None:
         1 if kpi.get("chart_supported") else 0,
         json.dumps(kpi.get("aliases") or []),
         1 if kpi.get("enabled", True) else 0,
+        str(kpi.get("tier") or "deterministic"),
         now,
     )
     async with aiosqlite.connect(db_path()) as db:
@@ -1911,8 +2055,8 @@ async def upsert_kpi(kpi: dict[str, Any]) -> None:
             f"""INSERT INTO {KPI_TABLE}
                 (id, kpi_name, kpi_category, description, formula_expression,
                  required_columns, sql_template, aggregation_type, output_type,
-                 chart_supported, aliases, enabled, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 chart_supported, aliases, enabled, tier, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                   kpi_name           = excluded.kpi_name,
                   kpi_category       = excluded.kpi_category,
@@ -1925,6 +2069,7 @@ async def upsert_kpi(kpi: dict[str, Any]) -> None:
                   chart_supported    = excluded.chart_supported,
                   aliases            = excluded.aliases,
                   enabled            = excluded.enabled,
+                  tier               = excluded.tier,
                   updated_at         = excluded.updated_at""",
             payload,
         )

@@ -28,12 +28,123 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from app.infrastructure import ALLOWED_TABLES, SCHEMA_COLUMNS, fetch_all
+from app.infrastructure import (
+    ALLOWED_TABLES,
+    SCHEMA_COLUMNS,
+    fetch_all,
+    get_connection,
+    quoted,
+)
 from app.kpi.registry import KpiRow, get_kpi
+from app.schema_mapping import (
+    MetricNotComputable,
+    MetricSqlBuilder,
+    resolve_schema,
+)
 from app.time_engine import apply_date_tokens, resolve_dataset_date_tokens
 
 
 _log = logging.getLogger("agentic_ai.kpi.engine")
+
+
+# Marker that tells the engine the sql_template is a builder method name
+# rather than literal SQL. See registry._REPOINTED_SQL for usage.
+_BUILDER_PREFIX = "@builder:"
+
+
+async def _list_user_table_columns() -> list[dict[str, Any]]:
+    """Return the shape resolve_schema() needs:
+        [{"table": <name>, "columns": [{"name": ..., "type": ...}, ...]}, ...]
+    Just for u_* tables. Kept private to the engine so the KPI module has
+    no dependency on coordinator tools.
+    """
+    out: list[dict[str, Any]] = []
+    async with get_connection() as db:
+        cur = await db.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name LIKE 'u\\_%' ESCAPE '\\' "
+            "ORDER BY name"
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        for r in rows:
+            name = dict(r).get("name") or ""
+            if not name:
+                continue
+            cur2 = await db.execute(f"PRAGMA table_info({quoted(name)})")
+            cols = await cur2.fetchall()
+            await cur2.close()
+            out.append({
+                "table": name,
+                "columns": [
+                    {
+                        "name": dict(c)["name"],
+                        "type": dict(c)["type"] or "TEXT",
+                    }
+                    for c in cols
+                ],
+            })
+    return out
+
+
+async def _legacy_tables_empty() -> bool:
+    """Returns True when every legacy table (ALLOWED_TABLES) is empty.
+    Used to short-circuit tier='legacy' KPIs gracefully instead of
+    surfacing 'no such column' errors to the user."""
+    try:
+        async with get_connection() as db:
+            for t in ALLOWED_TABLES:
+                cur = await db.execute(
+                    f"SELECT COUNT(*) AS n FROM {quoted(t)}"
+                )
+                row = await cur.fetchone()
+                await cur.close()
+                if row and int(dict(row).get("n", 0) or 0) > 0:
+                    return False
+    except Exception:
+        # If we cannot read them, assume not empty so the engine still tries.
+        return False
+    return True
+
+
+async def _resolve_builder_template(template: str) -> tuple[str | None, str | None]:
+    """Resolve a ``@builder:<method>`` template into runnable SQL.
+
+    Returns ``(sql, error)``:
+      - on success: ``(sql_string, None)``
+      - on missing concept: ``(None, "<message>")`` so the engine can
+        surface a clear "missing concept X" error to the user.
+    """
+    method_name = template[len(_BUILDER_PREFIX):].strip()
+    if not method_name:
+        return None, "Empty @builder: method name"
+
+    user_tables = await _list_user_table_columns()
+    if not user_tables:
+        return None, (
+            "No uploaded data: this KPI needs the workbook's u_* tables "
+            "to resolve column names against. Upload a sales workbook first."
+        )
+
+    resolved = resolve_schema(user_tables)
+    builder = MetricSqlBuilder(resolved)
+    method = getattr(builder, method_name, None)
+    if method is None or not callable(method):
+        return None, f"Unknown builder method: {method_name!r}"
+
+    try:
+        sql = method()
+    except MetricNotComputable as e:
+        return None, str(e)
+    except Exception as e:
+        return None, f"Builder method {method_name!r} failed: {e}"
+
+    if not sql:
+        return None, (
+            f"Builder method {method_name!r} returned no SQL — "
+            "the required concepts are not all resolved on this dataset."
+        )
+    return sql, None
 
 
 @dataclass
@@ -224,7 +335,38 @@ async def execute_kpi(kpi: KpiRow) -> KpiResult:
         computed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
 
-    # 1. Column validation
+    # 0. Legacy-tier short-circuit. These KPIs still target the
+    #    legacy sales/purchase tables; when those tables are empty we
+    #    return a graceful "not available" result instead of letting
+    #    SQLite raise 'no such column'.
+    if kpi.tier == "legacy" and await _legacy_tables_empty():
+        result.error = (
+            f"KPI '{kpi.id}' is a legacy KPI targeting the empty "
+            "sales/purchase tables. Re-point or skip."
+        )
+        return result
+
+    # 1. @builder: dispatch — concept-portable SQL. Resolve the live
+    #    upload's schema, ask the builder for the SQL, and continue as
+    #    if the template had been literal SQL all along.
+    if kpi.sql_template.startswith(_BUILDER_PREFIX):
+        sql, err = await _resolve_builder_template(kpi.sql_template)
+        if err:
+            result.error = f"KPI '{kpi.id}' cannot be computed: {err}"
+            return result
+        kpi = KpiRow(
+            id=kpi.id, kpi_name=kpi.kpi_name, kpi_category=kpi.kpi_category,
+            description=kpi.description,
+            formula_expression=kpi.formula_expression,
+            required_columns=[], sql_template=sql,
+            aggregation_type=kpi.aggregation_type,
+            output_type=kpi.output_type,
+            chart_supported=kpi.chart_supported,
+            aliases=list(kpi.aliases), enabled=kpi.enabled, tier=kpi.tier,
+        )
+
+    # 2. Column validation (legacy schema check — skipped for @builder:
+    #    KPIs since they declare required_columns=[]).
     missing = _validate_required_columns(kpi.required_columns)
     if missing:
         result.missing_columns = missing
@@ -233,13 +375,13 @@ async def execute_kpi(kpi: KpiRow) -> KpiResult:
         )
         return result
 
-    # 2. SQL safety check
+    # 3. SQL safety check
     safety = _validate_sql_safety(kpi.sql_template)
     if safety:
         result.error = f"SQL template rejected: {safety}"
         return result
 
-    # 3. Dataset-relative time substitution.
+    # 4. Dataset-relative time substitution.
     #    Templates may reference {dataset_today} / {dataset_month} / etc.
     #    apply_date_tokens replaces them with the current dataset values.
     #    If a template references a token and no data is uploaded yet, the
@@ -256,7 +398,7 @@ async def execute_kpi(kpi: KpiRow) -> KpiResult:
         )
         return result
 
-    # 4. Execute
+    # 5. Execute
     try:
         rows = await fetch_all(sql_to_run)
     except Exception as e:
