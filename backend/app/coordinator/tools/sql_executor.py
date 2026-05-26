@@ -243,16 +243,23 @@ def _build_chart_payload(
         {"name": str(r.get(x_col)), "value": _num(r.get(y_col))}
         for r in capped
     ]
-    # Compute the headline total correctly based on the KPI's aggregation type.
-    # percent / ratio metrics (e.g. margin %) must show the AVERAGE across
-    # items — summing them (e.g. 95% + 96% + ... = 955%) is meaningless.
-    # sum / count / currency metrics keep the plain sum.
+    # Compute the headline total correctly. percent / ratio metrics (e.g.
+    # margin %) MUST show the AVERAGE across items — summing them
+    # (e.g. 95% + 96% + ... = 955%) is meaningless and produces the
+    # infamous -7,843% / -3,065% banners on margin questions.
+    #
+    # Two signals decide percent-ness, in order:
+    #   1. KPI matcher passed aggregation_type='percent'/'ratio'/'avg'
+    #   2. The y column NAME looks like a percentage (margin, _pct,
+    #      percent, ratio) — this is the safety net when the KPI matcher
+    #      didn't fire (e.g. ad-hoc "high margin low stock" question).
+    y_label = _y_label_for(y_col)
     _agg = (aggregation_type or "sum").lower()
-    if _agg in ("percent", "ratio", "avg") and points:
+    _is_pct_col = y_label == "percent" or _agg in ("percent", "ratio", "avg")
+    if _is_pct_col and points:
         total_val = sum(p["value"] for p in points) / len(points)
     else:
         total_val = sum(p["value"] for p in points)
-    y_label = _y_label_for(y_col)
 
     if _looks_like_dates(x_col, capped):
         return {
