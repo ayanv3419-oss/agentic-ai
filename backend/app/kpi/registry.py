@@ -524,13 +524,21 @@ DEFAULT_KPIS: list[dict[str, Any]] = [
         "id": "gross_profit",
         "kpi_name": "Gross Profit",
         "kpi_category": "profit",
-        "description": "Revenue minus purchase cost.",
-        "formula_expression": "SUM(sales.Total Amount) - SUM(purchase.Total Amount)",
-        "required_columns": ["Total Amount"],
+        "description": "Revenue minus cost of goods sold (qty * unit_cost).",
+        # formula_expression is the textual hint passed to sqlWriter. Use
+        # concept names; the resolver / METRIC DEFINITIONS block maps them
+        # to the actual columns the uploaded workbook is using.
+        "formula_expression": "SUM(revenue) - SUM(quantity * unit_cost)",
+        "required_columns": [],
+        # sql_template targets the uploaded data tables when present.
+        # Legacy `sales` / `purchase` tables held stale/2025 test data and
+        # the formula `SUM(sales.Total Amount) - SUM(purchase.Total Amount)`
+        # treated full purchase spend as COGS — which is wrong (it ignores
+        # qty sold). This now uses qty*unit_cost cost-of-goods.
         "sql_template": (
-            'SELECT (s.r - p.c) AS value FROM '
-            '(SELECT COALESCE(SUM("Total Amount"), 0) AS r FROM sales) s, '
-            '(SELECT COALESCE(SUM("Total Amount"), 0) AS c FROM purchase) p'
+            'SELECT (SUM(t.net_sales) - SUM(t.quantity * i.unit_cost)) AS value '
+            'FROM u_sales_transactions t '
+            'LEFT JOIN u_inventory_master i ON i.sku_id = t.sku_id'
         ),
         "aggregation_type": "ratio",
         "output_type": "currency",
@@ -542,13 +550,15 @@ DEFAULT_KPIS: list[dict[str, Any]] = [
         "kpi_name": "Profit Margin",
         "kpi_category": "profit",
         "description": "Gross profit expressed as a percent of revenue.",
-        "formula_expression": "((Revenue - COGS) / Revenue) * 100",
-        "required_columns": ["Total Amount"],
+        # Use concept names so the LLM resolves through METRIC DEFINITIONS.
+        "formula_expression": "(SUM(revenue) - SUM(quantity * unit_cost)) * 100.0 / SUM(revenue)",
+        "required_columns": [],
         "sql_template": (
-            'SELECT CASE WHEN s.r = 0 THEN 0 '
-            'ELSE (s.r - p.c) * 100.0 / s.r END AS value FROM '
-            '(SELECT COALESCE(SUM("Total Amount"), 0) AS r FROM sales) s, '
-            '(SELECT COALESCE(SUM("Total Amount"), 0) AS c FROM purchase) p'
+            'SELECT CASE WHEN SUM(t.net_sales) = 0 THEN 0 '
+            '            ELSE (SUM(t.net_sales) - SUM(t.quantity * i.unit_cost)) * 100.0 '
+            '                   / SUM(t.net_sales) END AS value '
+            'FROM u_sales_transactions t '
+            'LEFT JOIN u_inventory_master i ON i.sku_id = t.sku_id'
         ),
         "aggregation_type": "percent",
         "output_type": "percent",
@@ -559,13 +569,14 @@ DEFAULT_KPIS: list[dict[str, Any]] = [
         "id": "cost_to_revenue_ratio",
         "kpi_name": "Cost-to-Revenue Ratio",
         "kpi_category": "profit",
-        "description": "Purchase spend divided by sales revenue.",
-        "formula_expression": "SUM(purchase.Total Amount) / SUM(sales.Total Amount)",
-        "required_columns": ["Total Amount"],
+        "description": "Cost of goods sold divided by sales revenue.",
+        "formula_expression": "SUM(quantity * unit_cost) / SUM(revenue)",
+        "required_columns": [],
         "sql_template": (
-            'SELECT CASE WHEN s.r = 0 THEN 0 ELSE p.c * 1.0 / s.r END AS value FROM '
-            '(SELECT COALESCE(SUM("Total Amount"), 0) AS r FROM sales) s, '
-            '(SELECT COALESCE(SUM("Total Amount"), 0) AS c FROM purchase) p'
+            'SELECT CASE WHEN SUM(t.net_sales) = 0 THEN 0 '
+            '            ELSE SUM(t.quantity * i.unit_cost) * 1.0 / SUM(t.net_sales) END AS value '
+            'FROM u_sales_transactions t '
+            'LEFT JOIN u_inventory_master i ON i.sku_id = t.sku_id'
         ),
         "aggregation_type": "ratio",
         "output_type": "ratio",
@@ -1351,12 +1362,24 @@ DEFAULT_KPIS: list[dict[str, Any]] = [
         "id": "highest_margin_products",
         "kpi_name": "Highest Margin Products",
         "kpi_category": "profit",
-        "description": "Top 5 products ranked by margin percentage.",
-        "formula_expression": "(avg_sale_price - unit_cost) / avg_sale_price * 100 GROUP BY product",
+        "description": "Top 10 products ranked by realized margin percentage.",
+        # Previously: '(avg_sale_price - unit_cost) / avg_sale_price * 100'.
+        # That averaged per-unit ratios — wrong. Correct margin is computed
+        # on SUM totals across all units sold, not per-row averages.
+        "formula_expression": (
+            "(SUM(revenue) - SUM(quantity * unit_cost)) * 100.0 / SUM(revenue) "
+            "GROUP BY product"
+        ),
         "required_columns": [],
         "sql_template": (
-            "SELECT product_name AS label, margin_pct AS value "
-            "FROM product_cost_master ORDER BY margin_pct DESC LIMIT 5"
+            'SELECT t.final_product AS label, '
+            '       (SUM(t.net_sales) - SUM(t.quantity * i.unit_cost)) * 100.0 '
+            '         / NULLIF(SUM(t.net_sales), 0) AS value '
+            'FROM u_sales_transactions t '
+            'LEFT JOIN u_inventory_master i ON i.sku_id = t.sku_id '
+            'GROUP BY t.final_product '
+            'HAVING SUM(t.net_sales) > 0 '
+            'ORDER BY value DESC LIMIT 10'
         ),
         "aggregation_type": "distribution",
         "output_type": "list",
