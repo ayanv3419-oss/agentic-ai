@@ -42,9 +42,11 @@ _STOP_WORDS: frozenset[str] = frozenset({
     "with", "from", "and", "or", "not", "are", "is", "was",
     "my", "our", "their", "per", "than", "too", "very", "but",
     # superlatives / adjectives that aren't entity names
-    "best", "worst", "most", "least", "fast", "slow",
-    "high", "low", "hot", "popular", "fastest", "slowest",
-    "highest", "lowest", "biggest", "smallest", "largest",
+    "best", "worst", "most", "least",
+    # NOTE: "high/low/hot/popular/fast/slow/fastest/slowest/highest/lowest/
+    # biggest/smallest/largest" are NOT stop-words — they are QUALIFIERS that
+    # downstream tools (sqlWriter ORDER BY direction, threshold filters) need
+    # to see. They are extracted via _extract_qualifiers() below.
     # time words
     "month", "week", "year", "day", "quarter", "period",
     "months", "weeks", "years", "days", "today", "now",
@@ -62,6 +64,33 @@ _STOP_WORDS: frozenset[str] = frozenset({
 
 # Tokenizer: words and hyphenated compounds.
 _TOKEN_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9'\-]*[a-zA-Z0-9]|[a-zA-Z0-9]")
+
+
+# Qualifier words: not entity names, but downstream tools need to know
+# them to flip ORDER BY direction or set thresholds.
+_QUALIFIER_WORDS: frozenset[str] = frozenset({
+    "high", "low", "hot", "popular", "fast", "slow",
+    "fastest", "slowest", "highest", "lowest",
+    "biggest", "smallest", "largest",
+})
+
+
+def _extract_qualifiers(question: str) -> list[str]:
+    """Return any qualifier words from the question (deduped, lower-cased).
+
+    These inform downstream SQL writing (e.g. "low/lowest" → ORDER BY ASC,
+    "high/highest" → DESC; "fast/slow" → velocity filters).
+    """
+    if not question:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in _TOKEN_RE.findall(question):
+        t = tok.lower()
+        if t in _QUALIFIER_WORDS and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 
 async def _list_user_tables() -> list[str]:
@@ -282,6 +311,11 @@ class EntityLocTool(Tool):
             for v in deduped:
                 entities.append({"kind": kind, "value": v})
 
+        # Extract qualifier words (high/low/fast/etc.) so sqlWriter can flip
+        # ORDER BY direction and downstream tools can apply threshold filters
+        # without re-parsing the question.
+        qualifiers = _extract_qualifiers(question)
+
         return ToolOutcome(
             ok=True,
             output={
@@ -289,12 +323,13 @@ class EntityLocTool(Tool):
                 "synonyms": synonyms,
                 "matches": matches_by_kind,
                 "candidates": candidates[:10],
+                "qualifiers": qualifiers,
                 "columns_searched": [
                     {"table": t, "column": c, "kind": k}
                     for t, c, k in entity_cols
                 ],
             },
-            state_updates={"entities": entities},
+            state_updates={"entities": entities, "qualifiers": qualifiers},
         )
 
 

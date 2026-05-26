@@ -88,6 +88,12 @@ def _build_user_prompt(ctx: ToolContext, args: dict[str, Any]) -> str:
             "Entities resolved by EntityLoc — add a WHERE filter for each:\n"
             + str(state.entities[:20])
         )
+    if state.qualifiers:
+        parts.append(
+            f"Qualifiers detected: {state.qualifiers}. Use these to inform "
+            f"ORDER BY direction (low/lowest/worst → ASC; "
+            f"high/highest/best → DESC) and threshold filters."
+        )
     schema = args.get("schema_summary") or state.schema_summary
     if schema:
         # Surface metric definitions FIRST and emphatically - otherwise the

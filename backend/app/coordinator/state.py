@@ -93,6 +93,10 @@ class TurnState(BaseModel):
     time_window: dict[str, Any] | None = None  # set by TimeKPI tool
     kpi_hints: list[str] = Field(default_factory=list)  # set by TimeKPI tool
     entities: list[dict[str, Any]] = Field(default_factory=list)
+    # Question qualifier words (high, low, fast, slow, highest, lowest, ...)
+    # extracted by EntityLoc. sqlWriter uses these to flip ORDER BY direction
+    # and downstream tools apply threshold filters without re-parsing.
+    qualifiers: list[str] = Field(default_factory=list)
     schema_summary: str | None = None
     # Concept->column resolution for the uploaded data; set by SchemaTool,
     # consumed by sqlWriter's deterministic ranking path.

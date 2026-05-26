@@ -46,6 +46,13 @@ _ROUTES: dict[str, tuple[str, ...]] = {
         "kpi", "metric", "total sales", "total revenue", "average",
         "sum of", "count of", "how many", "how much",
     ),
+    "INVENTORY": (
+        # whole-word singles
+        "stock", "inventory", "restock", "reorder",
+        # phrases
+        "out of stock", "low stock", "in stock", "dead stock",
+        "overstocked", "days of cover", "on hand",
+    ),
     "ANALYTICS": (
         "show", "list", "report", "breakdown", "summary",
     ),

@@ -62,9 +62,24 @@ _KPI_HINTS: dict[str, tuple[str, ...]] = {
     "orders":        ("orders", "transactions", "bills", "invoices"),
     "customers":     ("customers", "buyers", "clients", "unique customers"),
     "avg_basket":    ("average basket", "avg basket", "avg order", "average order"),
-    "profit":        ("profit", "margin", "gross"),
+    "profit":        ("profit", "gross"),
+    "margin":        ("margin", "profit margin", "gross margin"),
     "quantity":      ("units", "qty", "quantity", "pieces sold"),
+    "stock":         ("stock", "inventory", "on hand", "in stock", "out of stock"),
+    "low_stock":     ("low stock", "running low", "reorder", "restock"),
+    "dead_stock":    ("dead stock", "no sales", "stale"),
+    "forecast":      ("forecast", "predict", "projection"),
+    "category_dim":  ("category", "categories", "segment"),
 }
+
+
+# Routes where a default "last 30 days" window is appropriate even when the
+# question carries no explicit relative date. Other routes (ANALYTICS, CHAT,
+# RANKING when not time-bound) should NOT inherit an arbitrary window — the
+# downstream SQL writer is told to use the full available range instead.
+_TIME_BOUND_ROUTES: frozenset[str] = frozenset({
+    "KPI", "TREND", "FORECAST", "RCA", "COMPARISON",
+})
 
 
 def _window_for(token: str, anchor: date, m: re.Match | None = None) -> tuple[date, date]:
@@ -180,14 +195,46 @@ class TimeKPITool(Tool):
                 chosen_token = token
                 chosen_match = m
                 break
+
+        kpi_hints = _detect_kpi_hints(question)
         if chosen_token is None:
-            # Default to last 30 days when no explicit relative window.
-            start = anchor - timedelta(days=29)
-            end = anchor
-            label = "last 30 days (default)"
-        else:
-            start, end = _window_for(chosen_token, anchor, chosen_match)
-            label = chosen_token.replace("_", " ")
+            # No explicit relative date in the question.
+            # Only default to "last 30 days" when the route is time-bound
+            # (KPI/TREND/FORECAST/RCA/COMPARISON). Otherwise emit no window
+            # so the SQL writer queries the full available range.
+            current_route = (ctx.state.route or "").upper()
+            if current_route in _TIME_BOUND_ROUTES:
+                start = anchor - timedelta(days=29)
+                end = anchor
+                # Clamp days_in_month edge case
+                if end.day > calendar.monthrange(end.year, end.month)[1]:
+                    end = end.replace(
+                        day=calendar.monthrange(end.year, end.month)[1]
+                    )
+                tw = {
+                    "start_iso": start.isoformat(),
+                    "end_iso": end.isoformat(),
+                    "label": "last 30 days (default)",
+                    "anchor": anchor.isoformat(),
+                }
+                return ToolOutcome(
+                    ok=True,
+                    output={"time_window": tw, "kpi_hints": kpi_hints},
+                    state_updates={"time_window": tw, "kpi_hints": kpi_hints},
+                )
+            # Non-time-bound route → emit no window.
+            return ToolOutcome(
+                ok=True,
+                output={
+                    "time_window": None,
+                    "label": "no time filter",
+                    "kpi_hints": kpi_hints,
+                },
+                state_updates={"time_window": None, "kpi_hints": kpi_hints},
+            )
+
+        start, end = _window_for(chosen_token, anchor, chosen_match)
+        label = chosen_token.replace("_", " ")
 
         # Clamp days_in_month edge case
         if end.day > calendar.monthrange(end.year, end.month)[1]:
@@ -199,7 +246,6 @@ class TimeKPITool(Tool):
             "label": label,
             "anchor": anchor.isoformat(),
         }
-        kpi_hints = _detect_kpi_hints(question)
         return ToolOutcome(
             ok=True,
             output={"time_window": tw, "kpi_hints": kpi_hints},
