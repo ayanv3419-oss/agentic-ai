@@ -73,6 +73,28 @@ def _infer_column_types(
 _DATE_COL_HINT = re.compile(r"(date|month|year|day|week|quarter|period|bucket)", re.I)
 _DATE_VAL = re.compile(r"^\d{4}([-/]\d{1,2}){0,2}$")
 
+# Column-name patterns that imply the metric is a ratio/percent and so the
+# correct aggregation across rows is AVERAGE, not SUM. Used when no
+# aggregation_type hint was supplied by the KPI matcher.
+_PERCENT_COL_RE = re.compile(
+    r".*pct$|.*percent.*|.*ratio.*|.*margin$|.*_share$",
+    re.I,
+)
+
+
+def _derive_aggregation_type(y_col: str | None, supplied: str | None) -> str:
+    """Return the aggregation type for the banner total.
+
+    Respects an explicit hint when supplied. Otherwise inspects the y
+    column name for percent/ratio-like patterns and returns 'percent'
+    when matched; defaults to 'sum'.
+    """
+    if supplied:
+        return supplied.lower()
+    if y_col and _PERCENT_COL_RE.match(y_col):
+        return "percent"
+    return "sum"
+
 
 def _y_label_for(col: str) -> str:
     """Map a numeric column name to a y-axis semantic label. The frontend
@@ -254,7 +276,7 @@ def _build_chart_payload(
     #      percent, ratio) — this is the safety net when the KPI matcher
     #      didn't fire (e.g. ad-hoc "high margin low stock" question).
     y_label = _y_label_for(y_col)
-    _agg = (aggregation_type or "sum").lower()
+    _agg = _derive_aggregation_type(y_col, aggregation_type)
     _is_pct_col = y_label == "percent" or _agg in ("percent", "ratio", "avg")
     if _is_pct_col and points:
         total_val = sum(p["value"] for p in points) / len(points)

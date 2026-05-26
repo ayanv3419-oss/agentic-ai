@@ -89,18 +89,20 @@ class RunDataQueryCapability(Tool):
 
         # ── Step 1b: KPI matcher ────────────────────────────────────────────
         # Match the user's question + intent to a registered KPI. If we get a
-        # confident match, we pass the KPI's formula concept and aggregation
-        # type to sqlWriter so it writes correct SQL instead of guessing. We
-        # also store aggregation_type in state so SqlExecutor computes the
+        # confident-enough match, pass the KPI's formula concept and
+        # aggregation type to sqlWriter so it writes correct SQL instead of
+        # guessing. SqlExecutor also reads aggregation_type to compute the
         # chart total correctly (e.g. average for percent metrics, not sum).
-        # Confidence floor 0.70 — below that it's safer to let the LLM decide.
+        # Floor lowered to 0.65 so weaker matches still surface as hints —
+        # they are tagged with match_strength so downstream tools can decide
+        # how much to trust them. Below 0.65 the noise outweighs the signal.
         try:
             _kpi_text = f"{state.question} {intent}"
             _kpi_match = await _match_kpi(_kpi_text)
         except Exception:
             _kpi_match = None
 
-        if _kpi_match and _kpi_match.confidence >= 0.70:
+        if _kpi_match and _kpi_match.confidence >= 0.65:
             _k = _kpi_match.kpi
             kpi_hint: dict[str, Any] = {
                 "id":               _k.id,
@@ -110,6 +112,7 @@ class RunDataQueryCapability(Tool):
                 "output_type":      _k.output_type,
                 "description":      _k.description,
                 "confidence":       _kpi_match.confidence,
+                "match_strength":   "strong" if _kpi_match.confidence >= 0.85 else "weak",
             }
             updates["kpi_hint"] = kpi_hint
             state = state.apply(kpi_hint=kpi_hint)
