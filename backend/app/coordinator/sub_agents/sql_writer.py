@@ -52,9 +52,9 @@ Rules:
      identifies the winner from the full result. LIMIT 1 produces a Summary
      card with no chart. Use LIMIT 15 as the default for ranking questions.
    - Always use ORDER BY <metric> DESC with GROUP BY <dimension>.
-7. REVENUE COLUMN: always use "net_sales" for revenue / total sales questions.
-   Do NOT use "gross_sales" — that is pre-discount gross, not actual revenue.
-   The correct revenue column is net_sales in u_sales_transactions.
+7. REVENUE / METRIC COLUMNS: use the EXACT column name shown in the schema's
+   METRIC DEFINITIONS block. NEVER hardcode column names — the schema layer
+   maps revenue/cost/quantity to whatever the workbook uses.
 8. NEVER wrap the SQL in markdown fences in the final JSON.
 9. DATE RANGE AWARENESS: if the supplied time window would plausibly cover
    a period outside a table's data range, write the SQL without a date

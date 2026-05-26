@@ -70,8 +70,11 @@ class CausalTreeTool(Tool):
             },
             "value_column": {
                 "type": "string",
-                "default": "Total Amount",
-                "description": "Numeric column to aggregate (sum).",
+                "description": (
+                    "Numeric column to aggregate (sum). Leave unset to use "
+                    "resolved revenue concept or the first numeric column "
+                    "in state."
+                ),
             },
             "current_rows": {
                 "type": "array",
