@@ -1157,19 +1157,38 @@ DEFAULT_KPIS: list[dict[str, Any]] = [
     },
 
     # ─── INVENTORY LIST KPIs (returning SKU lists, not just counts) ────────
+    # Status thresholds (dataset-relative, last 30 days):
+    #   avg_daily = SUM(qty sold last 30d) / 30
+    #   low         = stock_qty < avg_daily * 7        (under one week of cover)
+    #   overstocked = stock_qty > avg_daily * 60       (over 60 days of cover)
+    #   dead        = no sales in last 30 days
+    # Source tables: u_inventory_master (real uploaded stock) joined with
+    # u_sales_transactions (real sales velocity). Previously these queried
+    # sku_inventory, which only had 7 synthetic rows derived from legacy
+    # `sales` table — invisible to the uploaded workbook.
     {
         "id": "low_stock_items",
         "kpi_name": "Low-Stock Items",
         "kpi_category": "inventory",
-        "description": "Top 10 SKUs at or below their reorder level, ordered by urgency.",
-        "formula_expression": "list SKUs WHERE status = 'low' ORDER BY days_of_cover ASC",
+        "description": "Top 10 SKUs below one week of cover, ordered by urgency.",
+        "formula_expression": "list SKUs WHERE stock_qty < (avg_daily_sales_30d * 7) ORDER BY stock_qty ASC",
         "required_columns": [],
         "sql_template": (
-            "SELECT i.product_name AS label, "
-            "       COALESCE(i.days_of_cover, 0) AS value, "
-            "       i.sku_code, i.on_hand_qty, i.reorder_level "
-            "FROM sku_inventory i WHERE i.status = 'low' "
-            "ORDER BY value ASC LIMIT 10"
+            "WITH ds AS (SELECT MAX(date(transaction_date)) AS d FROM u_sales_transactions), "
+            "vel AS ( "
+            "  SELECT t.sku_id, SUM(t.quantity)/30.0 AS avg_daily "
+            "  FROM u_sales_transactions t, ds "
+            "  WHERE date(t.transaction_date) >= date(ds.d, '-30 days') "
+            "  GROUP BY t.sku_id "
+            ") "
+            "SELECT i.final_product AS label, "
+            "       i.stock_qty AS value, "
+            "       i.sku_id, ROUND(COALESCE(v.avg_daily,0),2) AS avg_daily_sales "
+            "FROM u_inventory_master i "
+            "LEFT JOIN vel v ON v.sku_id = i.sku_id "
+            "WHERE COALESCE(v.avg_daily, 0) > 0 "
+            "  AND i.stock_qty < COALESCE(v.avg_daily, 0) * 7 "
+            "ORDER BY i.stock_qty ASC LIMIT 10"
         ),
         "aggregation_type": "distribution",
         "output_type": "list",
@@ -1185,15 +1204,22 @@ DEFAULT_KPIS: list[dict[str, Any]] = [
         "id": "dead_stock_items",
         "kpi_name": "Dead-Stock Items",
         "kpi_category": "inventory",
-        "description": "Top 10 SKUs flagged as dead stock (no recent sales activity).",
-        "formula_expression": "list SKUs WHERE status = 'dead'",
+        "description": "Top 10 SKUs flagged as dead stock (no sales in last 30 dataset days).",
+        "formula_expression": "list SKUs WHERE no sales in last 30 days ORDER BY stock_qty DESC",
         "required_columns": [],
         "sql_template": (
-            "SELECT i.product_name AS label, "
-            "       i.on_hand_qty AS value, "
-            "       i.sku_code, COALESCE(i.days_of_cover, 0) AS days_of_cover "
-            "FROM sku_inventory i WHERE i.status = 'dead' "
-            "ORDER BY i.on_hand_qty DESC LIMIT 10"
+            "WITH ds AS (SELECT MAX(date(transaction_date)) AS d FROM u_sales_transactions), "
+            "sold AS ( "
+            "  SELECT DISTINCT t.sku_id "
+            "  FROM u_sales_transactions t, ds "
+            "  WHERE date(t.transaction_date) >= date(ds.d, '-30 days') "
+            ") "
+            "SELECT i.final_product AS label, "
+            "       i.stock_qty AS value, "
+            "       i.sku_id "
+            "FROM u_inventory_master i "
+            "WHERE i.sku_id NOT IN (SELECT sku_id FROM sold) "
+            "ORDER BY i.stock_qty DESC LIMIT 10"
         ),
         "aggregation_type": "distribution",
         "output_type": "list",
@@ -1233,15 +1259,32 @@ DEFAULT_KPIS: list[dict[str, Any]] = [
         ],
     },
 
-    # ─── INVENTORY (derived from real sales velocity) ─────────────────────
+    # ─── INVENTORY (derived from uploaded u_inventory_master + sales) ──────
+    # Same status thresholds as the list KPIs above:
+    #   low         = stock_qty < avg_daily_sales_30d * 7
+    #   overstocked = stock_qty > avg_daily_sales_30d * 60
+    #   dead        = no sales in last 30 dataset days
     {
         "id": "low_stock_skus",
         "kpi_name": "Low-Stock SKUs",
         "kpi_category": "inventory",
-        "description": "Number of SKUs whose on-hand cover falls below a week of sales velocity.",
-        "formula_expression": "COUNT(*) FROM sku_inventory WHERE status = 'low'",
+        "description": "Number of SKUs with less than one week of cover at current sales velocity.",
+        "formula_expression": "COUNT(SKUs WHERE stock_qty < avg_daily_sales_30d * 7)",
         "required_columns": [],
-        "sql_template": "SELECT COUNT(*) AS value FROM sku_inventory WHERE status = 'low'",
+        "sql_template": (
+            "WITH ds AS (SELECT MAX(date(transaction_date)) AS d FROM u_sales_transactions), "
+            "vel AS ( "
+            "  SELECT t.sku_id, SUM(t.quantity)/30.0 AS avg_daily "
+            "  FROM u_sales_transactions t, ds "
+            "  WHERE date(t.transaction_date) >= date(ds.d, '-30 days') "
+            "  GROUP BY t.sku_id "
+            ") "
+            "SELECT COUNT(*) AS value "
+            "FROM u_inventory_master i "
+            "LEFT JOIN vel v ON v.sku_id = i.sku_id "
+            "WHERE COALESCE(v.avg_daily, 0) > 0 "
+            "  AND i.stock_qty < COALESCE(v.avg_daily, 0) * 7"
+        ),
         "aggregation_type": "count",
         "output_type": "count",
         "chart_supported": False,
@@ -1252,10 +1295,23 @@ DEFAULT_KPIS: list[dict[str, Any]] = [
         "id": "overstocked_skus",
         "kpi_name": "Overstocked SKUs",
         "kpi_category": "inventory",
-        "description": "Number of SKUs with more than 60 days of cover at current velocity.",
-        "formula_expression": "COUNT(*) FROM sku_inventory WHERE status = 'overstocked'",
+        "description": "Number of SKUs with more than 60 days of cover at current sales velocity.",
+        "formula_expression": "COUNT(SKUs WHERE stock_qty > avg_daily_sales_30d * 60)",
         "required_columns": [],
-        "sql_template": "SELECT COUNT(*) AS value FROM sku_inventory WHERE status = 'overstocked'",
+        "sql_template": (
+            "WITH ds AS (SELECT MAX(date(transaction_date)) AS d FROM u_sales_transactions), "
+            "vel AS ( "
+            "  SELECT t.sku_id, SUM(t.quantity)/30.0 AS avg_daily "
+            "  FROM u_sales_transactions t, ds "
+            "  WHERE date(t.transaction_date) >= date(ds.d, '-30 days') "
+            "  GROUP BY t.sku_id "
+            ") "
+            "SELECT COUNT(*) AS value "
+            "FROM u_inventory_master i "
+            "LEFT JOIN vel v ON v.sku_id = i.sku_id "
+            "WHERE COALESCE(v.avg_daily, 0) > 0 "
+            "  AND i.stock_qty > COALESCE(v.avg_daily, 0) * 60"
+        ),
         "aggregation_type": "count",
         "output_type": "count",
         "chart_supported": False,
@@ -1266,9 +1322,19 @@ DEFAULT_KPIS: list[dict[str, Any]] = [
         "kpi_name": "Dead-Stock SKUs",
         "kpi_category": "inventory",
         "description": "Number of SKUs with no sales in the last 30 dataset days.",
-        "formula_expression": "COUNT(*) FROM sku_inventory WHERE status = 'dead'",
+        "formula_expression": "COUNT(SKUs WHERE no sales in last 30 days)",
         "required_columns": [],
-        "sql_template": "SELECT COUNT(*) AS value FROM sku_inventory WHERE status = 'dead'",
+        "sql_template": (
+            "WITH ds AS (SELECT MAX(date(transaction_date)) AS d FROM u_sales_transactions), "
+            "sold AS ( "
+            "  SELECT DISTINCT t.sku_id "
+            "  FROM u_sales_transactions t, ds "
+            "  WHERE date(t.transaction_date) >= date(ds.d, '-30 days') "
+            ") "
+            "SELECT COUNT(*) AS value "
+            "FROM u_inventory_master i "
+            "WHERE i.sku_id NOT IN (SELECT sku_id FROM sold)"
+        ),
         "aggregation_type": "count",
         "output_type": "count",
         "chart_supported": False,
@@ -1279,12 +1345,27 @@ DEFAULT_KPIS: list[dict[str, Any]] = [
         "id": "inventory_status_breakdown",
         "kpi_name": "Inventory Health Breakdown",
         "kpi_category": "inventory",
-        "description": "SKU counts grouped by inventory health status.",
-        "formula_expression": "COUNT(*) FROM sku_inventory GROUP BY status",
+        "description": "SKU counts grouped by inventory health status (low/overstocked/dead/ok).",
+        "formula_expression": "GROUP BY (low | overstocked | dead | ok) status derived from stock_qty + sales velocity",
         "required_columns": [],
         "sql_template": (
-            "SELECT status AS label, COUNT(*) AS value FROM sku_inventory "
-            "GROUP BY status ORDER BY value DESC"
+            "WITH ds AS (SELECT MAX(date(transaction_date)) AS d FROM u_sales_transactions), "
+            "vel AS ( "
+            "  SELECT t.sku_id, SUM(t.quantity)/30.0 AS avg_daily "
+            "  FROM u_sales_transactions t, ds "
+            "  WHERE date(t.transaction_date) >= date(ds.d, '-30 days') "
+            "  GROUP BY t.sku_id "
+            ") "
+            "SELECT CASE "
+            "         WHEN COALESCE(v.avg_daily, 0) = 0 THEN 'dead' "
+            "         WHEN i.stock_qty < v.avg_daily * 7  THEN 'low' "
+            "         WHEN i.stock_qty > v.avg_daily * 60 THEN 'overstocked' "
+            "         ELSE 'ok' "
+            "       END AS label, "
+            "       COUNT(*) AS value "
+            "FROM u_inventory_master i "
+            "LEFT JOIN vel v ON v.sku_id = i.sku_id "
+            "GROUP BY label ORDER BY value DESC"
         ),
         "aggregation_type": "distribution",
         "output_type": "list",
@@ -1483,13 +1564,20 @@ DEFAULT_KPIS: list[dict[str, Any]] = [
         "id": "fast_moving_skus",
         "kpi_name": "Fast-Moving SKUs",
         "kpi_category": "inventory",
-        "description": "Top 10 SKUs by daily sales velocity.",
-        "formula_expression": "ORDER BY avg_daily_sales DESC",
+        "description": "Top 10 SKUs by daily sales velocity (qty per day, last 30 days).",
+        "formula_expression": "ORDER BY (SUM(quantity last 30d) / 30) DESC LIMIT 10",
         "required_columns": [],
         "sql_template": (
-            "SELECT product_name AS label, avg_daily_sales AS value "
-            "FROM sku_inventory WHERE avg_daily_sales > 0 "
-            "ORDER BY avg_daily_sales DESC LIMIT 10"
+            "WITH ds AS (SELECT MAX(date(transaction_date)) AS d FROM u_sales_transactions) "
+            "SELECT i.final_product AS label, "
+            "       ROUND(SUM(t.quantity)/30.0, 2) AS value, "
+            "       i.sku_id "
+            "FROM u_sales_transactions t, ds "
+            "JOIN u_inventory_master i ON i.sku_id = t.sku_id "
+            "WHERE date(t.transaction_date) >= date(ds.d, '-30 days') "
+            "GROUP BY i.sku_id, i.final_product "
+            "HAVING SUM(t.quantity) > 0 "
+            "ORDER BY value DESC LIMIT 10"
         ),
         "aggregation_type": "distribution",
         "output_type": "list",
@@ -1503,13 +1591,28 @@ DEFAULT_KPIS: list[dict[str, Any]] = [
         "id": "business_risk_skus",
         "kpi_name": "Inventory Risk SKUs",
         "kpi_category": "inventory",
-        "description": "Top 10 SKUs at highest inventory risk (dead or overstocked, by on_hand_qty).",
-        "formula_expression": "ORDER BY on_hand_qty DESC WHERE status IN ('dead','overstocked')",
+        "description": "Top 10 SKUs at highest inventory risk (dead or overstocked), ranked by on-hand quantity.",
+        "formula_expression": "list SKUs WHERE status IN ('dead','overstocked') ORDER BY stock_qty DESC",
         "required_columns": [],
         "sql_template": (
-            "SELECT product_name AS label, on_hand_qty AS value, status "
-            "FROM sku_inventory WHERE status IN ('dead', 'overstocked') "
-            "ORDER BY on_hand_qty DESC LIMIT 10"
+            "WITH ds AS (SELECT MAX(date(transaction_date)) AS d FROM u_sales_transactions), "
+            "vel AS ( "
+            "  SELECT t.sku_id, SUM(t.quantity)/30.0 AS avg_daily "
+            "  FROM u_sales_transactions t, ds "
+            "  WHERE date(t.transaction_date) >= date(ds.d, '-30 days') "
+            "  GROUP BY t.sku_id "
+            ") "
+            "SELECT i.final_product AS label, "
+            "       i.stock_qty AS value, "
+            "       CASE "
+            "         WHEN COALESCE(v.avg_daily, 0) = 0 THEN 'dead' "
+            "         ELSE 'overstocked' "
+            "       END AS status "
+            "FROM u_inventory_master i "
+            "LEFT JOIN vel v ON v.sku_id = i.sku_id "
+            "WHERE COALESCE(v.avg_daily, 0) = 0 "
+            "   OR (v.avg_daily > 0 AND i.stock_qty > v.avg_daily * 60) "
+            "ORDER BY i.stock_qty DESC LIMIT 10"
         ),
         "aggregation_type": "distribution",
         "output_type": "list",
