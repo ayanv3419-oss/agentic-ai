@@ -55,6 +55,13 @@ services:
         value: "0.0"
       - key: LLM_MAX_TOKENS
         value: "2048"
+      # --- Database (Supabase Postgres) ----------------------------------
+      # When set to a postgres:// URL, the backend uses asyncpg against
+      # Supabase instead of the local SQLite file on the mounted disk.
+      # Get the URI from: Supabase dashboard → Project Settings →
+      # Database → Connection string → URI mode. Set in Render dashboard.
+      - key: DATABASE_URL
+        sync: false
       - key: SENTRY_DSN
         sync: false   # set in Render dashboard if you use Sentry
       # Google Drive OAuth — secrets only in the Render dashboard, never

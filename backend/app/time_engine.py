@@ -93,12 +93,17 @@ async def _scan_max_date() -> str | None:
     candidates: list[str] = []
 
     # 1. Canonical sales / purchase tables — fixed "Date" column.
-    for table in ALLOWED_TABLES:
+    # Skip on Postgres: those tables don't exist there.
+    from app.db_engine import is_postgres as _is_pg_for_legacy
+    iter_tables = [] if _is_pg_for_legacy() else ALLOWED_TABLES
+    for table in iter_tables:
         try:
+            # LIKE pattern works on both SQLite and Postgres (vs GLOB
+            # which is SQLite-only).
             row = await fetch_one(
                 f'SELECT MAX("Date") AS max_d FROM {quoted(table)} '
                 f'WHERE "Date" IS NOT NULL '
-                f'  AND "Date" GLOB \'????-??-??\''
+                f'  AND "Date" LIKE \'____-__-__\''
             )
         except Exception:
             _log.warning("time_engine: scan of %s failed", table, exc_info=True)
@@ -108,11 +113,19 @@ async def _scan_max_date() -> str | None:
             candidates.append(d)
 
     # 2. Dynamic u_* tables — scan every date-like column.
+    from app.db_engine import is_postgres as _is_pg
     try:
-        u_tables = await fetch_all(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name LIKE 'u\\_%' ESCAPE '\\'"
-        )
+        if _is_pg():
+            u_tables = await fetch_all(
+                "SELECT table_name AS name FROM information_schema.tables "
+                "WHERE table_schema='public' "
+                "AND table_name LIKE 'u\\_%' ESCAPE '\\'"
+            )
+        else:
+            u_tables = await fetch_all(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name LIKE 'u\\_%' ESCAPE '\\'"
+            )
     except Exception:
         _log.warning("time_engine: failed to list u_* tables", exc_info=True)
         u_tables = []
@@ -121,7 +134,15 @@ async def _scan_max_date() -> str | None:
         if not name:
             continue
         try:
-            cols = await fetch_all(f"PRAGMA table_info({quoted(name)})")
+            if _is_pg():
+                cols = await fetch_all(
+                    "SELECT column_name AS name "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name=?",
+                    (name,),
+                )
+            else:
+                cols = await fetch_all(f"PRAGMA table_info({quoted(name)})")
         except Exception:
             continue
         for c in cols or []:
@@ -131,7 +152,7 @@ async def _scan_max_date() -> str | None:
             try:
                 row = await fetch_one(
                     f'SELECT MAX({quoted(col)}) AS max_d FROM {quoted(name)} '
-                    f'WHERE {quoted(col)} GLOB \'????-??-??\''
+                    f'WHERE {quoted(col)} LIKE \'____-__-__\''
                 )
             except Exception:
                 continue

@@ -95,12 +95,21 @@ def _extract_qualifiers(question: str) -> list[str]:
 
 async def _list_user_tables() -> list[str]:
     """Return names of all u_* tables currently in the DB."""
+    from app.db_engine import is_postgres
     async with get_connection() as db:
-        cur = await db.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type='table' AND name LIKE 'u\\_%' ESCAPE '\\' "
-            "ORDER BY name"
-        )
+        if is_postgres():
+            cur = await db.execute(
+                "SELECT table_name AS name FROM information_schema.tables "
+                "WHERE table_schema='public' "
+                "AND table_name LIKE 'u\\_%' ESCAPE '\\' "
+                "ORDER BY table_name"
+            )
+        else:
+            cur = await db.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name LIKE 'u\\_%' ESCAPE '\\' "
+                "ORDER BY name"
+            )
         rows = await cur.fetchall()
         await cur.close()
     return [dict(r)["name"] for r in rows if dict(r).get("name")]
@@ -267,12 +276,21 @@ class EntityLocTool(Tool):
             _entity_col_hints = re.compile(
                 r"(product|item|name|party|customer|brand|category)", re.I
             )
+            from app.db_engine import is_postgres as _is_pg
             async with get_connection() as db:
                 for tbl in user_tables:
                     try:
-                        cur = await db.execute(
-                            f"PRAGMA table_info({quoted(tbl)})"
-                        )
+                        if _is_pg():
+                            cur = await db.execute(
+                                "SELECT column_name AS name "
+                                "FROM information_schema.columns "
+                                "WHERE table_schema='public' AND table_name=?",
+                                (tbl,),
+                            )
+                        else:
+                            cur = await db.execute(
+                                f"PRAGMA table_info({quoted(tbl)})"
+                            )
                         cols = await cur.fetchall()
                         await cur.close()
                         for c in cols:

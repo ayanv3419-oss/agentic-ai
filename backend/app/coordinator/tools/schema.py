@@ -58,15 +58,63 @@ async def _date_range_for_table(
 
 
 async def _list_user_tables() -> list[dict[str, Any]]:
-    """Inspect SQLite for u_* (dynamic) tables + their columns + row counts.
+    """Inspect the DB for u_* (dynamic) tables + their columns + row counts.
 
     Also records date_range=(min, max) for any table that has a recognisable
     date column, so the schema summary can warn the LLM when a table's data
     is stale (e.g. only covers May–Jul 2025 while queries target 2026).
+
+    Branches on the active engine: SQLite uses sqlite_master + PRAGMA;
+    Postgres uses information_schema.
     """
+    from app.db_engine import is_postgres
     out: list[dict[str, Any]] = []
     _date_col_hint = re.compile(r"(date|txn_date|transaction_date)", re.I)
     async with get_connection() as db:
+        if is_postgres():
+            # Postgres: list u_* tables from information_schema.
+            cur = await db.execute(
+                "SELECT table_name AS name FROM information_schema.tables "
+                "WHERE table_schema = 'public' "
+                "AND table_name LIKE 'u\\_%' ESCAPE '\\' "
+                "ORDER BY table_name"
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            for r in rows:
+                name = dict(r).get("name") or ""
+                if not name:
+                    continue
+                cur2 = await db.execute(
+                    "SELECT column_name AS name, data_type AS type "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = ? "
+                    "ORDER BY ordinal_position",
+                    (name,),
+                )
+                cols = await cur2.fetchall()
+                await cur2.close()
+                col_defs = [
+                    {"name": dict(c)["name"], "type": (dict(c)["type"] or "text").upper()}
+                    for c in cols
+                ]
+                date_col = next(
+                    (c["name"] for c in col_defs
+                     if _date_col_hint.search(c["name"])),
+                    None,
+                )
+                date_range: tuple[str, str] | None = None
+                if date_col:
+                    date_range = await _date_range_for_table(db, name, date_col)
+                out.append({
+                    "table": name,
+                    "row_count": await _table_row_count(db, name),
+                    "columns": col_defs,
+                    "date_range": date_range,
+                })
+            return out
+
+        # SQLite path
         cur = await db.execute(
             "SELECT name FROM sqlite_master "
             "WHERE type='table' AND name LIKE 'u\\_%' ESCAPE '\\' "
@@ -85,20 +133,19 @@ async def _list_user_tables() -> list[dict[str, Any]]:
                 {"name": dict(c)["name"], "type": dict(c)["type"] or "TEXT"}
                 for c in cols
             ]
-            # Find date column for coverage check
             date_col = next(
                 (c["name"] for c in col_defs
                  if _date_col_hint.search(c["name"])),
                 None,
             )
-            date_range: tuple[str, str] | None = None
+            date_range = None
             if date_col:
                 date_range = await _date_range_for_table(db, name, date_col)
             out.append({
                 "table": name,
                 "row_count": await _table_row_count(db, name),
                 "columns": col_defs,
-                "date_range": date_range,   # (min, max) or None
+                "date_range": date_range,
             })
     return out
 

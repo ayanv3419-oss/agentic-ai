@@ -1332,7 +1332,7 @@ async def upload_workbook(
 
         # Ingest every sheet — drop+create+insert per sheet.
         try:
-            summary = ingest_workbook(
+            summary = await ingest_workbook(
                 wb_path=persistent_path,
                 source_file_name=filename,
                 batch_id=batch_id,
@@ -2092,10 +2092,23 @@ def _module_for_path(path: str) -> str:
 
 async def _startup() -> None:
     from app.infrastructure import init_database, list_uploads_meta, load_synonyms
+    from app.db_engine import is_postgres as _is_pg
     from app.vector import register_vocabulary
 
     await init_database()
     _app_log.info("database engine: %s", engine_kind())
+
+    # Postgres flag: KPI registry, hierarchy seeding, enrichment, mock backfill,
+    # quantity backfill are all SQLite-only legacy paths. Skip them on Postgres
+    # for tonight's 5-hour migration — the agentic loop (Schema + sqlWriter +
+    # SqlExecutor) does NOT depend on any of these; KPI fast-path is bypassed
+    # and the LLM writes SQL directly against the u_* tables.
+    _on_pg = _is_pg()
+    if _on_pg:
+        _app_log.info(
+            "Postgres engine detected — skipping SQLite-only seeding "
+            "(KPI registry, hierarchy, enrichment, mock backfill)."
+        )
 
     # Registry reconcile — rebuild dynamic_tables.json from SQLite so AI
     # queries work immediately after restart even if the JSON was lost.
@@ -2113,17 +2126,18 @@ async def _startup() -> None:
     # to existing DBs without a manual /kpi/rebuild call. User-added KPIs
     # (ids not in DEFAULT_KPIS) are untouched because rebuild_catalog only
     # upserts the shipped default catalog.
-    try:
-        await init_kpi_table()
-        n = await rebuild_catalog()
-        _app_log.info("kpi registry rebuilt: %d shipped KPIs upserted", n)
-        kpi_rows = await list_kpis(enabled_only=False)
-        _app_log.info(
-            "kpi registry: %d total (%d enabled)",
-            len(kpi_rows), sum(1 for k in kpi_rows if k.enabled),
-        )
-    except Exception:
-        _app_log.exception("kpi registry bootstrap failed (continuing)")
+    if not _on_pg:
+        try:
+            await init_kpi_table()
+            n = await rebuild_catalog()
+            _app_log.info("kpi registry rebuilt: %d shipped KPIs upserted", n)
+            kpi_rows = await list_kpis(enabled_only=False)
+            _app_log.info(
+                "kpi registry: %d total (%d enabled)",
+                len(kpi_rows), sum(1 for k in kpi_rows if k.enabled),
+            )
+        except Exception:
+            _app_log.exception("kpi registry bootstrap failed (continuing)")
 
     # Time engine — invalidate any stale cached tokens, then probe once so
     # the operator sees the current dataset date in the boot log.
@@ -2144,39 +2158,42 @@ async def _startup() -> None:
     # Mock product-name backfill — runs BEFORE hierarchy so newly-named
     # rows propagate to the trees in the same boot cycle. Idempotent:
     # rows that already have a real product name are never touched.
-    try:
-        mock_stats = await backfill_missing_product_names()
-        if any(v > 0 for v in mock_stats.values()):
-            _app_log.info("mock product backfill (startup): %s", mock_stats)
-    except Exception:
-        _app_log.exception("mock product backfill failed (continuing)")
+    if not _on_pg:
+        try:
+            mock_stats = await backfill_missing_product_names()
+            if any(v > 0 for v in mock_stats.values()):
+                _app_log.info("mock product backfill (startup): %s", mock_stats)
+        except Exception:
+            _app_log.exception("mock product backfill failed (continuing)")
 
     # Hierarchy — seed default business/branch + sync product master from
     # whatever data is already in the SQLite tables (v1 + v2 in parallel).
-    try:
-        seeds = await seed_default_business()
-        _app_log.info("default branch chain seeded: %s", seeds)
-        sync_stats = await sync_product_master_from_data()
-        _app_log.info("product hierarchy v1: %s", sync_stats)
-        v2_stats = await sync_product_sku_master()
-        _app_log.info("product hierarchy v2: %s", v2_stats)
-        branches = await list_branches()
-        _app_log.info("branches: %d enabled", len(branches))
-    except Exception:
-        _app_log.exception("hierarchy bootstrap failed (continuing)")
+    if not _on_pg:
+        try:
+            seeds = await seed_default_business()
+            _app_log.info("default branch chain seeded: %s", seeds)
+            sync_stats = await sync_product_master_from_data()
+            _app_log.info("product hierarchy v1: %s", sync_stats)
+            v2_stats = await sync_product_sku_master()
+            _app_log.info("product hierarchy v2: %s", v2_stats)
+            branches = await list_branches()
+            _app_log.info("branches: %d enabled", len(branches))
+        except Exception:
+            _app_log.exception("hierarchy bootstrap failed (continuing)")
 
     # Enrichment — inventory + forecast derived from the real sales data.
-    try:
-        inv_stats = await refresh_inventory()
-        _app_log.info("inventory enrichment: %s", inv_stats)
-        fc_stats = await refresh_forecast()
-        _app_log.info("forecast enrichment: %s", fc_stats)
-        cost_stats = await refresh_product_costs()
-        _app_log.info("cost master enrichment: %s", cost_stats)
-        qty_stats = await backfill_quantities()
-        _app_log.info("quantity backfill (startup): %s", qty_stats)
-    except Exception:
-        _app_log.exception("enrichment bootstrap failed (continuing)")
+    if not _on_pg:
+        try:
+            inv_stats = await refresh_inventory()
+            _app_log.info("inventory enrichment: %s", inv_stats)
+            fc_stats = await refresh_forecast()
+            _app_log.info("forecast enrichment: %s", fc_stats)
+            cost_stats = await refresh_product_costs()
+            _app_log.info("cost master enrichment: %s", cost_stats)
+            qty_stats = await backfill_quantities()
+            _app_log.info("quantity backfill (startup): %s", qty_stats)
+        except Exception:
+            _app_log.exception("enrichment bootstrap failed (continuing)")
 
     # Coordinator registry — Phase 2: 4 capabilities only.
     # Sub-agents (sqlWriter, rcaReasoner, insightFmt) are called internally

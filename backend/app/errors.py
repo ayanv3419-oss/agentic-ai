@@ -135,6 +135,18 @@ def log_error(
     payload_json = _jsonify(request_payload)
     context_json = _jsonify(context)
 
+    # On Postgres, skip the raw-sqlite3 write (it would open a local file
+    # instead of hitting Supabase). The error is still surfaced via the
+    # Python logger below. Queryable history via /errors is unavailable on
+    # Postgres tonight; re-port over the weekend.
+    from app.db_engine import is_postgres as _is_pg
+    if _is_pg():
+        _log.warning(
+            "error_log skipped on Postgres: id=%s severity=%s module=%s type=%s msg=%s",
+            error_id, sev, module or "system", error_type, msg[:300],
+        )
+        return error_id
+
     try:
         import sqlite3
         conn = sqlite3.connect(str(db_path()), isolation_level=None)

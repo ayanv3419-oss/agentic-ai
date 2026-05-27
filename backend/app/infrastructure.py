@@ -82,6 +82,11 @@ class Settings(BaseSettings):
         default=10 * 1024 * 1024 * 1024, alias="SQL_MAX_BYTES_SCANNED"
     )
 
+    # --- Database (Supabase / Postgres) ---------------------------------
+    # When set to a postgres://... URL, the backend uses asyncpg against
+    # that database instead of the local SQLite file. See app/db_engine.py.
+    database_url: str = Field(default="", alias="DATABASE_URL")
+
     # --- Storage paths (absolute) ---------------------------------------
     financial_db_path: str = Field(
         default=str(PROJECT_ROOT / "data" / "financial_records.db"),
@@ -656,8 +661,78 @@ _ERROR_LOG_INDEXES: tuple[str, ...] = (
 )
 
 
+_UPLOADS_DDL_PG = """
+CREATE TABLE IF NOT EXISTS uploads (
+    batch_id      TEXT PRIMARY KEY,
+    filename      TEXT NOT NULL,
+    target        TEXT NOT NULL,
+    rows_inserted INTEGER NOT NULL DEFAULT 0,
+    rows_failed   INTEGER NOT NULL DEFAULT 0,
+    source        TEXT NOT NULL DEFAULT 'upload',
+    status        TEXT NOT NULL DEFAULT 'active',
+    min_date      TEXT,
+    max_date      TEXT,
+    error_message TEXT,
+    file_path     TEXT,
+    file_hash     TEXT,
+    file_bytes    BIGINT,
+    dedup_mode    TEXT,
+    rows_skipped_duplicate INTEGER NOT NULL DEFAULT 0,
+    rows_replaced INTEGER NOT NULL DEFAULT 0,
+    uploaded_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"""
+
+_ERROR_LOG_DDL_PG = """
+CREATE TABLE IF NOT EXISTS error_log (
+    id              BIGSERIAL PRIMARY KEY,
+    error_id        TEXT NOT NULL UNIQUE,
+    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    severity        TEXT NOT NULL,
+    module          TEXT NOT NULL,
+    error_type      TEXT NOT NULL,
+    message         TEXT NOT NULL,
+    endpoint        TEXT,
+    method          TEXT,
+    user_facing     INTEGER NOT NULL DEFAULT 0,
+    suggested_fix   TEXT,
+    source          TEXT,
+    stack_trace     TEXT,
+    request_payload TEXT,
+    context         TEXT,
+    resolved        INTEGER NOT NULL DEFAULT 0,
+    resolved_at     TIMESTAMPTZ,
+    resolved_note   TEXT
+)
+"""
+
+
+async def _init_database_postgres() -> None:
+    """Postgres init — minimum schema only. Static sales/purchase, hierarchy,
+    enrichment, and KPI tables are SQLite-only legacy paths that we don't
+    port in the 5-hour migration window. The dynamic u_* tables are created
+    on demand by dynamic_ingest."""
+    from app.db_engine import pg_connection
+    async with pg_connection() as db:
+        await db.execute(_UPLOADS_DDL_PG)
+        await db.execute(_ERROR_LOG_DDL_PG)
+        await db.execute(
+            'CREATE INDEX IF NOT EXISTS idx_uploads_file_hash '
+            'ON uploads(file_hash, status)'
+        )
+        await db.execute(
+            'CREATE INDEX IF NOT EXISTS idx_error_log_occurred '
+            'ON error_log(occurred_at DESC)'
+        )
+    log.info("postgres DB initialized (minimum schema: uploads + error_log)")
+
+
 async def init_database() -> None:
     """Create / verify the financial DB. Idempotent."""
+    from app.db_engine import is_postgres
+    if is_postgres():
+        await _init_database_postgres()
+        return
     p = db_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(p) as db:
@@ -769,7 +844,18 @@ async def init_database() -> None:
 
 @asynccontextmanager
 async def get_connection() -> AsyncIterator[Any]:
-    """Yields an aiosqlite.Connection. Always SQLite — single-user MVP."""
+    """Yields an aiosqlite.Connection, OR (when DATABASE_URL is set to a
+    postgres URL) an aiosqlite-compatible shim around asyncpg.
+
+    The shim exposes the same `execute / fetchall / commit` surface so
+    every existing call site keeps working without rewrites. See
+    app/db_engine.py for the SQL translation that bridges the dialects."""
+    # Import here so a missing asyncpg dep doesn't break SQLite-only deploys.
+    from app.db_engine import is_postgres, pg_connection
+    if is_postgres():
+        async with pg_connection() as db:
+            yield db
+        return
     async with aiosqlite.connect(db_path()) as db:
         db.row_factory = aiosqlite.Row
         yield db
@@ -794,6 +880,11 @@ async def count_rows(table: str) -> int:
     allowed = set(ALLOWED_TABLES) | {f"{t}_archive" for t in ALLOWED_TABLES}
     if table not in allowed:
         return 0
+    # Static sales/purchase tables don't exist on Postgres (SQLite-only
+    # legacy path). Return 0 cleanly instead of raising UndefinedTableError.
+    from app.db_engine import is_postgres
+    if is_postgres():
+        return 0
     row = await fetch_one(f"SELECT COUNT(*) AS n FROM {quoted(table)}")
     return int(row["n"]) if row else 0
 
@@ -814,7 +905,20 @@ def insert_rows(
 
     `row_hashes` parallels `rows`. When None, row_hash is NULL — older
     callers keep working but lose duplicate-detection benefits on those rows.
+
+    On Postgres (DATABASE_URL set), this becomes a no-op: the static
+    sales/purchase tables are SQLite-only legacy paths that weren't ported
+    in the 5-hour Supabase migration window. XLSX uploads still work via
+    dynamic_ingest's u_* tables.
     """
+    from app.db_engine import is_postgres
+    if is_postgres():
+        log.info(
+            "insert_rows skipped on Postgres (table=%s, rows=%d) — "
+            "use XLSX upload for u_* dynamic tables instead",
+            table, len(rows),
+        )
+        return 0
     if table not in ALLOWED_TABLES:
         raise ValueError(f"unknown table: {table!r}")
     if not rows:
@@ -891,14 +995,32 @@ async def record_upload_meta(
 ) -> None:
     if status not in ("active", "archived", "error", "removed"):
         raise ValueError(f"unknown upload status: {status!r}")
+    # ON CONFLICT syntax works on SQLite >=3.24 and Postgres natively.
+    # Replaces the prior `INSERT OR REPLACE` which was SQLite-only.
     async with get_connection() as db:
         await db.execute(
-            """INSERT OR REPLACE INTO uploads
+            """INSERT INTO uploads
                (batch_id, filename, target, rows_inserted, rows_failed,
                 source, status, min_date, max_date, error_message, file_path,
                 file_hash, file_bytes, dedup_mode,
                 rows_skipped_duplicate, rows_replaced)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (batch_id) DO UPDATE SET
+                 filename = EXCLUDED.filename,
+                 target = EXCLUDED.target,
+                 rows_inserted = EXCLUDED.rows_inserted,
+                 rows_failed = EXCLUDED.rows_failed,
+                 source = EXCLUDED.source,
+                 status = EXCLUDED.status,
+                 min_date = EXCLUDED.min_date,
+                 max_date = EXCLUDED.max_date,
+                 error_message = EXCLUDED.error_message,
+                 file_path = EXCLUDED.file_path,
+                 file_hash = EXCLUDED.file_hash,
+                 file_bytes = EXCLUDED.file_bytes,
+                 dedup_mode = EXCLUDED.dedup_mode,
+                 rows_skipped_duplicate = EXCLUDED.rows_skipped_duplicate,
+                 rows_replaced = EXCLUDED.rows_replaced""",
             (batch_id, filename, target, rows_inserted, rows_failed,
              source, status, min_date, max_date, error_message, file_path,
              file_hash, file_bytes, dedup_mode,
@@ -1049,18 +1171,32 @@ async def _disconnect_workbook(batch_id: str, meta: dict[str, Any]) -> dict[str,
     tagged with a _batch_id column (not in sales/purchase). Delete every
     row for this batch so the Coordinator no longer sees the data, then
     mark the upload 'removed'."""
+    from app.db_engine import is_postgres as _is_pg
     rows_removed = 0
     async with get_connection() as db:
-        cur = await db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name LIKE 'u\\_%' ESCAPE '\\'"
-        )
+        if _is_pg():
+            cur = await db.execute(
+                "SELECT table_name AS name FROM information_schema.tables "
+                "WHERE table_schema='public' AND table_name LIKE 'u\\_%' ESCAPE '\\'"
+            )
+        else:
+            cur = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name LIKE 'u\\_%' ESCAPE '\\'"
+            )
         tables = [dict(r).get("name") or "" for r in await cur.fetchall()]
         await cur.close()
         for t in tables:
             if not t:
                 continue
-            cur = await db.execute(f"PRAGMA table_info({quoted(t)})")
+            if _is_pg():
+                cur = await db.execute(
+                    "SELECT column_name AS name FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name=?",
+                    (t,),
+                )
+            else:
+                cur = await db.execute(f"PRAGMA table_info({quoted(t)})")
             cols = [dict(c).get("name") for c in await cur.fetchall()]
             await cur.close()
             if "_batch_id" not in cols:
@@ -1068,7 +1204,7 @@ async def _disconnect_workbook(batch_id: str, meta: dict[str, Any]) -> dict[str,
             cur = await db.execute(
                 f'DELETE FROM {quoted(t)} WHERE _batch_id = ?', (batch_id,)
             )
-            rows_removed += cur.rowcount or 0
+            rows_removed += getattr(cur, "rowcount", 0) or 0
             await cur.close()
         await db.execute(
             "UPDATE uploads SET status='removed' WHERE batch_id = ?",

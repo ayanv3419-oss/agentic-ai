@@ -371,7 +371,16 @@ def reconcile_registry() -> dict[str, int]:
     uploaded_at are cross-referenced from the uploads table via _batch_id.
 
     Returns {'added': N, 'removed': M}.
+
+    On Postgres this is currently a no-op — the schema tool queries
+    information_schema live for every turn so a stale JSON registry is
+    harmless for the agentic-loop path. Re-port over the weekend if the
+    JSON registry needs to stay accurate for other consumers.
     """
+    from app.db_engine import is_postgres
+    if is_postgres():
+        log.info("reconcile_registry: skipped on Postgres (no-op)")
+        return {"added": 0, "removed": 0}
     with _REGISTRY_LOCK:
         reg = load_registry()
 
@@ -501,6 +510,30 @@ def _build_create_sql(table: str, cols: list[tuple[str, str]]) -> str:
         f'  _batch_id TEXT NOT NULL,\n'
         f'  _source_sheet TEXT NOT NULL,\n'
         f'  _inserted_at TEXT NOT NULL DEFAULT (datetime(\'now\')),\n'
+        f'  {col_defs}\n'
+        f')'
+    )
+
+
+# SQLite TEXT/INTEGER/REAL → Postgres mapping.
+_PG_TYPE_MAP: dict[str, str] = {
+    "TEXT": "TEXT",
+    "INTEGER": "BIGINT",
+    "REAL": "DOUBLE PRECISION",
+}
+
+
+def _build_create_sql_pg(table: str, cols: list[tuple[str, str]]) -> str:
+    col_defs = ",\n  ".join(
+        f'"{name}" {_PG_TYPE_MAP.get(sqltype, "TEXT")}'
+        for name, sqltype in cols
+    )
+    return (
+        f'CREATE TABLE "{table}" (\n'
+        f'  _id BIGSERIAL PRIMARY KEY,\n'
+        f'  _batch_id TEXT NOT NULL,\n'
+        f'  _source_sheet TEXT NOT NULL,\n'
+        f'  _inserted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n'
         f'  {col_defs}\n'
         f')'
     )
@@ -654,7 +687,7 @@ def ingest_sheet(
             pass
 
 
-def ingest_workbook(
+def ingest_workbook_sync(
     *,
     wb_path: Path,
     source_file_name: str,
@@ -664,6 +697,10 @@ def ingest_workbook(
 
     Sheets where header detection fails are recorded under ``skipped`` with
     the reason, never aborting the whole upload.
+
+    This is the SQLite path. For Postgres, see ``ingest_workbook_pg``.
+    The public async ``ingest_workbook`` dispatches between them based on
+    the active engine.
     """
     wb = load_workbook(filename=str(wb_path), read_only=True, data_only=True)
     try:
@@ -700,6 +737,205 @@ def ingest_workbook(
         "skipped":       skipped,
         "tables":        [s["table"] for s in ingested],
     }
+
+
+async def ingest_sheet_pg(
+    *,
+    wb_path: Path,
+    sheet_name: str,
+    source_file_name: str,
+    batch_id: str,
+) -> dict[str, Any]:
+    """Postgres counterpart of ``ingest_sheet``. Same XLSX parsing + type
+    inference; differs only in the storage path (asyncpg via the shim).
+    """
+    from app.db_engine import pg_connection
+
+    wb = load_workbook(filename=str(wb_path), read_only=True, data_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            raise DynamicIngestError(f"sheet not found: {sheet_name!r}")
+        ws = wb[sheet_name]
+
+        buffered: list[list[Any]] = []
+        row_iter = _iter_sheet_rows(ws)
+        for _ in range(_MAX_HEADER_SCAN_ROWS):
+            try:
+                buffered.append(next(row_iter))
+            except StopIteration:
+                break
+        if not buffered:
+            raise DynamicIngestError(f"sheet {sheet_name!r} is empty")
+
+        hdr_idx = _find_header_row(buffered)
+        if hdr_idx is None:
+            raise DynamicIngestError(
+                f"could not detect a header row in first {_MAX_HEADER_SCAN_ROWS} "
+                f"rows of sheet {sheet_name!r}"
+            )
+        header_raw = [str(c).strip() if c is not None else "" for c in buffered[hdr_idx]]
+        while header_raw and not header_raw[-1]:
+            header_raw.pop()
+        if not header_raw:
+            raise DynamicIngestError(f"sheet {sheet_name!r} has empty header row")
+        col_names = _dedupe_columns(header_raw)
+        n_cols = len(col_names)
+
+        data_rows: list[list[Any]] = []
+        for r in buffered[hdr_idx + 1:]:
+            if r is None:
+                continue
+            trimmed = r[:n_cols] + [None] * max(0, n_cols - len(r))
+            if any(v is not None and str(v).strip() != "" for v in trimmed):
+                data_rows.append(trimmed)
+        for r in row_iter:
+            trimmed = r[:n_cols] + [None] * max(0, n_cols - len(r))
+            if any(v is not None and str(v).strip() != "" for v in trimmed):
+                data_rows.append(trimmed)
+
+        if not data_rows:
+            raise DynamicIngestError(f"sheet {sheet_name!r} has no data rows after header")
+
+        col_types: list[str] = []
+        sample = data_rows[:_TYPE_INFER_SAMPLE]
+        for i in range(n_cols):
+            samples = [row[i] for row in sample]
+            col_types.append(_infer_column_type(samples))
+
+        table = sheet_to_table_name(sheet_name)
+
+        skipped = 0
+        payload: list[tuple[Any, ...]] = []
+        for row in data_rows:
+            try:
+                coerced = [_coerce(row[i], col_types[i]) for i in range(n_cols)]
+                payload.append((batch_id, sheet_name, *coerced))
+            except Exception:
+                skipped += 1
+
+        # DROP + CREATE + bulk INSERT via asyncpg shim
+        async with pg_connection() as db:
+            await db.execute(f'DROP TABLE IF EXISTS "{table}"')
+            dropped = True  # IF EXISTS is idempotent; we don't track prior state
+            create_sql = _build_create_sql_pg(table, list(zip(col_names, col_types)))
+            await db.execute(create_sql)
+
+            if payload:
+                placeholders = ", ".join("?" * (n_cols + 2))
+                quoted_cols = ", ".join(f'"{c}"' for c in col_names)
+                insert_sql = (
+                    f'INSERT INTO "{table}" (_batch_id, _source_sheet, {quoted_cols}) '
+                    f'VALUES ({placeholders})'
+                )
+                await db.executemany(insert_sql, payload)
+
+        rows_inserted = len(payload)
+
+        columns_meta = [
+            {"name": name, "type": sqltype}
+            for name, sqltype in zip(col_names, col_types)
+        ]
+        register_table(
+            table,
+            columns=columns_meta,
+            source_sheet=sheet_name,
+            source_file=source_file_name,
+            row_count=rows_inserted,
+        )
+
+        log.info(
+            "dynamic_ingest_pg: sheet=%r → table=%r rows=%d cols=%d skipped=%d",
+            sheet_name, table, rows_inserted, n_cols, skipped,
+        )
+
+        return {
+            "table":             table,
+            "source_sheet":      sheet_name,
+            "header_row":        hdr_idx + 1,
+            "columns":           columns_meta,
+            "rows_inserted":     rows_inserted,
+            "dropped_existing":  dropped,
+            "skipped_rows":      skipped,
+        }
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+async def ingest_workbook_pg(
+    *,
+    wb_path: Path,
+    source_file_name: str,
+    batch_id: str,
+) -> dict[str, Any]:
+    """Async Postgres workbook ingest. Mirrors ingest_workbook_sync."""
+    wb = load_workbook(filename=str(wb_path), read_only=True, data_only=True)
+    try:
+        sheet_names = list(wb.sheetnames)
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    ingested: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    for sheet in sheet_names:
+        try:
+            summary = await ingest_sheet_pg(
+                wb_path=wb_path,
+                sheet_name=sheet,
+                source_file_name=source_file_name,
+                batch_id=batch_id,
+            )
+            ingested.append(summary)
+        except DynamicIngestError as e:
+            log.warning("dynamic_ingest_pg: skip sheet=%r reason=%s", sheet, e)
+            skipped.append({"sheet": sheet, "reason": str(e)})
+        except Exception as e:
+            log.exception("dynamic_ingest_pg: sheet=%r crashed", sheet)
+            skipped.append({"sheet": sheet, "reason": f"{type(e).__name__}: {e}"})
+
+    return {
+        "batch_id":      batch_id,
+        "source_file":   source_file_name,
+        "sheet_count":   len(sheet_names),
+        "ingested":      ingested,
+        "skipped":       skipped,
+        "tables":        [s["table"] for s in ingested],
+    }
+
+
+async def ingest_workbook(
+    *,
+    wb_path: Path,
+    source_file_name: str,
+    batch_id: str,
+) -> dict[str, Any]:
+    """Async dispatcher — Postgres or SQLite based on DATABASE_URL.
+
+    Was previously a sync function. The async signature is a small breaking
+    change at the one call site (core_system.py upload route) which already
+    runs inside an async handler — just `await` the call.
+    """
+    import asyncio as _asyncio
+    from app.db_engine import is_postgres
+    if is_postgres():
+        return await ingest_workbook_pg(
+            wb_path=wb_path,
+            source_file_name=source_file_name,
+            batch_id=batch_id,
+        )
+    # SQLite path stays synchronous + uses raw sqlite3 — push it to a thread
+    # so it doesn't block the event loop.
+    return await _asyncio.to_thread(
+        ingest_workbook_sync,
+        wb_path=wb_path,
+        source_file_name=source_file_name,
+        batch_id=batch_id,
+    )
 
 
 # ---------------------------------------------------------------------------
