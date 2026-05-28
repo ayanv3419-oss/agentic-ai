@@ -368,6 +368,14 @@ class SqlExecutorTool(Tool):
             granularity=ctx.state.granularity,
             aggregation_type=_kpi_hint.get("aggregation_type"),
         )
+        import logging as _lg
+        _lg.getLogger("agentic_ai.sql_executor").info(
+            "chart_build rows=%d cols=%s chart_kind=%s sql_head=%r",
+            len(result),
+            list(result[0].keys())[:6] if result else [],
+            (chart or {}).get("kind"),
+            sql[:160],
+        )
         updates: dict[str, Any] = {
             "sql_final": final_sql,
             "rows": result,

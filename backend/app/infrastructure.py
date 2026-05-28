@@ -1742,17 +1742,22 @@ def _cache_save(data: dict[str, Any]) -> None:
     tmp.replace(p)
 
 
+_PROMPT_VERSION = "v2-charts-2026-05-29"
+
+
 def cache_key_for(
     question: str,
     *,
     conversation_id: str | None = None,
 ) -> str:
-    """Cache key embeds (data_version, conversation_id, question). Single-user
-    MVP — no tenant scoping."""
+    """Cache key embeds (prompt_version, data_version, conversation_id, question).
+    Bumping ``_PROMPT_VERSION`` invalidates every cached answer in one shot —
+    used whenever the system prompt or formatter prompt changes meaningfully,
+    so users immediately see the new behaviour instead of stale answers."""
     convo = (conversation_id or "default").strip()
     version = get_data_version()
     norm_q = (question or "").strip().lower()
-    payload = f"{version}|{convo}|{norm_q}"
+    payload = f"{_PROMPT_VERSION}|{version}|{convo}|{norm_q}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

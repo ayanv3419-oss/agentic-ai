@@ -47,11 +47,23 @@ Rules:
    Use the EXACT value string from the entity — do not approximate.
    If entities look irrelevant to the core question, omit the filter.
 5. Prefer SUM / COUNT / GROUP BY for aggregate questions.
-6. RANKING QUESTIONS ('which brand/category/product sold most/best/top'):
-   - Always return at LEAST 10 rows — NEVER use LIMIT 1. The writer agent
-     identifies the winner from the full result. LIMIT 1 produces a Summary
-     card with no chart. Use LIMIT 15 as the default for ranking questions.
-   - Always use ORDER BY <metric> DESC with GROUP BY <dimension>.
+6. RANKING / EXTREMUM QUESTIONS - NEVER use LIMIT 1.
+   This covers BOTH:
+     - "which brand/category/product sold most/best/top" (ranking)
+     - "lowest / highest / best / worst <bucket>" where bucket is a day,
+       week, month, store, brand, etc. (extremum on a dimension)
+   Rules for both:
+     - Use GROUP BY <dimension> + ORDER BY <metric> ASC (for lowest/worst)
+       or DESC (for highest/best).
+     - Return AT LEAST 10 rows (LIMIT 10-15). The downstream layer reads
+       the first row as the answer and uses the rest as chart context.
+     - LIMIT 1 produces a single-row result which makes the chart
+       degenerate to a value card with no comparison — the user always
+       wants to SEE the extremum in context, not as a bare number.
+   Examples:
+     "lowest revenue day"      → GROUP BY DATE(date_col), ORDER BY sum ASC LIMIT 10
+     "highest sales month"     → GROUP BY strftime('%Y-%m',...), ORDER BY sum DESC LIMIT 12
+     "best performing brand"   → GROUP BY brand, ORDER BY sum DESC LIMIT 15
 7. REVENUE / METRIC COLUMNS: use the EXACT column name shown in the schema's
    METRIC DEFINITIONS block. NEVER hardcode column names — the schema layer
    maps revenue/cost/quantity to whatever the workbook uses.
@@ -68,6 +80,24 @@ Rules:
    column names. Copy it verbatim. NEVER average per-row ratios
    (AVG(margin)) — always compute on SUM totals exactly as written.
    NEVER substitute a formula of your own.
+11. TREND CHART RULE: When the user prompt shows a Granularity hint
+   (month / week / day / year) AND the time window spans multiple periods,
+   you MUST GROUP BY that granularity — NEVER write a bare SUM returning
+   one row. One row = no chart visible to the user. Use:
+     strftime('%Y-%m', <date_col>) AS month   → monthly
+     strftime('%Y-W%W', <date_col>) AS week    → weekly
+     DATE(<date_col>) AS day                   → daily
+   Always ORDER BY the bucket column ASC. SHAPE (column / table names
+   come from THIS turn's schema + time window — do NOT copy the
+   identifiers below verbatim, they are placeholders):
+     SELECT strftime('%Y-%m', "<date_col>") AS month,
+            SUM("<metric_col>") AS total
+     FROM "<sales_table>"
+     WHERE "<date_col>" BETWEEN '<start_iso>' AND '<end_iso>'
+     GROUP BY month ORDER BY month ASC
+   Replace every <…> with the actual identifier from the schema and the
+   actual ISO date from the supplied time window. Never paste a literal
+   date that wasn't in the time window.
 
 Respond with valid JSON only, exactly this shape:
 {"sql": "SELECT ...", "rationale": "<one short sentence>"}"""

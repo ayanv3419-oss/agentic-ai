@@ -40,9 +40,20 @@ log = logging.getLogger("agentic_ai.db_engine")
 # ---------------------------------------------------------------------------
 
 def database_url() -> str:
-    """The DATABASE_URL env var, or '' if unset. Read fresh every call so
-    tests that monkeypatch os.environ work."""
-    return os.environ.get("DATABASE_URL", "").strip()
+    """The DATABASE_URL value, or '' if unset. Reads os.environ first
+    (so tests that monkeypatch it work, and so a shell-exported value
+    wins). Falls back to the pydantic Settings, which loads from the
+    backend's .env file — without this fallback, putting DATABASE_URL
+    in .env silently has no effect since pydantic Settings populate
+    a separate Settings object, not os.environ."""
+    val = os.environ.get("DATABASE_URL", "").strip()
+    if val:
+        return val
+    try:
+        from app.infrastructure import get_settings
+        return (get_settings().database_url or "").strip()
+    except Exception:
+        return ""
 
 
 def is_postgres() -> bool:
