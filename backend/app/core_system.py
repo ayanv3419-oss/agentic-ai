@@ -982,6 +982,28 @@ async def _post_ingest_refresh() -> int:
     # Invalidate the dataset-relative time cache so the next analytics call
     # recomputes MAX(Date) against the freshly inserted rows.
     invalidate_time_cache()
+
+    # Postgres path: detect cross-table relationships across the freshly
+    # ingested u_* tables and store them in `_relationships`. The Schema
+    # tool reads this to emit explicit JOIN-key hints to the LLM, so the
+    # SQL writer doesn't have to guess which columns join which tables.
+    from app.db_engine import is_postgres
+    if is_postgres():
+        try:
+            from app.schema_mapping.relationships import refresh_relationships_pg
+            rel_count = await refresh_relationships_pg()
+            refresh_log.info("relationships refreshed: count=%d", rel_count)
+        except Exception:
+            refresh_log.warning(
+                "relationship refresh failed (continuing)", exc_info=True,
+            )
+        # Everything below targets the SQLite-only legacy schema (static
+        # sales / purchase tables, product hierarchy, enrichment, cost
+        # master). Those tables don't exist on Postgres — every call would
+        # raise inside its try/except, wasting CPU and spamming the logs.
+        # The agentic loop reads u_* tables directly via the Schema tool.
+        return new_version
+
     # Mock product-name backfill — fill any rows whose Product Name came in
     # blank with a deterministic footwear name. MUST run before hierarchy
     # sync so the new names get classified into the v1 + v2 trees this cycle.

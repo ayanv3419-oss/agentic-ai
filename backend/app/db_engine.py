@@ -311,6 +311,13 @@ class _PgConnection:
     async def rollback(self) -> None:
         return None
 
+    def transaction(self) -> Any:
+        # asyncpg's native transaction context manager. Use as:
+        #   async with db.transaction():
+        #       await db.execute(...)
+        # On exception inside the block, the transaction is ROLLBACKed.
+        return self._conn.transaction()
+
     # Some call sites use a row_factory attribute; expose a stub.
     @property
     def row_factory(self) -> Any:

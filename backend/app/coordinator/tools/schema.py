@@ -98,6 +98,19 @@ async def _list_user_tables() -> list[dict[str, Any]]:
                     {"name": dict(c)["name"], "type": (dict(c)["type"] or "text").upper()}
                     for c in cols
                 ]
+                # Attach data-quality profile to each column when available.
+                # `_column_profile` is populated by the ingest profiler; if
+                # profiling failed or the row hasn't been written yet, the
+                # dict is empty and we just skip the merge.
+                try:
+                    from app.schema_mapping.profiler import load_table_profile_pg
+                    profile = await load_table_profile_pg(name)
+                except Exception:
+                    profile = {}
+                for c in col_defs:
+                    p = profile.get(c["name"])
+                    if p:
+                        c["profile"] = p
                 date_col = next(
                     (c["name"] for c in col_defs
                      if _date_col_hint.search(c["name"])),
@@ -332,6 +345,111 @@ def _inventory_hints(resolved: ResolvedSchema) -> str:
     )
 
 
+def _profile_note(col: dict[str, Any]) -> str:
+    """Render the profile dict on a column into a short inline annotation
+    the LLM can read. Returns '' when no profile is attached or all stats
+    are unremarkable.
+
+    Format: ' [null=N% num=N% date=N%]' — only includes fields that carry
+    signal (e.g. omit num=100% on a pure-numeric column, but include
+    null=42% which would warn the LLM the column is sparse).
+    """
+    p = col.get("profile")
+    if not p:
+        return ""
+    parts: list[str] = []
+    nn = float(p.get("pct_non_null") or 0.0)
+    if nn < 1.0:
+        parts.append(f"null={int(round((1.0 - nn) * 100))}%")
+    nm = float(p.get("pct_numeric") or 0.0)
+    if 0.05 < nm < 1.0:
+        # Mixed-type column — partly numeric, partly text. LLM should be wary
+        # of SUM() unless it casts and filters first.
+        parts.append(f"num={int(round(nm * 100))}%")
+    dc = float(p.get("pct_date") or 0.0)
+    if 0.5 < dc < 1.0:
+        parts.append(f"date={int(round(dc * 100))}%")
+    return f" [{' '.join(parts)}]" if parts else ""
+
+
+def _data_quality_warnings(user_tables: list[dict[str, Any]]) -> str:
+    """Emit a ## DATA QUALITY block listing columns the LLM should AVOID
+    using as a measure or key — typically those that are mostly NULL.
+
+    Returns '' when no column crosses the warning threshold (≥70% null).
+    """
+    bad: list[str] = []
+    for t in user_tables:
+        for c in t.get("columns", []):
+            p = c.get("profile")
+            if not p:
+                continue
+            nn = float(p.get("pct_non_null") or 0.0)
+            if nn <= 0.30 and p.get("distinct_count", 0) > 0:
+                bad.append(
+                    f'"{t["table"]}"."{c["name"]}" is '
+                    f"{int(round((1.0 - nn) * 100))}% NULL"
+                )
+    if not bad:
+        return ""
+    return (
+        "\n\n## DATA QUALITY - the columns below are mostly NULL. Do NOT "
+        "use them as a measure (SUM/AVG would be misleading) or as a key "
+        "(joins would drop most rows). Prefer cleaner columns when "
+        "alternatives exist.\n- "
+        + "\n- ".join(bad)
+    )
+
+
+async def _relationship_hints(user_tables: list[dict[str, Any]]) -> str:
+    """Emit the ## TABLE RELATIONSHIPS block.
+
+    Reads the ``_relationships`` table (populated post-ingest by
+    ``refresh_relationships_pg``) and lists every detected JOIN key as
+    an explicit hint the LLM can copy into a JOIN clause. Only shows
+    relationships whose endpoints are CURRENTLY in ``user_tables`` —
+    detection results for tables that have since been dropped are
+    silently filtered.
+
+    SQLite-only deployments return '' (no relationships table).
+    """
+    if not user_tables:
+        return ""
+    from app.db_engine import is_postgres
+    if not is_postgres():
+        return ""
+    try:
+        from app.schema_mapping.relationships import load_relationships_pg
+        rels = await load_relationships_pg()
+    except Exception:
+        return ""
+    if not rels:
+        return ""
+    live_tables = {t["table"] for t in user_tables}
+    visible = [
+        r for r in rels
+        if r["from_table"] in live_tables and r["to_table"] in live_tables
+    ]
+    if not visible:
+        return ""
+    lines = [
+        "\n\n## TABLE RELATIONSHIPS - shared keys detected across the "
+        "uploaded tables, with value-overlap percentages. Use these EXACT "
+        "join keys when a question needs data from more than one table. "
+        "Use LEFT JOIN when the LEFT table's totals must be preserved "
+        "(orphan keys are common in real uploads)."
+    ]
+    for r in visible:
+        pct = int(round(float(r.get("overlap_pct") or 0.0) * 100))
+        lines.append(
+            f'- "{r["from_table"]}"."{r["from_column"]}" '
+            f'= "{r["to_table"]}"."{r["to_column"]}"  '
+            f'(overlap {pct}%, distinct {r.get("from_distinct", 0)} '
+            f'/ {r.get("to_distinct", 0)})'
+        )
+    return "\n".join(lines)
+
+
 def _metric_hints(
     user_tables: list[dict[str, Any]], resolved: ResolvedSchema,
 ) -> str:
@@ -397,7 +515,8 @@ class SchemaTool(Tool):
             )
             for t in user_tables:
                 cols = ", ".join(
-                    f'"{c["name"]}":{c["type"]}' for c in t["columns"]
+                    f'"{c["name"]}":{c["type"]}{_profile_note(c)}'
+                    for c in t["columns"]
                 )
                 dr = t.get("date_range")
                 date_note = (
@@ -431,7 +550,13 @@ class SchemaTool(Tool):
         # Resolve canonical analytic concepts onto this dataset's columns
         # once; sqlWriter's deterministic ranking path reuses the result.
         resolved = resolve_schema(user_tables)
-        text = "\n".join(summary_lines) + _metric_hints(user_tables, resolved)
+        rel_block = await _relationship_hints(user_tables)
+        text = (
+            "\n".join(summary_lines)
+            + rel_block
+            + _data_quality_warnings(user_tables)
+            + _metric_hints(user_tables, resolved)
+        )
         return ToolOutcome(
             ok=True,
             output={

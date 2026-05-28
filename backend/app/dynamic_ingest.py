@@ -23,7 +23,7 @@ import json
 import logging
 import re
 import sqlite3
-from datetime import datetime
+from datetime import date as _date_cls, datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any, Iterator
@@ -515,18 +515,160 @@ def _build_create_sql(table: str, cols: list[tuple[str, str]]) -> str:
     )
 
 
-# SQLite TEXT/INTEGER/REAL → Postgres mapping.
+# SQLite TEXT/INTEGER/REAL → Postgres mapping. Used as a fallback only;
+# `_refine_pg_type` produces richer types (DATE, TIMESTAMPTZ, NUMERIC) when
+# the column's name and samples warrant it.
 _PG_TYPE_MAP: dict[str, str] = {
     "TEXT": "TEXT",
     "INTEGER": "BIGINT",
     "REAL": "DOUBLE PRECISION",
 }
 
+# Column-name hints used to upgrade a SQLite-inferred type to a richer
+# Postgres type. NUMERIC(18,2) is preferred over DOUBLE PRECISION for any
+# REAL column whose name reads as money — IEEE-754 floats introduce drift
+# on millions of rows and compare unreliably for equality.
+_MONEY_HINT = re.compile(
+    r"(amount|price|value|revenue|cost|sales|net|gross|total|"
+    r"profit|margin|turnover|expense|fee|tax|discount|charge|"
+    r"sale|paid|due|balance)",
+    re.IGNORECASE,
+)
+# Column names that lean timestamp-of-day over plain date.
+_TIMESTAMP_HINT = re.compile(
+    r"(timestamp|datetime|created|updated|modified|inserted|_at\b|_ts\b)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_timestamp_str(s: str) -> bool:
+    """Quick check for a string that carries a time component (HH:MM)."""
+    return ("T" in s and ":" in s) or (" " in s and ":" in s and "-" in s)
+
+
+def _refine_pg_type(name: str, sql_type: str, samples: list[Any]) -> str:
+    """Pick a richer Postgres column type than the static _PG_TYPE_MAP.
+
+    Rules:
+      - INTEGER → BIGINT (unchanged)
+      - REAL, money-named → NUMERIC(18,2)
+      - REAL, otherwise → DOUBLE PRECISION
+      - TEXT, ≥90% of non-null samples parse as ISO date → DATE
+        (TIMESTAMPTZ if name hints time or samples carry HH:MM)
+      - TEXT, otherwise → TEXT
+    """
+    if sql_type == "INTEGER":
+        return "BIGINT"
+    if sql_type == "REAL":
+        if _MONEY_HINT.search(name):
+            return "NUMERIC(18,2)"
+        return "DOUBLE PRECISION"
+    # TEXT — try to upgrade to DATE / TIMESTAMPTZ when the values look it.
+    non_null = 0
+    date_count = 0
+    ts_count = 0
+    for v in samples[:50]:
+        if v is None:
+            continue
+        if isinstance(v, datetime):
+            non_null += 1
+            date_count += 1
+            ts_count += 1
+            continue
+        if isinstance(v, _date_cls):
+            non_null += 1
+            date_count += 1
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        non_null += 1
+        if _parse_date_str(s) is not None:
+            date_count += 1
+            if _looks_like_timestamp_str(s):
+                ts_count += 1
+    if non_null >= 3 and date_count / non_null >= 0.9:
+        if _TIMESTAMP_HINT.search(name) or (ts_count >= non_null / 2):
+            return "TIMESTAMPTZ"
+        return "DATE"
+    return "TEXT"
+
+
+def _coerce_pg(value: Any, pg_type: str) -> Any:
+    """Convert a raw Excel cell into something asyncpg accepts for ``pg_type``.
+
+    DATE → datetime.date or None.
+    TIMESTAMPTZ → datetime.datetime or None.
+    NUMERIC(18,2) / DOUBLE PRECISION → float or None.
+    BIGINT → int or None.
+    TEXT → str or None.
+    """
+    if value is None:
+        return None
+    if pg_type == "TEXT":
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d")
+        if isinstance(value, _date_cls):
+            return value.strftime("%Y-%m-%d")
+        s = str(value).strip()
+        return s if s else None
+    if pg_type == "BIGINT":
+        try:
+            return int(float(_to_number_str(value)))
+        except (TypeError, ValueError):
+            return None
+    if pg_type in ("DOUBLE PRECISION", "NUMERIC(18,2)"):
+        try:
+            return float(_to_number_str(value))
+        except (TypeError, ValueError):
+            return None
+    if pg_type == "DATE":
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, _date_cls):
+            return value
+        s = str(value).strip()
+        if not s:
+            return None
+        iso = _parse_date_str(s)
+        if iso is None:
+            return None
+        return _date_cls.fromisoformat(iso)
+    if pg_type == "TIMESTAMPTZ":
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, _date_cls):
+            return datetime.combine(value, datetime.min.time())
+        s = str(value).strip()
+        if not s:
+            return None
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%d %H:%M:%S.%f",
+        ):
+            try:
+                return datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        iso = _parse_date_str(s)
+        if iso is not None:
+            return datetime.strptime(iso, "%Y-%m-%d")
+        return None
+    return value
+
 
 def _build_create_sql_pg(table: str, cols: list[tuple[str, str]]) -> str:
+    """Build CREATE TABLE DDL for Postgres.
+
+    ``cols`` is a list of (column_name, pg_type) pairs where pg_type is the
+    REFINED Postgres type (one of TEXT, BIGINT, DOUBLE PRECISION,
+    NUMERIC(18,2), DATE, TIMESTAMPTZ). Callers must call _refine_pg_type
+    BEFORE building DDL so the richer types are honoured.
+    """
     col_defs = ",\n  ".join(
-        f'"{name}" {_PG_TYPE_MAP.get(sqltype, "TEXT")}'
-        for name, sqltype in cols
+        f'"{name}" {pgtype}' for name, pgtype in cols
     )
     return (
         f'CREATE TABLE "{table}" (\n'
@@ -796,11 +938,17 @@ async def ingest_sheet_pg(
         if not data_rows:
             raise DynamicIngestError(f"sheet {sheet_name!r} has no data rows after header")
 
+        # Two-stage typing: first the SQLite-flavoured inference (kept for
+        # registry metadata + downstream callers), then a Postgres-flavoured
+        # refinement that upgrades dates and money to native DATE / NUMERIC.
         col_types: list[str] = []
+        pg_types: list[str] = []
         sample = data_rows[:_TYPE_INFER_SAMPLE]
         for i in range(n_cols):
             samples = [row[i] for row in sample]
-            col_types.append(_infer_column_type(samples))
+            sql_t = _infer_column_type(samples)
+            col_types.append(sql_t)
+            pg_types.append(_refine_pg_type(col_names[i], sql_t, samples))
 
         table = sheet_to_table_name(sheet_name)
 
@@ -808,26 +956,29 @@ async def ingest_sheet_pg(
         payload: list[tuple[Any, ...]] = []
         for row in data_rows:
             try:
-                coerced = [_coerce(row[i], col_types[i]) for i in range(n_cols)]
+                coerced = [_coerce_pg(row[i], pg_types[i]) for i in range(n_cols)]
                 payload.append((batch_id, sheet_name, *coerced))
             except Exception:
                 skipped += 1
 
-        # DROP + CREATE + bulk INSERT via asyncpg shim
+        # DROP + CREATE + bulk INSERT — wrapped in one transaction so a crash
+        # mid-INSERT ROLLBACKs and leaves the previous table contents intact
+        # (the alternative is an empty CREATEd table replacing real data).
         async with pg_connection() as db:
-            await db.execute(f'DROP TABLE IF EXISTS "{table}"')
-            dropped = True  # IF EXISTS is idempotent; we don't track prior state
-            create_sql = _build_create_sql_pg(table, list(zip(col_names, col_types)))
-            await db.execute(create_sql)
+            async with db.transaction():
+                await db.execute(f'DROP TABLE IF EXISTS "{table}"')
+                dropped = True  # IF EXISTS is idempotent; we don't track prior state
+                create_sql = _build_create_sql_pg(table, list(zip(col_names, pg_types)))
+                await db.execute(create_sql)
 
-            if payload:
-                placeholders = ", ".join("?" * (n_cols + 2))
-                quoted_cols = ", ".join(f'"{c}"' for c in col_names)
-                insert_sql = (
-                    f'INSERT INTO "{table}" (_batch_id, _source_sheet, {quoted_cols}) '
-                    f'VALUES ({placeholders})'
-                )
-                await db.executemany(insert_sql, payload)
+                if payload:
+                    placeholders = ", ".join("?" * (n_cols + 2))
+                    quoted_cols = ", ".join(f'"{c}"' for c in col_names)
+                    insert_sql = (
+                        f'INSERT INTO "{table}" (_batch_id, _source_sheet, {quoted_cols}) '
+                        f'VALUES ({placeholders})'
+                    )
+                    await db.executemany(insert_sql, payload)
 
         rows_inserted = len(payload)
 
@@ -842,6 +993,26 @@ async def ingest_sheet_pg(
             source_file=source_file_name,
             row_count=rows_inserted,
         )
+
+        # Profile every column so the resolver can prefer cleaner columns
+        # when concept synonyms tie, and the Schema tool can surface data
+        # quality (% null, % numeric, distinct count) to the LLM. Failures
+        # never break the upload — profiling is best-effort.
+        try:
+            from app.schema_mapping.profiler import (
+                profile_table_pg, save_profiles_pg,
+            )
+            profiles = await profile_table_pg(table, list(col_names))
+            saved = await save_profiles_pg(profiles)
+            log.info(
+                "profile_pg: table=%r cols_profiled=%d saved=%d",
+                table, len(profiles), saved,
+            )
+        except Exception:
+            log.warning(
+                "profile_pg: table=%r profiling failed (continuing)",
+                table, exc_info=True,
+            )
 
         log.info(
             "dynamic_ingest_pg: sheet=%r → table=%r rows=%d cols=%d skipped=%d",

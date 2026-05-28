@@ -683,6 +683,36 @@ CREATE TABLE IF NOT EXISTS uploads (
 )
 """
 
+_COLUMN_PROFILE_DDL_PG = """
+CREATE TABLE IF NOT EXISTS _column_profile (
+    table_name      TEXT NOT NULL,
+    column_name     TEXT NOT NULL,
+    pct_non_null    DOUBLE PRECISION NOT NULL DEFAULT 0,
+    pct_numeric     DOUBLE PRECISION NOT NULL DEFAULT 0,
+    pct_date        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    distinct_count  BIGINT NOT NULL DEFAULT 0,
+    min_val         TEXT,
+    max_val         TEXT,
+    profiled_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (table_name, column_name)
+)
+"""
+
+_RELATIONSHIPS_DDL_PG = """
+CREATE TABLE IF NOT EXISTS _relationships (
+    from_table     TEXT NOT NULL,
+    from_column    TEXT NOT NULL,
+    to_table       TEXT NOT NULL,
+    to_column      TEXT NOT NULL,
+    overlap_pct    DOUBLE PRECISION NOT NULL DEFAULT 0,
+    from_distinct  BIGINT NOT NULL DEFAULT 0,
+    to_distinct    BIGINT NOT NULL DEFAULT 0,
+    detected_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (from_table, from_column, to_table, to_column)
+)
+"""
+
+
 _ERROR_LOG_DDL_PG = """
 CREATE TABLE IF NOT EXISTS error_log (
     id              BIGSERIAL PRIMARY KEY,
@@ -716,6 +746,8 @@ async def _init_database_postgres() -> None:
     async with pg_connection() as db:
         await db.execute(_UPLOADS_DDL_PG)
         await db.execute(_ERROR_LOG_DDL_PG)
+        await db.execute(_COLUMN_PROFILE_DDL_PG)
+        await db.execute(_RELATIONSHIPS_DDL_PG)
         await db.execute(
             'CREATE INDEX IF NOT EXISTS idx_uploads_file_hash '
             'ON uploads(file_hash, status)'
@@ -724,7 +756,10 @@ async def _init_database_postgres() -> None:
             'CREATE INDEX IF NOT EXISTS idx_error_log_occurred '
             'ON error_log(occurred_at DESC)'
         )
-    log.info("postgres DB initialized (minimum schema: uploads + error_log)")
+    log.info(
+        "postgres DB initialized (minimum schema: uploads + error_log "
+        "+ _column_profile + _relationships)"
+    )
 
 
 async def init_database() -> None:
