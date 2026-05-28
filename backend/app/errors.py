@@ -224,7 +224,32 @@ async def get_error(error_id: str) -> dict[str, Any] | None:
 
 
 async def resolve_error(error_id: str, note: str | None = None) -> bool:
-    """Mark resolved=1 and stamp resolved_at. Returns False on unknown id."""
+    """Mark resolved=1 and stamp resolved_at. Returns False on unknown id.
+
+    Cross-engine: on Postgres routes through the async connection; on
+    SQLite keeps the legacy direct sqlite3 path (idempotent, no behaviour
+    change). Both paths use NOW() / datetime('now') correctly per engine.
+    """
+    from app.db_engine import is_postgres
+    if is_postgres():
+        try:
+            from app.infrastructure import get_connection as _get_conn
+            async with _get_conn() as db:
+                cur = await db.execute(
+                    "UPDATE error_log SET resolved = 1, "
+                    "resolved_at = NOW(), resolved_note = ? "
+                    "WHERE error_id = ?",
+                    (note, error_id),
+                )
+                # asyncpg shim doesn't expose rowcount; we treat any
+                # non-error path as success and let the caller re-check
+                # via get_error() if it needs strict confirmation.
+                await cur.close()
+                await db.commit()
+                return True
+        except Exception:
+            _log.exception("resolve_error (postgres) failed for %s", error_id)
+            return False
     try:
         import sqlite3
         conn = sqlite3.connect(str(db_path()), isolation_level=None)
@@ -239,7 +264,7 @@ async def resolve_error(error_id: str, note: str | None = None) -> bool:
         finally:
             conn.close()
     except Exception:
-        _log.exception("resolve_error failed for %s", error_id)
+        _log.exception("resolve_error (sqlite) failed for %s", error_id)
         return False
 
 

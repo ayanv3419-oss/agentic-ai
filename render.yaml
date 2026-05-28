@@ -21,10 +21,12 @@ services:
         value: /data/response_store.json
       - key: RELOAD
         value: "false"
+      # CORS lock-down — only the deployed Vercel frontend may call this API.
+      # If you redeploy to a different Vercel URL, update this here (and
+      # FRONTEND_URL below) before re-pushing. "*" is forbidden in prod:
+      # it lets any website on the internet hit your backend.
       - key: ALLOWED_ORIGINS
-        value: "*"
-        # After Vercel deploys, change this to your Vercel URL, e.g.:
-        # value: https://agentic-ai-livid-eta.vercel.app
+        value: https://agentic-ai-livid-eta.vercel.app
       - key: FRONTEND_URL
         value: https://agentic-ai-livid-eta.vercel.app
       # --- Auth (Phase 3) -------------------------------------------

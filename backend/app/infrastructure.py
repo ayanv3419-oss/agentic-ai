@@ -121,6 +121,11 @@ class Settings(BaseSettings):
     auth_enabled:        bool = Field(default=False, alias="AUTH_ENABLED")
     admin_username:      str  = Field(default="",    alias="ADMIN_USERNAME")
     admin_password:      str  = Field(default="",    alias="ADMIN_PASSWORD")
+    # Sentinel value used as the in-source default. If auth is enabled and
+    # AUTH_TOKEN_SECRET is still this value (i.e. the deployer forgot to
+    # set a real one), the app refuses to start — see `_validate_auth()`
+    # called below. Keeps the previous dev-mode UX (auth off → no config
+    # required) without ever shipping a guessable token signer in prod.
     auth_token_secret:   str  = Field(default="dev-auth-secret-CHANGE-ME",
                                       alias="AUTH_TOKEN_SECRET")
     auth_token_ttl_hours: int = Field(default=168,   alias="AUTH_TOKEN_TTL_HOURS")
@@ -162,6 +167,39 @@ class Settings(BaseSettings):
         self.response_store_path = _abs(self.response_store_path)
         self.synonyms_path = _abs(self.synonyms_path)
         self.google_token_path = _abs(self.google_token_path)
+        self._validate_auth()
+
+    # Default token secret value — must be overridden when auth is on.
+    _AUTH_DEFAULT_SECRET = "dev-auth-secret-CHANGE-ME"
+
+    def _validate_auth(self) -> None:
+        """Refuse to start with insecure auth configuration.
+
+        Triggered only when ``auth_enabled=True``. We require all three of
+        AUTH_TOKEN_SECRET, ADMIN_USERNAME, ADMIN_PASSWORD to be non-empty
+        and the secret to differ from the in-source sentinel. This catches
+        the "AUTH_ENABLED=true but I forgot to set the secret" deploy bug
+        that would otherwise sign tokens with a publicly known string.
+        """
+        if not self.auth_enabled:
+            return
+        problems: list[str] = []
+        if not self.auth_token_secret or self.auth_token_secret == self._AUTH_DEFAULT_SECRET:
+            problems.append(
+                "AUTH_TOKEN_SECRET is unset or still the in-source default — "
+                "set it to a strong random string."
+            )
+        if not self.admin_username:
+            problems.append("ADMIN_USERNAME is empty.")
+        if not self.admin_password:
+            problems.append("ADMIN_PASSWORD is empty.")
+        if problems:
+            raise RuntimeError(
+                "AUTH_ENABLED=true but auth config is insecure:\n  - "
+                + "\n  - ".join(problems)
+                + "\nFix these env vars (Render dashboard) or set "
+                "AUTH_ENABLED=false to fall back to no-auth mode."
+            )
 
 
 @lru_cache

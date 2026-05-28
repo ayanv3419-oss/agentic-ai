@@ -64,29 +64,30 @@ def cost_guard(state: TurnState, call: ToolCall) -> HookOutcome:
 
 
 def restriction_guard(state: TurnState, call: ToolCall) -> HookOutcome:
-    """Block any capability name we don't expose. Defense in depth — the
-    OpenAI tools list already limits choices, but the LLM could hallucinate
-    a name (e.g. calling a raw Phase-1 tool directly).
-
-    Phase 2: only the 4 capabilities are allowed. Raw tools (Schema,
-    RouteClass, SqlExecutor, etc.) and sub-agents (sqlWriter, insightFmt, …)
-    are internal implementation details — they are never dispatched by the
-    LLM directly.
+    """Block any tool name we don't expose. Defense in depth — the
+    OpenAI tool-calling list already limits choices, but the LLM could
+    hallucinate a name. Phase 3: 11 fine-grained tools are allowed.
     """
     _ALLOWED = {
-        "understand_question",
-        "run_data_query",
-        "explain_change",
-        "write_answer",
+        # Perception
+        "RouteClass", "TimeKPI", "Granularity", "EntityLoc",
+        # Schema
+        "Schema",
+        # SQL
+        "sqlWriter", "SqlDryRun", "SqlExecutor",
+        # Causal / RCA
+        "CausalTree", "rcaReasoner",
+        # Terminal
+        "insightFmt",
     }
     if call.name not in _ALLOWED:
         return HookOutcome(
             skip=True,
-            reason=f"capability {call.name!r} is not in the allowed set",
+            reason=f"tool {call.name!r} is not in the allowed set",
             forced_result=ToolOutcome(
                 ok=False,
                 error=(
-                    f"'{call.name}' is not a valid capability. "
+                    f"'{call.name}' is not a valid tool. "
                     f"Use one of: {sorted(_ALLOWED)}"
                 ),
             ),
@@ -179,9 +180,10 @@ PreHook = Callable[[TurnState, ToolCall], HookOutcome]
 PostHook = Callable[[TurnState, ToolCall, ToolResult], None]
 
 
-PRE_HOOKS: list[PreHook] = [restriction_guard, cost_guard]
-# sql_dryrun_guard removed from pre-hooks: SqlDryRun is now called
-# structurally inside RunDataQueryCapability — it cannot be bypassed.
+PRE_HOOKS: list[PreHook] = [restriction_guard, cost_guard, sql_dryrun_guard]
+# sql_dryrun_guard is re-enabled in Phase 3: SqlDryRun is no longer
+# called structurally inside a capability, so the hook is the only
+# barrier preventing the LLM from running SqlExecutor on un-validated SQL.
 POST_HOOKS: list[PostHook] = [log_result]
 
 
