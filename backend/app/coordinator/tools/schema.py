@@ -401,52 +401,129 @@ def _data_quality_warnings(user_tables: list[dict[str, Any]]) -> str:
     )
 
 
+async def _load_pg_foreign_keys(live_tables: set[str]) -> list[dict[str, Any]]:
+    """Return every FOREIGN KEY whose BOTH endpoints sit in ``live_tables``.
+
+    Read straight from information_schema so manually-added FKs (via
+    Supabase SQL editor) are picked up alongside any our ingest pipeline
+    might create. Each row: {from_table, from_column, to_table, to_column,
+    constraint_name}. Empty list on any error so a missing GRANT never
+    breaks schema emission.
+    """
+    if not live_tables:
+        return []
+    from app.db_engine import pg_connection
+    out: list[dict[str, Any]] = []
+    sql = (
+        "SELECT tc.table_name      AS from_table, "
+        "       kcu.column_name    AS from_column, "
+        "       ccu.table_name     AS to_table, "
+        "       ccu.column_name    AS to_column, "
+        "       tc.constraint_name AS constraint_name "
+        "FROM information_schema.table_constraints tc "
+        "JOIN information_schema.key_column_usage kcu "
+        "  ON tc.constraint_name = kcu.constraint_name "
+        " AND tc.table_schema    = kcu.table_schema "
+        "JOIN information_schema.constraint_column_usage ccu "
+        "  ON tc.constraint_name = ccu.constraint_name "
+        " AND tc.table_schema    = ccu.table_schema "
+        "WHERE tc.constraint_type = 'FOREIGN KEY' "
+        "  AND tc.table_schema    = 'public'"
+    )
+    try:
+        async with pg_connection() as db:
+            cur = await db.execute(sql)
+            rows = await cur.fetchall()
+            for r in rows or []:
+                d = dict(r)
+                ft, tt = d.get("from_table"), d.get("to_table")
+                if ft in live_tables and tt in live_tables:
+                    out.append(d)
+    except Exception:
+        return []
+    return out
+
+
 async def _relationship_hints(user_tables: list[dict[str, Any]]) -> str:
     """Emit the ## TABLE RELATIONSHIPS block.
 
-    Reads the ``_relationships`` table (populated post-ingest by
-    ``refresh_relationships_pg``) and lists every detected JOIN key as
-    an explicit hint the LLM can copy into a JOIN clause. Only shows
-    relationships whose endpoints are CURRENTLY in ``user_tables`` —
-    detection results for tables that have since been dropped are
-    silently filtered.
+    Merges TWO sources of join evidence:
+      1. ``_relationships`` — value-overlap auto-detector (≥80% match).
+      2. ``information_schema.referential_constraints`` — real Postgres
+         FOREIGN KEY constraints, treated as AUTHORITATIVE. When a pair
+         appears in both, the FK wins (auto-detector entry is dropped).
 
-    SQLite-only deployments return '' (no relationships table).
+    Only emits relationships whose endpoints are CURRENTLY in
+    ``user_tables`` — stale detection rows / FKs against dropped tables
+    are silently filtered.
+
+    SQLite-only deployments return '' (no Postgres info_schema).
     """
     if not user_tables:
         return ""
     from app.db_engine import is_postgres
     if not is_postgres():
         return ""
+
+    live_tables = {t["table"] for t in user_tables}
+
+    # Load both sources concurrently — neither blocks the other on failure.
     try:
         from app.schema_mapping.relationships import load_relationships_pg
         rels = await load_relationships_pg()
     except Exception:
-        return ""
-    if not rels:
-        return ""
-    live_tables = {t["table"] for t in user_tables}
-    visible = [
+        rels = []
+    fks = await _load_pg_foreign_keys(live_tables)
+
+    # Dedupe: a pair is identified by the unordered set of
+    # (table.column, table.column). When an FK exists for the pair, the
+    # auto-detector entry is dropped — the FK is the source of truth.
+    def _pair_key(a_t: str, a_c: str, b_t: str, b_c: str) -> tuple:
+        return tuple(sorted([(a_t, a_c), (b_t, b_c)]))
+
+    fk_pairs = {
+        _pair_key(f["from_table"], f["from_column"], f["to_table"], f["to_column"])
+        for f in fks
+    }
+
+    visible_auto = [
         r for r in rels
-        if r["from_table"] in live_tables and r["to_table"] in live_tables
+        if r["from_table"] in live_tables
+        and r["to_table"] in live_tables
+        and _pair_key(r["from_table"], r["from_column"],
+                      r["to_table"], r["to_column"]) not in fk_pairs
     ]
-    if not visible:
+
+    if not fks and not visible_auto:
         return ""
+
     lines = [
-        "\n\n## TABLE RELATIONSHIPS - shared keys detected across the "
-        "uploaded tables, with value-overlap percentages. Use these EXACT "
-        "join keys when a question needs data from more than one table. "
-        "Use LEFT JOIN when the LEFT table's totals must be preserved "
-        "(orphan keys are common in real uploads)."
+        "\n\n## TABLE RELATIONSHIPS - join keys across the uploaded tables. "
+        "Use these EXACT keys when a question needs data from more than one "
+        "table. Prefer LEFT JOIN when the LEFT table's totals must be "
+        "preserved (orphan keys are common in real uploads)."
     ]
-    for r in visible:
-        pct = int(round(float(r.get("overlap_pct") or 0.0) * 100))
+    if fks:
         lines.append(
-            f'- "{r["from_table"]}"."{r["from_column"]}" '
-            f'= "{r["to_table"]}"."{r["to_column"]}"  '
-            f'(overlap {pct}%, distinct {r.get("from_distinct", 0)} '
-            f'/ {r.get("to_distinct", 0)})'
+            "\n# Declared foreign keys (authoritative — enforced by the DB):"
         )
+        for f in fks:
+            lines.append(
+                f'- "{f["from_table"]}"."{f["from_column"]}" '
+                f'= "{f["to_table"]}"."{f["to_column"]}"'
+            )
+    if visible_auto:
+        lines.append(
+            "\n# Detected by value overlap (no FK declared — treat as a hint):"
+        )
+        for r in visible_auto:
+            pct = int(round(float(r.get("overlap_pct") or 0.0) * 100))
+            lines.append(
+                f'- "{r["from_table"]}"."{r["from_column"]}" '
+                f'= "{r["to_table"]}"."{r["to_column"]}"  '
+                f'(overlap {pct}%, distinct {r.get("from_distinct", 0)} '
+                f'/ {r.get("to_distinct", 0)})'
+            )
     return "\n".join(lines)
 
 

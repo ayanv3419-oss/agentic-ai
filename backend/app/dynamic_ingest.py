@@ -966,7 +966,12 @@ async def ingest_sheet_pg(
         # (the alternative is an empty CREATEd table replacing real data).
         async with pg_connection() as db:
             async with db.transaction():
-                await db.execute(f'DROP TABLE IF EXISTS "{table}"')
+                # CASCADE so re-upload doesn't crash when a FOREIGN KEY in
+                # another u_* table references this one. Any dependent FKs
+                # are dropped silently — `_post_ingest_refresh` reruns the
+                # relationship detector after every ingest so the next
+                # Schema-tool call still surfaces the join keys.
+                await db.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE')
                 dropped = True  # IF EXISTS is idempotent; we don't track prior state
                 create_sql = _build_create_sql_pg(table, list(zip(col_names, pg_types)))
                 await db.execute(create_sql)
@@ -1170,9 +1175,11 @@ async def drop_all_dynamic_tables() -> int:
     reg = load_registry()
     count = 0
     async with get_connection() as conn:
+        from app.db_engine import is_postgres
+        cascade = " CASCADE" if is_postgres() else ""
         for name in list(reg.keys()):
             try:
-                await conn.execute(f'DROP TABLE IF EXISTS "{name}"')
+                await conn.execute(f'DROP TABLE IF EXISTS "{name}"{cascade}')
                 count += 1
             except Exception:
                 log.warning("drop_all_dynamic_tables: failed on %r", name, exc_info=True)

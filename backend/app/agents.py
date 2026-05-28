@@ -197,93 +197,304 @@ async def _validate_post_insert(target: str, batch_id: str) -> dict[str, Any]:
 # ===========================================================================
 
 
+# Postgres data-type names that behave like text in LIKE / substr expressions.
+# Anything outside this set (date, timestamp, timestamp with time zone, …) is
+# treated as a typed temporal value and must use to_char() / native operators.
+_TEXTLIKE_TYPES: frozenset[str] = frozenset({
+    "text", "varchar", "character varying", "character", "char",
+    "citext", "name",
+})
+
+
+def _column_data_type(
+    user_tables: list[dict[str, Any]], table: str, column: str,
+) -> str:
+    """Return the lower-cased data_type of one column from the schema
+    snapshot, or '' when the column isn't found. Tolerates the
+    SQLite-path entries (where 'type' may be uppercase like 'TEXT')."""
+    for t in user_tables:
+        if t.get("table") != table:
+            continue
+        for c in t.get("columns", []):
+            if c.get("name") == column:
+                return str(c.get("type") or "").lower()
+        return ""
+    return ""
+
+
+def _is_text_type(data_type: str) -> bool:
+    """True when LIKE / substr applied directly to the column works."""
+    t = (data_type or "").lower().strip()
+    if not t:
+        # Unknown type: assume text — that's the safer guess for legacy
+        # SQLite paths where types were stored loosely.
+        return True
+    return t in _TEXTLIKE_TYPES
+
+
 class DashboardAgent:
-    """Reads sales rows, verifies dates, filters, groups, aggregates.
-    Output matches the frontend's DashboardData type exactly:
-      { month, kpis: {total_sales, orders, customers},
-        series: [{bucket, sales, orders}], monthly_sales_pie: [...] }
+    """Reads the user's uploaded dataset and aggregates KPIs + time series.
+
+    Uses the schema-mapping resolver so it works on ANY workbook the user
+    uploads — the resolver maps `transaction_date` / `revenue` / `customer`
+    / `invoice_id` concepts to whatever columns the workbook actually has.
+    Works on both SQLite and Postgres (Supabase).
+
+    Output shape (frozen contract, frontend reads it):
+        { month, kpis: {total_sales, orders, customers},
+          series: [{bucket, sales, orders}], monthly_sales_pie: [...] }
     """
 
     name = "DashboardAgent"
 
-    async def run(self, *, month: str | None = None) -> dict[str, Any]:
-        where_parts: list[str] = []
-        params: list[Any] = []
-        if month is not None:
-            if not (len(month) == 7 and month[4] == "-"):
-                raise ValueError(f"invalid month format: {month!r}")
-            where_parts.append('"Date" LIKE ?')
-            params.append(f"{month}-%")
-        where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
-        sql = (
-            f'SELECT "Date", "Total Amount", "Party Name" '
-            f'FROM {quoted("sales")}'
-            f'{where_sql}'
-        )
-        raw_rows = await fetch_all(sql, params)
+    @staticmethod
+    def _empty_payload(month: str | None, reason: str) -> dict[str, Any]:
+        _dashboard_log.info("DashboardAgent empty payload: %s", reason)
+        return {
+            "month": month,
+            "kpis": {"total_sales": 0.0, "orders": 0, "customers": 0},
+            "series": [],
+            "monthly_sales_pie": [],
+        }
 
-        valid: list[dict[str, Any]] = []
-        skipped = 0
-        for r in raw_rows:
-            d = r.get("Date")
-            if not isinstance(d, str) or not _ISO_DATE_RE.match(d):
-                skipped += 1
-                continue
-            valid.append(r)
-        if skipped:
-            _dashboard_log.warning(
-                "DashboardAgent skipped %d rows with non-ISO Date", skipped,
+    @staticmethod
+    async def _list_user_tables_for_resolver() -> list[dict[str, Any]]:
+        """Return the same shape SchemaTool uses, so resolve_schema works.
+
+        Each entry: {"table": name, "columns": [{"name": col, "type": t}, ...]}
+        """
+        from app.db_engine import is_postgres
+        out: list[dict[str, Any]] = []
+        async with get_connection() as db:
+            if is_postgres():
+                cur = await db.execute(
+                    "SELECT table_name AS name FROM information_schema.tables "
+                    "WHERE table_schema='public' "
+                    "AND table_name LIKE 'u\\_%' ESCAPE '\\' "
+                    "ORDER BY table_name"
+                )
+            else:
+                cur = await db.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name LIKE 'u\\_%' ESCAPE '\\' "
+                    "ORDER BY name"
+                )
+            rows = await cur.fetchall()
+            await cur.close()
+            for r in rows:
+                name = dict(r).get("name") or ""
+                if not name:
+                    continue
+                if is_postgres():
+                    cur2 = await db.execute(
+                        "SELECT column_name AS name, data_type AS type "
+                        "FROM information_schema.columns "
+                        "WHERE table_schema='public' AND table_name=? "
+                        "ORDER BY ordinal_position",
+                        (name,),
+                    )
+                else:
+                    cur2 = await db.execute(f"PRAGMA table_info({quoted(name)})")
+                cols = await cur2.fetchall()
+                await cur2.close()
+                col_defs = [
+                    {"name": dict(c)["name"], "type": (dict(c).get("type") or "TEXT")}
+                    for c in cols
+                ]
+                out.append({"table": name, "columns": col_defs})
+        return out
+
+    async def run(self, *, month: str | None = None) -> dict[str, Any]:
+        # 1. Validate month format if supplied.
+        if month is not None and not (len(month) == 7 and month[4] == "-"):
+            raise ValueError(f"invalid month format: {month!r}")
+
+        # 2. Resolve the dataset schema. If no u_* tables exist or required
+        #    concepts can't be resolved, return an empty (but well-shaped)
+        #    payload so the frontend renders zero-state instead of crashing.
+        from app.schema_mapping import resolve_schema
+        user_tables = await self._list_user_tables_for_resolver()
+        if not user_tables:
+            return self._empty_payload(month, "no u_* tables uploaded yet")
+        resolved = resolve_schema(user_tables)
+
+        date_ref = resolved.ref("transaction_date")
+        rev_ref = resolved.ref("revenue")
+        cust_ref = resolved.ref("customer")
+        inv_ref = resolved.ref("invoice_id")
+        if date_ref is None or rev_ref is None:
+            return self._empty_payload(
+                month,
+                f"dataset missing required concepts "
+                f"(date={date_ref}, revenue={rev_ref})",
             )
 
-        if month:
-            valid = [r for r in valid if r["Date"].startswith(month)]
+        sales_t = date_ref.table
+        date_col = date_ref.column
+        rev_col = rev_ref.column
+        # Customer / invoice_id are usable when they live on the SAME table as
+        # the sales rows. If they're on a different table (common in
+        # normalized schemas where party_name lives in u_item_details),
+        # we run a separate cross-table query below.
+        cust_same_t = (cust_ref and cust_ref.table == sales_t)
+        inv_same_t = (inv_ref and inv_ref.table == sales_t)
 
-        buckets: dict[str, dict[str, float]] = defaultdict(
-            lambda: {"sales": 0.0, "orders": 0}
+        # Look up the date column's actual data type. Postgres rejects
+        # `LIKE '____-__-__'` on a real DATE/TIMESTAMPTZ column with
+        # "operator does not exist: date ~~ unknown". The legacy SQLite
+        # path stores dates as TEXT so the LIKE works there. Branch on
+        # type — for typed date columns the type itself guarantees a
+        # valid date, so we can skip the shape filter.
+        date_type = _column_data_type(user_tables, sales_t, date_col)
+        date_is_text = _is_text_type(date_type)
+        # Expression used wherever we need a YYYY-MM-DD string out of the
+        # date column (month filter, monthly pie, series formatting).
+        date_text_expr = (
+            quoted(date_col)
+            if date_is_text
+            else f"to_char({quoted(date_col)}, 'YYYY-MM-DD')"
         )
-        total_sales = 0.0
-        orders = 0
-        customers: set[str] = set()
-        for r in valid:
-            d = r["Date"]
-            amt = float(r.get("Total Amount") or 0)
-            buckets[d]["sales"] += amt
-            buckets[d]["orders"] = int(buckets[d]["orders"]) + 1
-            total_sales += amt
-            orders += 1
-            party = r.get("Party Name")
-            if isinstance(party, str) and party:
-                customers.add(party)
 
-        series = [
-            {"bucket": d, "sales": round(b["sales"], 2), "orders": int(b["orders"])}
-            for d, b in sorted(buckets.items(), key=lambda x: x[0])
-        ][:366]
+        where_parts = [
+            f'{quoted(date_col)} IS NOT NULL',
+            f'{quoted(rev_col)} IS NOT NULL',
+        ]
+        if date_is_text:
+            where_parts.append(f"{quoted(date_col)} LIKE '____-__-__'")
+        params: list[Any] = []
+        if month is not None:
+            where_parts.append(f"{date_text_expr} LIKE ?")
+            params.append(f"{month}-%")
+        where_sql = " WHERE " + " AND ".join(where_parts)
 
-        monthly_sales_pie = await self._aggregate_monthly_sales_pie()
+        # 3. KPI aggregation — single SQL call. Push the work to Postgres.
+        kpi_select_parts = [
+            f'COALESCE(SUM({quoted(rev_col)}), 0) AS total_sales',
+        ]
+        if inv_same_t and inv_ref is not None:
+            kpi_select_parts.append(
+                f'COUNT(DISTINCT {quoted(inv_ref.column)}) AS orders'
+            )
+        else:
+            kpi_select_parts.append('COUNT(*) AS orders')
+        if cust_same_t and cust_ref is not None:
+            kpi_select_parts.append(
+                f'COUNT(DISTINCT {quoted(cust_ref.column)}) AS customers'
+            )
+        else:
+            kpi_select_parts.append('0 AS customers')
+
+        kpi_sql = (
+            f'SELECT {", ".join(kpi_select_parts)} '
+            f'FROM {quoted(sales_t)}'
+            f'{where_sql}'
+        )
+        try:
+            kpi_row = await fetch_one(kpi_sql, params)
+        except Exception as e:
+            _dashboard_log.warning("DashboardAgent KPI query failed: %s", e)
+            return self._empty_payload(month, f"KPI query failed: {e}")
+        kpi_data = dict(kpi_row or {})
+        total_sales = float(kpi_data.get("total_sales") or 0)
+        orders = int(kpi_data.get("orders") or 0)
+        customers = int(kpi_data.get("customers") or 0)
+
+        # 4. Cross-table customer count — when party_name lives on a
+        #    different table than the sales rows (e.g. u_item_details).
+        if customers == 0 and cust_ref and not cust_same_t:
+            try:
+                cust_sql = (
+                    f'SELECT COUNT(DISTINCT {quoted(cust_ref.column)}) AS n '
+                    f'FROM {quoted(cust_ref.table)} '
+                    f'WHERE {quoted(cust_ref.column)} IS NOT NULL'
+                )
+                cr = await fetch_one(cust_sql, [])
+                if cr:
+                    customers = int(dict(cr).get("n") or 0)
+            except Exception as e:
+                _dashboard_log.warning(
+                    "DashboardAgent cross-table customer count failed: %s", e,
+                )
+
+        # 5. Time series — per-day aggregation in SQL.
+        series_sql = (
+            f'SELECT {quoted(date_col)} AS day, '
+            f'  SUM({quoted(rev_col)}) AS sales, '
+            f'  COUNT(*) AS orders '
+            f'FROM {quoted(sales_t)}'
+            f'{where_sql} '
+            f'GROUP BY {quoted(date_col)} '
+            f'ORDER BY {quoted(date_col)} '
+            f'LIMIT 366'
+        )
+        try:
+            series_rows = await fetch_all(series_sql, params)
+        except Exception as e:
+            _dashboard_log.warning("DashboardAgent series query failed: %s", e)
+            series_rows = []
+
+        series: list[dict[str, Any]] = []
+        for r in series_rows:
+            d = r.get("day")
+            if isinstance(d, (datetime, _date_cls)):
+                d = d.strftime("%Y-%m-%d")
+            if not isinstance(d, str) or not _ISO_DATE_RE.match(d):
+                continue
+            try:
+                s = float(r.get("sales") or 0)
+            except (TypeError, ValueError):
+                s = 0.0
+            o = int(r.get("orders") or 0)
+            series.append({"bucket": d, "sales": round(s, 2), "orders": o})
+
+        # 6. Monthly pie.
+        monthly_sales_pie = await self._aggregate_monthly_sales_pie(
+            sales_t, date_col, rev_col, date_is_text,
+        )
+
+        _dashboard_log.info(
+            "DashboardAgent ok table=%s total_sales=%.2f orders=%d customers=%d series=%d",
+            sales_t, total_sales, orders, customers, len(series),
+        )
 
         return {
             "month": month,
             "kpis": {
                 "total_sales": round(total_sales, 2),
                 "orders":      orders,
-                "customers":   len(customers),
+                "customers":   customers,
             },
             "series": series,
             "monthly_sales_pie": monthly_sales_pie,
         }
 
     @staticmethod
-    async def _aggregate_monthly_sales_pie() -> list[dict[str, Any]]:
-        """SQL GROUP BY year-month -> SUM(Total Amount)."""
+    async def _aggregate_monthly_sales_pie(
+        sales_t: str, date_col: str, rev_col: str, date_is_text: bool,
+    ) -> list[dict[str, Any]]:
+        """SQL GROUP BY year-month -> SUM(amount).
+
+        Branches on date column type:
+          - TEXT (SQLite path, or text columns on Postgres): substr() + LIKE
+          - DATE/TIMESTAMP (Postgres typed columns): to_char(date, 'YYYY-MM')
+            — substr() and LIKE don't work on date types in Postgres.
+        """
+        if date_is_text:
+            ym_expr = f"substr({quoted(date_col)}, 1, 7)"
+            shape_filter = (
+                f"AND {quoted(date_col)} LIKE '____-__-__' "
+            )
+        else:
+            ym_expr = f"to_char({quoted(date_col)}, 'YYYY-MM')"
+            shape_filter = ""
         pie_sql = (
             f'SELECT '
-            f'  substr("Date", 1, 7) AS ym, '
-            f'  SUM("Total Amount") AS sales '
-            f'FROM {quoted("sales")} '
-            f'WHERE "Date" IS NOT NULL '
-            f'  AND "Date" GLOB \'????-??-??\' '
-            f'  AND "Total Amount" IS NOT NULL '
+            f'  {ym_expr} AS ym, '
+            f'  SUM({quoted(rev_col)}) AS sales '
+            f'FROM {quoted(sales_t)} '
+            f'WHERE {quoted(date_col)} IS NOT NULL '
+            f'  {shape_filter}'
+            f'  AND {quoted(rev_col)} IS NOT NULL '
             f'GROUP BY ym '
             f'ORDER BY ym ASC'
         )
@@ -305,7 +516,10 @@ class DashboardAgent:
                 label = datetime.strptime(ym, "%Y-%m").strftime("%b %Y")
             except ValueError:
                 continue
-            sales = float(r.get("sales") or 0)
+            try:
+                sales = float(r.get("sales") or 0)
+            except (TypeError, ValueError):
+                continue
             if sales <= 0:
                 continue
             out.append({"month": label, "sales": round(sales, 2)})

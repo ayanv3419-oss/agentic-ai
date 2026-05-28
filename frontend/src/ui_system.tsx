@@ -2204,7 +2204,19 @@ function UploadsTable({ refreshKey = 0, onDisconnected }: UploadsTableProps) {
                     </td>
                     <td className="py-2.5 pr-3 text-zinc-400 tabular-nums">{range}</td>
                     <td className="py-2.5 pr-3 text-zinc-400">
-                      {new Date(u.uploaded_at + 'Z').toLocaleString()}
+                      {(() => {
+                        // Backend now emits ISO with timezone offset
+                        // (e.g. "2026-05-29T13:30:00+05:30"); blindly
+                        // appending 'Z' produced an invalid duplicate
+                        // and the string parsed as Invalid Date. Append
+                        // 'Z' only when no timezone marker is present.
+                        const raw = u.uploaded_at || ''
+                        const hasTz = /Z$|[+-]\d{2}:?\d{2}$/.test(raw)
+                        const parsed = new Date(hasTz ? raw : raw + 'Z')
+                        return isNaN(parsed.getTime())
+                          ? raw || '—'
+                          : parsed.toLocaleString()
+                      })()}
                     </td>
                     <td className="py-2.5 pl-3 text-right">
                       {u.status === 'active' ? (
