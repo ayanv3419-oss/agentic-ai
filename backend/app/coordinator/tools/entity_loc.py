@@ -100,7 +100,7 @@ async def _list_user_tables() -> list[str]:
         if is_postgres():
             cur = await db.execute(
                 "SELECT table_name AS name FROM information_schema.tables "
-                "WHERE table_schema='public' "
+                "WHERE table_schema=current_schema() "
                 "AND table_name LIKE 'u\\_%' ESCAPE '\\' "
                 "ORDER BY table_name"
             )
@@ -284,7 +284,7 @@ class EntityLocTool(Tool):
                             cur = await db.execute(
                                 "SELECT column_name AS name "
                                 "FROM information_schema.columns "
-                                "WHERE table_schema='public' AND table_name=?",
+                                "WHERE table_schema=current_schema() AND table_name=?",
                                 (tbl,),
                             )
                         else:

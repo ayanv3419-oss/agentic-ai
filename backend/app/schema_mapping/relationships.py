@@ -249,7 +249,7 @@ async def _list_pg_user_tables() -> list[dict[str, Any]]:
     async with pg_connection() as db:
         cur = await db.execute(
             "SELECT table_name AS name FROM information_schema.tables "
-            "WHERE table_schema = 'public' "
+            "WHERE table_schema = current_schema() "
             "AND table_name LIKE 'u\\_%' ESCAPE '\\' "
             "ORDER BY table_name"
         )
@@ -261,7 +261,7 @@ async def _list_pg_user_tables() -> list[dict[str, Any]]:
             cur2 = await db.execute(
                 "SELECT column_name AS name "
                 "FROM information_schema.columns "
-                "WHERE table_schema = 'public' AND table_name = ? "
+                "WHERE table_schema = current_schema() AND table_name = ? "
                 "ORDER BY ordinal_position",
                 (name,),
             )

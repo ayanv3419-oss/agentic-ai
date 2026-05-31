@@ -1,4 +1,4 @@
-# Architecture — Agentic AI Platform
+# Architecture — Metric AI Platform
 
 > Last updated: 2025-05-15 | Audited against actual source
 
@@ -6,7 +6,7 @@
 
 ## 1. System Overview
 
-Agentic AI is a **local-first, single-user, LLM-coordinated analytics platform** for small business owners.
+Metric AI is a **local-first, single-user, LLM-coordinated analytics platform** for small business owners.
 Users upload CSV/XLSX financial records, then ask natural-language questions.
 The system answers with grounded SQL results, narrative insight, and chart-ready aggregates — all streamed live.
 

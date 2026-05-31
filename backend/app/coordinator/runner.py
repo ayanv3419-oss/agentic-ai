@@ -48,6 +48,14 @@ async def run_query_turn(
       turn.start -> [cache.hit | loop.iteration* + tool.call/result*] ->
         final -> turn.end
     """
+    # Multi-tenant SLICE 2c: bind the data-query tenant for THIS turn so the
+    # loop's u_* reads / schema introspection resolve to the tenant's own schema
+    # (require_principal no longer drives search_path). AUTH-off → "public" →
+    # default search_path → byte-for-byte today's behavior. persist_turn writes
+    # are public-qualified, so they're unaffected by this.
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(state.tenant_id)
+
     own_llm = False
     if llm is None:
         llm = LLMClient()
@@ -89,6 +97,17 @@ async def run_query_turn(
                     question=state.question,
                     answer=cached.get("final_answer", ""),
                     route=cached.get("route"),
+                )
+            except Exception:
+                pass
+            try:
+                from app.conversation_store import persist_turn
+                await persist_turn(
+                    state.conversation_id,
+                    question=state.question,
+                    answer=cached.get("final_answer", ""),
+                    chart=cached.get("chart"),
+                    tenant_id=state.tenant_id,
                 )
             except Exception:
                 pass
@@ -143,6 +162,17 @@ async def run_query_turn(
                 question=state.question,
                 answer=state.final_answer,
                 route=state.route,
+            )
+        except Exception:
+            pass
+        try:
+            from app.conversation_store import persist_turn
+            await persist_turn(
+                state.conversation_id,
+                question=state.question,
+                answer=state.final_answer,
+                chart=state.chart_payload,
+                tenant_id=state.tenant_id,
             )
         except Exception:
             pass

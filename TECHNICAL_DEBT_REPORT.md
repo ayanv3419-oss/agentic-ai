@@ -1,4 +1,4 @@
-# Technical Debt Report — Agentic AI Platform
+# Technical Debt Report — Metric AI Platform
 
 > Audit date: 2025-05-15
 > Format: debt item → actual code evidence → remediation

@@ -1,4 +1,4 @@
-# Agentic AI — System Summary
+# Metric AI — System Summary
 
 A concise architectural overview of the platform as actually implemented in the
 codebase under `Agentic Ai/`. References to files use the project's relative
@@ -8,7 +8,7 @@ paths.
 
 ## 1. System Overview
 
-**Purpose.** Agentic AI is an LLM-coordinated analytics platform that lets a
+**Purpose.** Metric AI is an LLM-coordinated analytics platform that lets a
 small business upload its sales / purchase records (CSV or XLSX) and then ask
 natural-language questions about that data. The system answers with grounded
 numeric results, narrative insight, and chart-ready aggregates.

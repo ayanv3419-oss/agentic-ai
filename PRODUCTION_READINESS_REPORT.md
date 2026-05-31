@@ -1,4 +1,4 @@
-# Production Readiness Report — Agentic AI Platform
+# Production Readiness Report — Metric AI Platform
 
 > Audit date: 2025-05-15
 > Auditor: Principal Engineer review
