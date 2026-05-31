@@ -121,19 +121,15 @@ def check_admin_credentials(username: str, password: str) -> bool:
     """Validate against env vars. Case-insensitive on username, exact on
     password. Constant-time compare for both.
 
-    Back-compat fallback: when AUTH_ENABLED is false AND
-    ADMIN_USERNAME/PASSWORD are empty, fall through to the legacy
-    APP_LOGIN_USER / APP_LOGIN_PASSWORD pair so existing dev workflows
-    keep working without env-var edits.
+    No credentials are hardcoded: when ``ADMIN_USERNAME`` / ``ADMIN_PASSWORD``
+    are unset there is nothing to match against, so this returns False. (Real
+    per-user accounts live in the ``users`` table via ``app.identity`` — this
+    legacy admin path is only active when both env vars are explicitly set.)
     """
     admin_u = settings.admin_username
     admin_p = settings.admin_password
     if not admin_u or not admin_p:
-        # Legacy fallback — read from os.environ at call time, NOT at
-        # module load, so test fixtures can override.
-        import os
-        admin_u = os.environ.get("APP_LOGIN_USER", "Mansuri")
-        admin_p = os.environ.get("APP_LOGIN_PASSWORD", "182012")
+        return False
     u_ok = hmac.compare_digest(
         (username or "").strip().lower().encode("utf-8"),
         (admin_u or "").strip().lower().encode("utf-8"),

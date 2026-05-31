@@ -22,7 +22,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import (
-    APIRouter, FastAPI, File, Form, Request, UploadFile,
+    APIRouter, Depends, FastAPI, File, Form, Request, UploadFile,
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.agents import DashboardAgent, DataCleanAgent
+from app.tenant_context import Principal, require_principal
 from app.coordinator import (
     EventEmitter,
     PresentationEmitter as _CoordinatorPresentation,
@@ -107,6 +108,11 @@ from app.infrastructure import (
     settings,
     unarchive_upload,
     uploads_dir,
+)
+from app.conversation_store import (
+    delete_conversation,
+    get_conversation,
+    list_conversations,
 )
 from app.dedup import DEDUP_MODES, DEFAULT_DEDUP_MODE, compute_file_hash
 from app import google_drive
@@ -245,6 +251,69 @@ class LoginRequest(BaseModel):
     pass_:    str | None = Field(default=None, alias="pass", max_length=200)
 
 
+class SignupRequest(BaseModel):
+    """Signup body — ``{email, password}``. Extra fields ignored so a
+    slightly-divergent frontend build still slots in."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    email:    str | None = Field(default=None, max_length=200)
+    password: str | None = Field(default=None, max_length=200)
+
+
+@api_router.post("/auth/signup")
+async def auth_signup(req: SignupRequest, request: Request):
+    """Create a real per-user account and return a tenant-bearing token.
+
+    ``{ email, password } -> { token }``. Delegates to ``identity.signup``
+    (creates a ``users`` row + an owned ``tenants`` row, bcrypt-hashes the
+    password) and mints a token from the resulting Principal. A duplicate
+    email is a 409; bad input (empty email / short password) is a 400.
+
+    Rate-limited per client IP, same as login, to blunt automated abuse.
+    """
+    rate_error = _rate_limit_check(_client_ip(request))
+    if rate_error is not None:
+        return JSONResponse(status_code=429, content=rate_error)
+
+    from app import identity
+
+    email = (req.email or "").strip()
+    password = req.password or ""
+
+    try:
+        principal = await identity.signup(email, password)
+    except identity.EmailExists:
+        return JSONResponse(
+            status_code=409,
+            content=envelope(
+                "Email already registered",
+                detail="An account with that email already exists.",
+                kind="conflict",
+            ),
+        )
+    except ValueError as e:
+        return JSONResponse(
+            status_code=400,
+            content=envelope(
+                "Invalid signup",
+                detail=str(e) or "Email and a password of at least 6 "
+                                 "characters are required.",
+                kind="validation",
+            ),
+        )
+
+    log.info("auth/signup: created account for user=%r", email[:40])
+    return {
+        "ok": True,
+        "authenticated": True,
+        "username": principal.email,
+        "token": identity.mint_token(principal),
+        "token_ttl_hours": settings.auth_token_ttl_hours,
+        "auth_enabled": settings.auth_enabled,
+    }
+
+
 @api_router.post("/auth/login")
 async def auth_login(req: LoginRequest, request: Request) -> dict:
     """
@@ -278,12 +347,29 @@ async def auth_login(req: LoginRequest, request: Request) -> dict:
             ),
         )
 
-    # Phase 3: real credential check + HMAC-signed token. When
-    # ADMIN_USERNAME / ADMIN_PASSWORD are unset, check_admin_credentials
-    # falls back to the legacy APP_LOGIN_USER / APP_LOGIN_PASSWORD pair
-    # so existing dev environments keep working without env edits.
+    # Multi-tenant slice 1: real per-user accounts. Try the `users` table
+    # first — on a match we mint a *tenant-bearing* token from the resolved
+    # Principal. `authenticate` never raises and returns None on no-match,
+    # so we simply fall through to the legacy admin path below.
+    from app import identity
     from app.auth import check_admin_credentials, mint_token
 
+    principal = await identity.authenticate(username, password)
+    if principal is not None:
+        log.info("auth/login: success (account) for user=%r", username[:40])
+        return {
+            "ok": True,
+            "authenticated": True,
+            "username": principal.email,
+            "token": identity.mint_token(principal),
+            "token_ttl_hours": settings.auth_token_ttl_hours,
+            "auth_enabled": settings.auth_enabled,
+        }
+
+    # Legacy single-admin path — only active when ADMIN_USERNAME /
+    # ADMIN_PASSWORD are explicitly set (no hardcoded fallback). Mints a
+    # plain (tenant-less) HMAC token, exactly as before, so dev setups that
+    # relied on the admin login keep working when AUTH_ENABLED=false.
     if not check_admin_credentials(username, password):
         log.info("auth/login: rejected attempt for user=%r", username[:40])
         return JSONResponse(
@@ -299,7 +385,7 @@ async def auth_login(req: LoginRequest, request: Request) -> dict:
     # AUTH_TOKEN_SECRET — no server-side session store. Frontend sends it
     # back as `Authorization: Bearer ...` on every subsequent request,
     # and the auth middleware enforces when AUTH_ENABLED=true.
-    canonical_username = settings.admin_username or _APP_LOGIN_USER
+    canonical_username = settings.admin_username or username
     token = mint_token(canonical_username)
     log.info("auth/login: success for user=%r", username[:40])
     return {
@@ -313,8 +399,26 @@ async def auth_login(req: LoginRequest, request: Request) -> dict:
 
 
 @api_router.get("/auth/me")
-async def auth_me() -> dict:
-    """Google Drive auth status for the Upload page card."""
+async def auth_me(request: Request) -> dict:
+    """Identity of the caller, plus Google Drive auth status.
+
+    Multi-tenant slice 1: when a valid ``Authorization: Bearer <token>`` is
+    present (minted by signup/login), surface the account identity
+    ``{user_id, email, tenant_id}`` resolved from it. Absent / invalid
+    tokens fall through to the legacy response (Google Drive status for the
+    Upload page card), so today's behaviour is unchanged.
+    """
+    auth_hdr = request.headers.get("Authorization") or ""
+    if auth_hdr.lower().startswith("bearer "):
+        from app import identity
+        principal = identity.verify_token(auth_hdr[7:].strip())
+        if principal is not None:
+            return {
+                "user_id": principal.user_id,
+                "email": principal.email,
+                "tenant_id": principal.tenant_id,
+            }
+
     try:
         connected = await asyncio.to_thread(google_drive.is_connected)
     except Exception:
@@ -456,7 +560,11 @@ async def drive_sync(request: Request, body: DriveSyncRequest):
 # ---------------------------------------------------------------------------
 
 @api_router.get("/kpi")
-async def kpi_list(category: str | None = None, enabled_only: bool = True):
+async def kpi_list(
+    category: str | None = None,
+    enabled_only: bool = True,
+    principal: Principal = Depends(require_principal),
+):
     rows = await list_kpis(category=category, enabled_only=enabled_only)
     return {
         "count": len(rows),
@@ -480,7 +588,10 @@ async def kpi_list(category: str | None = None, enabled_only: bool = True):
 
 
 @api_router.get("/kpi/match")
-async def kpi_match_route(question: str):
+async def kpi_match_route(
+    question: str,
+    principal: Principal = Depends(require_principal),
+):
     """Resolve a natural-language question to a registered KPI."""
     m = await match_kpi(question)
     if m is None:
@@ -497,7 +608,10 @@ async def kpi_match_route(question: str):
 
 
 @api_router.get("/kpi/{kpi_id}")
-async def kpi_get(kpi_id: str):
+async def kpi_get(
+    kpi_id: str,
+    principal: Principal = Depends(require_principal),
+):
     kpi = await get_kpi(kpi_id)
     if kpi is None:
         return JSONResponse(status_code=404, content=envelope(
@@ -1059,6 +1173,7 @@ async def upload(
     file: UploadFile = File(...),
     target: str = Form("sales"),
     dedup_mode: str = Form(DEFAULT_DEDUP_MODE),
+    principal: Principal = Depends(require_principal),
 ):
     upload_log = logging.getLogger("agentic_ai.api.upload")
     rl = _rate_limit_check(_client_ip(request), bucket_namespace="upload", limit_per_minute=5)
@@ -1299,6 +1414,7 @@ async def upload(
 async def upload_workbook(
     request: Request,
     file: UploadFile = File(...),
+    principal: Principal = Depends(require_principal),
 ):
     upload_log = logging.getLogger("agentic_ai.api.upload_workbook")
     rl = _rate_limit_check(_client_ip(request), bucket_namespace="upload", limit_per_minute=5)
@@ -1425,7 +1541,13 @@ async def upload_workbook(
 # ---------------------------------------------------------------------------
 
 @api_router.get("/tables/dynamic")
-async def list_dynamic_tables_route():
+async def list_dynamic_tables_route(
+    principal: Principal = Depends(require_principal),
+):
+    # DATA-PATH route: lists u_* tables. Bind the query tenant so the listing
+    # resolves against the tenant's OWN schema rather than the default.
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(principal.tenant_id)
     return {"tables": list_dynamic_tables()}
 
 
@@ -1569,7 +1691,15 @@ async def upload_preview(
 # ---------------------------------------------------------------------------
 
 @api_router.get("/dashboard")
-async def dashboard(month: str | None = None):
+async def dashboard(
+    month: str | None = None,
+    principal: Principal = Depends(require_principal),
+):
+    # DATA-PATH route: reads u_* tables. Explicitly bind the query tenant so
+    # those reads resolve against the tenant's OWN schema (require_principal no
+    # longer drives search_path — identity and data isolation are decoupled).
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(principal.tenant_id)
     if month is not None and (len(month) != 7 or month[4] != "-"):
         return JSONResponse(status_code=400, content=envelope(
             "Invalid month",
@@ -1601,9 +1731,13 @@ async def dashboard(month: str | None = None):
 # ---------------------------------------------------------------------------
 
 @api_router.get("/uploads")
-async def uploads():
+async def uploads(
+    principal: Principal = Depends(require_principal),
+):
+    # First-party isolation: the uploads registry lives in ``public`` and is
+    # scoped by ``tenant_id`` so each tenant only sees their own datasets.
     return {
-        "uploads": await list_uploads_meta(),
+        "uploads": await list_uploads_meta(tenant_id=principal.tenant_id),
         "total_rows": {
             "sales":    await count_rows("sales"),
             "purchase": await count_rows("purchase"),
@@ -1669,11 +1803,14 @@ async def upload_unarchive(batch_id: str):
 
 
 @api_router.get("/datasets")
-async def datasets_view():
+async def datasets_view(
+    principal: Principal = Depends(require_principal),
+):
     """Single-call dataset management view. Returns the full upload
     inventory bucketed by status, plus live + archive row counts. The
     frontend dataset manager renders this directly."""
-    all_uploads = await list_uploads_meta(limit=1000)
+    # First-party isolation: scope the uploads registry to the caller's tenant.
+    all_uploads = await list_uploads_meta(limit=1000, tenant_id=principal.tenant_id)
     by_status: dict[str, list] = {"active": [], "archived": [], "error": [], "removed": []}
     for u in all_uploads:
         by_status.setdefault(u.get("status") or "active", []).append(u)
@@ -1734,6 +1871,67 @@ async def cache_clear():
     n = invalidate_all()
     new_version = bump_data_version()
     return {"cleared": n, "data_version": new_version}
+
+
+# ---------------------------------------------------------------------------
+# /conversations — read-only chat history (list / open / delete)
+# ---------------------------------------------------------------------------
+
+@api_router.get("/conversations")
+async def conversations_list(
+    principal: Principal = Depends(require_principal),
+):
+    """List recent chat conversations (most-recently-updated first).
+
+    First-party isolation: conversations live in ``public`` and are scoped by
+    ``tenant_id`` (require_principal no longer drives search_path), so each
+    tenant only sees their own history.
+    """
+    return {"conversations": await list_conversations(tenant_id=principal.tenant_id)}
+
+
+@api_router.get("/conversations/{conversation_id}")
+async def conversation_detail(
+    conversation_id: str,
+    principal: Principal = Depends(require_principal),
+):
+    """Return one conversation's metadata + its full message transcript."""
+    if not conversation_id or len(conversation_id) > 64:
+        return JSONResponse(status_code=400, content=envelope(
+            "Invalid conversation_id",
+            detail="conversation_id is empty or too long.",
+            kind="validation",
+        ))
+    convo = await get_conversation(conversation_id, tenant_id=principal.tenant_id)
+    if convo is None:
+        return JSONResponse(status_code=404, content=envelope(
+            "Conversation not found",
+            detail=f"No conversation with id {conversation_id}.",
+            kind="validation",
+        ))
+    return convo
+
+
+@api_router.delete("/conversations/{conversation_id}")
+async def conversation_delete(
+    conversation_id: str,
+    principal: Principal = Depends(require_principal),
+):
+    """Delete a conversation and all of its messages."""
+    if not conversation_id or len(conversation_id) > 64:
+        return JSONResponse(status_code=400, content=envelope(
+            "Invalid conversation_id",
+            detail="conversation_id is empty or too long.",
+            kind="validation",
+        ))
+    deleted = await delete_conversation(conversation_id, tenant_id=principal.tenant_id)
+    if not deleted:
+        return JSONResponse(status_code=404, content=envelope(
+            "Conversation not found",
+            detail=f"No conversation with id {conversation_id}.",
+            kind="validation",
+        ))
+    return {"deleted": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1871,9 +2069,17 @@ async def query_stream(req: QueryRequest, request: Request):
         question_chars=len(req.question),
     )
 
+    # Resolve the calling Principal so the turn carries its tenant. With AUTH
+    # off this is the implicit single-tenant ("public") principal, so behaviour
+    # is unchanged; with AUTH on it enforces a valid Bearer token (401 here
+    # before any streaming begins).
+    from app.tenant_context import require_principal
+    principal = await require_principal(request)
+
     initial = TurnState(
         question=req.question,
         conversation_id=req.conversation_id,
+        tenant_id=principal.tenant_id,
     )
     runner_task = _safe_create_task(_runner(initial, emitter))
     heartbeat_task = _safe_create_task(_heartbeat(emitter))
@@ -1919,6 +2125,18 @@ async def lifespan(_app: FastAPI):
     #      server binds immediately and Render's health-check grace period
     #      isn't consumed.  Every step inside _startup() is already wrapped
     #      in try/except, so errors are logged but the server stays up.
+    # Postgres-required guard. MetricAi no longer supports SQLite as a
+    # runtime engine; refuse to start without a Postgres DATABASE_URL.
+    # This lives in the lifespan startup path ONLY (not at import/settings
+    # time) so direct unit tests that call functions in isolation are
+    # unaffected.
+    from app.db_engine import is_postgres
+    if not is_postgres():
+        raise RuntimeError(
+            "MetricAi now requires PostgreSQL. Set DATABASE_URL to your Supabase/Postgres "
+            "connection string. (SQLite is no longer a supported runtime engine.)"
+        )
+
     try:
         from app.infrastructure import init_database
         await init_database()
@@ -1975,6 +2193,7 @@ app.add_middleware(
 _AUTH_PUBLIC_PREFIXES = (
     "/health",
     "/auth/login",
+    "/auth/signup",
     "/auth/me",
     "/auth/google/login",
     "/auth/google/callback",
@@ -2280,7 +2499,10 @@ async def _startup() -> None:
         _app_log.exception("vector vocabulary bootstrap failed (continuing without)")
 
     _app_log.info("sentry: %s", sentry_status())
-    _app_log.info("auth: DISABLED — all routes public")
+    _app_log.info(
+        "auth: %s",
+        "ENABLED (login required)" if settings.auth_enabled else "DISABLED — all routes public",
+    )
 
     # Drive the mounted FastMCP sub-app's lifespan — Starlette does not run
     # lifespans of mounted ASGI apps, so the streamable-HTTP session manager

@@ -240,6 +240,26 @@ export interface DriveSyncResult {
   rows_inserted_total: number
 }
 
+// Chat session history (read-only "Recents"). Server-sourced metadata for one
+// stored conversation. Lives in the backend DB (conversations table) and is
+// listed recency-first by the Recents sidebar.
+export interface SessionMeta {
+  id: string
+  title: string
+  updated_at: string
+  message_count: number
+}
+
+// Shape of a single server-stored message as returned by GET /conversations/{id}.
+// Mapped into the frontend's ChatMessage by getConversation().
+interface ServerConversationMessage {
+  id: string
+  role: ChatRole
+  content: string
+  chart?: SalesChart | null
+  created_at: string
+}
+
 // ---------------------------------------------------------------------------
 // 2. Class-name helper
 // ---------------------------------------------------------------------------
@@ -490,6 +510,30 @@ export async function loginWith(
   return result
 }
 
+// Create a new account. POST /auth/signup { email, password } -> { token }.
+// On success the backend mints a tenant-bearing token; we store it through the
+// exact same path loginWith uses (setAuthToken) so the app becomes
+// authenticated identically. The username slot is set to the email so the
+// shell has something to display. Reuses safeFetch / BASE_URL / ApiError.
+export async function signupWith(email: string, password: string): Promise<void> {
+  const res = await safeFetch(`${BASE_URL}/auth/signup`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => undefined)
+    throw new ApiError(
+      (detail as { detail?: string } | undefined)?.detail
+        ?? `Sign up failed (HTTP ${res.status})`,
+      res.status,
+      detail,
+    )
+  }
+  const result = (await res.json()) as { token: string }
+  useAppStore.getState().setAuthToken(result.token, email)
+}
+
 // Clear the local auth state. Renamed from `logout` because the codebase
 // already has a Google-Drive `logout()` that hits POST /auth/logout —
 // keeping the names distinct prevents a TS duplicate-declaration error
@@ -596,6 +640,45 @@ export async function syncDrive(
   })
 }
 
+// ---------------------------------------------------------------------------
+// Chat session history (read-only "Recents"). All three reuse the same
+// BASE_URL + auth-header + error-handling primitives as apiGet/apiPost, so
+// the backend origin is never hardcoded here.
+// ---------------------------------------------------------------------------
+
+export async function listConversations(): Promise<SessionMeta[]> {
+  const { conversations } = await apiGet<{ conversations: SessionMeta[] }>('/conversations')
+  return conversations ?? []
+}
+
+export async function getConversation(
+  id: string,
+): Promise<{ id: string; title: string; messages: ChatMessage[] }> {
+  const data = await apiGet<{
+    id: string
+    title: string
+    messages: ServerConversationMessage[]
+  }>(`/conversations/${encodeURIComponent(id)}`)
+  const messages: ChatMessage[] = (data.messages ?? []).map((m) => ({
+    id: m.id,
+    role: m.role,
+    content: m.content,
+    chart: m.chart ?? null,
+    status: 'done' as ChatStatus,
+    toolEvents: [],
+    timestamp: m.created_at,
+  }))
+  return { id: data.id, title: data.title, messages }
+}
+
+export async function deleteConversation(id: string): Promise<void> {
+  const res = await safeFetch(`${BASE_URL}/conversations/${encodeURIComponent(id)}`, withAuthHeader({
+    method: 'DELETE',
+    headers: buildHeaders(),
+  }))
+  await handle<{ deleted: boolean }>(res, `DELETE /conversations/${id}`)
+}
+
 export async function streamAIQuery(
   message: string,
   onEvent: (e: SseEvent) => void,
@@ -657,6 +740,16 @@ interface AppState {
   isStreaming: boolean
   conversationId: string
 
+  // Read-only "Recents" history. Transient + server-sourced: never persisted
+  // (not in the persist partialize) — re-fetched from the backend on mount and
+  // after each turn. `viewingSessionId` is the id of the session currently being
+  // viewed read-only, or null when the live chat is active. `viewedMessages`
+  // holds the fetched read-only transcript so the LIVE `chatHistory` is left
+  // completely untouched while a session is open.
+  sessions: SessionMeta[]
+  viewingSessionId: string | null
+  viewedMessages: ChatMessage[]
+
   // Latest `data_version` observed from any server response. Used by the
   // Dashboard to auto-reload when the server's data has changed.
   serverDataVersion: number | null
@@ -688,6 +781,15 @@ interface AppState {
   setStreaming: (b: boolean) => void
   rotateConversation: () => void
 
+  // Recents actions. refreshSessions re-pulls the server list; openSession
+  // fetches a transcript and shows it read-only; closeSession returns to the
+  // live chat; removeSession deletes server-side then refreshes (and closes the
+  // viewer if the deleted session was open).
+  refreshSessions: () => Promise<void>
+  openSession: (id: string) => Promise<void>
+  closeSession: () => void
+  removeSession: (id: string) => Promise<void>
+
   // Auth setters
   setAuthToken: (token: string | null, username?: string | null) => void
   setAuthEnabled: (enabled: boolean) => void
@@ -715,7 +817,7 @@ const newConversationId = (): string => {
 
 export const useAppStore = create<AppState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       shop: emptyShop,
       dataset: null,
       filters: { month: defaultMonth() },
@@ -723,6 +825,10 @@ export const useAppStore = create<AppState>()(
       chatHistory: [],
       isStreaming: false,
       conversationId: newConversationId(),
+
+      sessions: [],
+      viewingSessionId: null,
+      viewedMessages: [],
 
       serverDataVersion: null,
       conversationStartVersion: null,
@@ -757,6 +863,41 @@ export const useAppStore = create<AppState>()(
           conversationId: newConversationId(),
           conversationStartVersion: null,
         }),
+
+      // --- Recents (read-only history) --------------------------------------
+      // All defensive: a history-list/fetch/delete failure must never break the
+      // live chat, so each swallows its error after logging.
+      refreshSessions: async () => {
+        try {
+          const sessions = await listConversations()
+          set({ sessions })
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.error('[sessions] refresh failed', e)
+        }
+      },
+      openSession: async (id) => {
+        try {
+          const convo = await getConversation(id)
+          // Stash into viewedMessages — never the live chatHistory — so the
+          // live conversation survives untouched behind the read-only view.
+          set({ viewingSessionId: id, viewedMessages: convo.messages })
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.error('[sessions] open failed', e)
+        }
+      },
+      closeSession: () => set({ viewingSessionId: null, viewedMessages: [] }),
+      removeSession: async (id) => {
+        try {
+          await deleteConversation(id)
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.error('[sessions] delete failed', e)
+        }
+        if (get().viewingSessionId === id) set({ viewingSessionId: null, viewedMessages: [] })
+        await get().refreshSessions()
+      },
 
       setAuthToken: (token, username) =>
         set((s) => ({ auth: { ...s.auth, token, username: username ?? s.auth.username } })),

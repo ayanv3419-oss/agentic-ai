@@ -85,6 +85,12 @@ class TurnState(BaseModel):
     turn_id: str = Field(default_factory=lambda: f"turn-{uuid.uuid4().hex[:12]}")
     question: str
     conversation_id: str | None = None
+    # Tenant that owns this turn. Defaults to the implicit single-tenant
+    # sentinel (tenant_context.DEFAULT_TENANT_ID == "public") so every
+    # existing constructor and AUTH-off request behaves exactly as today.
+    # The request boundary (/query_stream) overrides this from the resolved
+    # Principal; downstream WRITES (conversation persistence) read it.
+    tenant_id: str = "public"
     started_at: float = Field(default_factory=time.time)
 
     # Routing ------------------------------------------------------------

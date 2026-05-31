@@ -463,6 +463,76 @@ _UPLOADS_INDEXES: tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Chat sessions (read-only history). Timestamps are stored as TEXT ISO
+# strings in BOTH engines (passed from Python) to avoid datetime('now') vs
+# NOW() / TIMESTAMPTZ divergence. The schema is all TEXT/INTEGER, so the
+# SAME CREATE TABLE / CREATE INDEX strings are applied in the SQLite branch
+# AND in _init_database_postgres().
+# ---------------------------------------------------------------------------
+
+_CONVERSATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS conversations (
+    id            TEXT PRIMARY KEY,
+    title         TEXT NOT NULL DEFAULT '',
+    tenant_id     TEXT,                              -- nullable; multi-user readiness, unused now
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+_CONVERSATION_MESSAGES_DDL = """
+CREATE TABLE IF NOT EXISTS conversation_messages (
+    id              TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    role            TEXT NOT NULL,                   -- 'user' | 'assistant'
+    content         TEXT NOT NULL DEFAULT '',
+    chart_json      TEXT,                            -- json.dumps(chart) or NULL
+    created_at      TEXT NOT NULL
+)
+"""
+
+_CONVERSATIONS_INDEXES: tuple[str, ...] = (
+    'CREATE INDEX IF NOT EXISTS idx_convo_messages_cid '
+    'ON conversation_messages(conversation_id, created_at)',
+    'CREATE INDEX IF NOT EXISTS idx_conversations_updated '
+    'ON conversations(updated_at)',
+)
+
+
+# ---------------------------------------------------------------------------
+# Identity / Auth foundation (multi-tenant slice 1). Per-user accounts plus a
+# tenant per owner. Additive and OFF by default (the routes that consume these
+# only enforce when AUTH_ENABLED=true). All-TEXT schema with Python-supplied
+# timestamps, so the SAME CREATE TABLE / CREATE INDEX strings apply in the
+# SQLite branch AND in _init_database_postgres() — exactly like the
+# conversations tables above.
+# ---------------------------------------------------------------------------
+
+_USERS_DDL = """
+CREATE TABLE IF NOT EXISTS users (
+    id            TEXT PRIMARY KEY,
+    email         TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+)
+"""
+
+_TENANTS_DDL = """
+CREATE TABLE IF NOT EXISTS tenants (
+    id             TEXT PRIMARY KEY,
+    owner_user_id  TEXT NOT NULL,
+    name           TEXT,
+    created_at     TEXT NOT NULL
+)
+"""
+
+_IDENTITY_INDEXES: tuple[str, ...] = (
+    'CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)',
+)
+
+
 def uploads_dir() -> Path:
     """Permanent directory for source CSV/XLSX files. Files live here until
     the user explicitly disconnects the dataset — never auto-cleaned."""
@@ -794,9 +864,46 @@ async def _init_database_postgres() -> None:
             'CREATE INDEX IF NOT EXISTS idx_error_log_occurred '
             'ON error_log(occurred_at DESC)'
         )
+        # Chat sessions (read-only history) — identical TEXT/INTEGER schema
+        # as SQLite, so the same DDL/index strings apply here.
+        await db.execute(_CONVERSATIONS_DDL)
+        await db.execute(_CONVERSATION_MESSAGES_DDL)
+        for stmt in _CONVERSATIONS_INDEXES:
+            await db.execute(stmt)
+        # Identity / auth foundation — additive, all-TEXT, same DDL as SQLite.
+        await db.execute(_USERS_DDL)
+        await db.execute(_TENANTS_DDL)
+        for stmt in _IDENTITY_INDEXES:
+            await db.execute(stmt)
+        # Multi-tenant slice 2a — additive tenant_id scaffolding (PG-native,
+        # idempotent). The 'public' sentinel is tenant_context.DEFAULT_TENANT_ID.
+        # No RLS and no read-scoping in this step; existing rows backfilled so
+        # nothing disappears from any list. SQLite branch is intentionally
+        # untouched (it goes dormant once Postgres is required).
+        await db.execute(
+            "ALTER TABLE uploads "
+            "ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'public'"
+        )
+        await db.execute(
+            "ALTER TABLE conversation_messages "
+            "ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'public'"
+        )
+        # conversations already has a nullable tenant_id from Slice 1:
+        # backfill existing NULLs, then set the column DEFAULT.
+        await db.execute(
+            "UPDATE conversations SET tenant_id = 'public' "
+            "WHERE tenant_id IS NULL"
+        )
+        await db.execute(
+            "ALTER TABLE conversations ALTER COLUMN tenant_id SET DEFAULT 'public'"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversations_tenant "
+            "ON conversations(tenant_id, updated_at)"
+        )
     log.info(
         "postgres DB initialized (minimum schema: uploads + error_log "
-        "+ _column_profile + _relationships)"
+        "+ _column_profile + _relationships + conversations + users/tenants)"
     )
 
 
@@ -910,6 +1017,16 @@ async def init_database() -> None:
         # Error-log table.
         await db.execute(_ERROR_LOG_DDL)
         for stmt in _ERROR_LOG_INDEXES:
+            await db.execute(stmt)
+        # Chat sessions (read-only history) — idempotent.
+        await db.execute(_CONVERSATIONS_DDL)
+        await db.execute(_CONVERSATION_MESSAGES_DDL)
+        for stmt in _CONVERSATIONS_INDEXES:
+            await db.execute(stmt)
+        # Identity / auth foundation (multi-tenant slice 1) — idempotent.
+        await db.execute(_USERS_DDL)
+        await db.execute(_TENANTS_DDL)
+        for stmt in _IDENTITY_INDEXES:
             await db.execute(stmt)
         await db.commit()
     log.info("financial DB initialized at %s", p)
@@ -1072,7 +1189,7 @@ async def record_upload_meta(
     # Replaces the prior `INSERT OR REPLACE` which was SQLite-only.
     async with get_connection() as db:
         await db.execute(
-            """INSERT INTO uploads
+            """INSERT INTO public.uploads
                (batch_id, filename, target, rows_inserted, rows_failed,
                 source, status, min_date, max_date, error_message, file_path,
                 file_hash, file_bytes, dedup_mode,
@@ -1102,17 +1219,23 @@ async def record_upload_meta(
         await db.commit()
 
 
-async def list_uploads_meta(limit: int = 200) -> list[dict[str, Any]]:
+async def list_uploads_meta(
+    limit: int = 200, *, tenant_id: str = "public"
+) -> list[dict[str, Any]]:
+    """List uploads for one tenant (default 'public'). The uploads table
+    lives in `public` and isolates via `WHERE tenant_id = ?` (slice 2a
+    stamps tenant_id on every write)."""
     return await fetch_all(
-        f"SELECT {_UPLOAD_META_COLS} FROM uploads "
+        f"SELECT {_UPLOAD_META_COLS} FROM public.uploads "
+        "WHERE tenant_id = ? "
         "ORDER BY uploaded_at DESC LIMIT ?",
-        (limit,),
+        (tenant_id, limit),
     )
 
 
 async def get_upload_meta(batch_id: str) -> dict[str, Any] | None:
     return await fetch_one(
-        f"SELECT {_UPLOAD_META_COLS} FROM uploads WHERE batch_id = ?",
+        f"SELECT {_UPLOAD_META_COLS} FROM public.uploads WHERE batch_id = ?",
         (batch_id,),
     )
 
@@ -1123,7 +1246,7 @@ async def find_active_upload_by_file_hash(file_hash: str) -> dict[str, Any] | No
     if not file_hash:
         return None
     return await fetch_one(
-        f"SELECT {_UPLOAD_META_COLS} FROM uploads "
+        f"SELECT {_UPLOAD_META_COLS} FROM public.uploads "
         "WHERE file_hash = ? AND status = 'active' "
         "ORDER BY uploaded_at DESC LIMIT 1",
         (file_hash,),
@@ -1180,7 +1303,7 @@ async def archive_upload(batch_id: str) -> dict[str, Any]:
                 f'DELETE FROM {live_t} WHERE batch_id = ?', (batch_id,),
             )
         await db.execute(
-            "UPDATE uploads SET status='archived' WHERE batch_id = ?",
+            "UPDATE public.uploads SET status='archived' WHERE batch_id = ?",
             (batch_id,),
         )
         await db.commit()
@@ -1228,7 +1351,7 @@ async def unarchive_upload(batch_id: str) -> dict[str, Any]:
                 f'DELETE FROM {arch_t} WHERE batch_id = ?', (batch_id,),
             )
         await db.execute(
-            "UPDATE uploads SET status='active' WHERE batch_id = ?",
+            "UPDATE public.uploads SET status='active' WHERE batch_id = ?",
             (batch_id,),
         )
         await db.commit()
@@ -1250,7 +1373,7 @@ async def _disconnect_workbook(batch_id: str, meta: dict[str, Any]) -> dict[str,
         if _is_pg():
             cur = await db.execute(
                 "SELECT table_name AS name FROM information_schema.tables "
-                "WHERE table_schema='public' AND table_name LIKE 'u\\_%' ESCAPE '\\'"
+                "WHERE table_schema = current_schema() AND table_name LIKE 'u\\_%' ESCAPE '\\'"
             )
         else:
             cur = await db.execute(
@@ -1265,7 +1388,7 @@ async def _disconnect_workbook(batch_id: str, meta: dict[str, Any]) -> dict[str,
             if _is_pg():
                 cur = await db.execute(
                     "SELECT column_name AS name FROM information_schema.columns "
-                    "WHERE table_schema='public' AND table_name=?",
+                    "WHERE table_schema = current_schema() AND table_name=?",
                     (t,),
                 )
             else:
@@ -1280,7 +1403,7 @@ async def _disconnect_workbook(batch_id: str, meta: dict[str, Any]) -> dict[str,
             rows_removed += getattr(cur, "rowcount", 0) or 0
             await cur.close()
         await db.execute(
-            "UPDATE uploads SET status='removed' WHERE batch_id = ?",
+            "UPDATE public.uploads SET status='removed' WHERE batch_id = ?",
             (batch_id,),
         )
         await db.commit()
@@ -1350,7 +1473,7 @@ async def disconnect_upload(batch_id: str) -> dict[str, Any]:
         rows_removed += (cur.rowcount or 0)
         await cur.close()
         await db.execute(
-            "UPDATE uploads SET status='removed' WHERE batch_id = ?",
+            "UPDATE public.uploads SET status='removed' WHERE batch_id = ?",
             (batch_id,),
         )
         await db.commit()

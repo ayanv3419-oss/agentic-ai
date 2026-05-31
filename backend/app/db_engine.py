@@ -26,6 +26,7 @@ small so it's predictable.
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import re
@@ -33,6 +34,36 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Iterable
 
 log = logging.getLogger("agentic_ai.db_engine")
+
+
+# ---------------------------------------------------------------------------
+# Multi-tenant: per-request current tenant + schema isolation
+# ---------------------------------------------------------------------------
+# A per-request contextvar holds the active tenant id. pg_connection() reads it
+# and points search_path at that tenant's schema. The default "public" maps to
+# the existing `public` schema, so AUTH-off / single-tenant behavior is
+# byte-for-byte unchanged. This module is a LEAF — it must NOT import
+# app.tenant_context or app.identity (would create an import cycle); the
+# contextvar is set by tenant_context.require_principal instead.
+current_tenant_var: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "current_tenant", default="public"
+)
+
+
+def tenant_schema(tenant_id: str | None) -> str:
+    """Map a tenant id to its Postgres schema name.
+
+    The default tenant ``"public"`` (``DEFAULT_TENANT_ID``, AUTH-off) maps to the
+    existing ``public`` schema. Any real tenant id maps to ``t_<sanitized>``.
+    Schema names are interpolated into SQL (identifiers can't be parameterized),
+    so the id is sanitized to ``[a-z0-9_]`` here — this is the ONLY place schema
+    names are derived, which keeps them identifier-injection safe.
+    """
+    t = (tenant_id or "public").strip().lower()
+    if t == "public":
+        return "public"
+    safe = "".join(ch for ch in t if ch.isalnum() or ch == "_")
+    return f"t_{safe}" if safe else "public"
 
 
 # ---------------------------------------------------------------------------
@@ -341,18 +372,77 @@ class _PgConnection:
 
 @asynccontextmanager
 async def pg_connection() -> AsyncIterator[_PgConnection]:
-    """Acquire a connection from the pool, wrapped in the aiosqlite shim."""
+    """Acquire a connection from the pool, wrapped in the aiosqlite shim.
+
+    Before yielding, point ``search_path`` at the current tenant's schema (read
+    from ``current_tenant_var``) so unqualified table references and
+    ``information_schema`` introspection resolve to the tenant's OWN schema. When
+    the tenant is ``"public"`` (the default) the search_path is left untouched —
+    byte-for-byte identical to the pre-multitenant behavior.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        yield _PgConnection(conn)
+        schema = tenant_schema(current_tenant_var.get())
+        if schema == "public":
+            # Default tenant: leave the search_path untouched — byte-for-byte the
+            # pre-multitenant behavior.
+            yield _PgConnection(conn)
+        else:
+            # Real tenant: wrap the whole block in ONE transaction and SET LOCAL the
+            # search_path. SET LOCAL is transaction-scoped, which means it (a) applies
+            # reliably on Supabase's transaction pooler — a session-level `SET` would
+            # NOT persist across pooled statements there — and (b) auto-resets at
+            # COMMIT, so a pooled connection can never leak this tenant's search_path
+            # into a later request for a different tenant.
+            #
+            # STRICT (slice 2c): the tenant schema ONLY — NO `, public` fallback. A
+            # missing table must error inside the tenant's own schema rather than
+            # silently resolving to another tenant's (or the shared public) data.
+            # First-party tables that legitimately live in public are reached by
+            # callers that qualify them explicitly (e.g. `public.conversations`).
+            async with conn.transaction():
+                await conn.execute(f'SET LOCAL search_path TO "{schema}"')
+                yield _PgConnection(conn)
+
+
+async def ensure_tenant_schema(tenant_id: str) -> None:
+    """Idempotently provision a tenant's schema (``CREATE SCHEMA IF NOT EXISTS``).
+
+    Additive and safe to call repeatedly. The ``"public"`` tenant already has its
+    schema, so it's a no-op. Runs on a fresh connection with the default
+    search_path (the tenant is intentionally NOT set on this connection)."""
+    schema = tenant_schema(tenant_id)
+    if schema == "public":
+        return
+    async with pg_connection() as db:  # default search_path (tenant not set yet)
+        await db.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+
+
+@asynccontextmanager
+async def tenant_pg_connection(tenant_id: str) -> AsyncIterator[_PgConnection]:
+    """Like pg_connection, but binds the tenant for the transaction via a
+    transaction-local GUC (`app.current_tenant`). Added for multi-tenant
+    slice 2a: it's a harmless no-op until RLS policies read that GUC in a
+    later step. Yields the same aiosqlite shim so call sites are unchanged."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT set_config('app.current_tenant', $1, true)", tenant_id
+            )
+            yield _PgConnection(conn)
 
 
 __all__ = [
     "close_pool",
+    "current_tenant_var",
     "database_url",
     "engine_kind",
+    "ensure_tenant_schema",
     "get_pool",
     "is_postgres",
     "pg_connection",
+    "tenant_pg_connection",
+    "tenant_schema",
     "translate_sql",
 ]

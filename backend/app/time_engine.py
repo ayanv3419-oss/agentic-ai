@@ -118,7 +118,7 @@ async def _scan_max_date() -> str | None:
         if _is_pg():
             u_tables = await fetch_all(
                 "SELECT table_name AS name FROM information_schema.tables "
-                "WHERE table_schema='public' "
+                "WHERE table_schema=current_schema() "
                 "AND table_name LIKE 'u\\_%' ESCAPE '\\'"
             )
         else:
@@ -138,7 +138,7 @@ async def _scan_max_date() -> str | None:
                 cols = await fetch_all(
                     "SELECT column_name AS name "
                     "FROM information_schema.columns "
-                    "WHERE table_schema='public' AND table_name=?",
+                    "WHERE table_schema=current_schema() AND table_name=?",
                     (name,),
                 )
             else:

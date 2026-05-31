@@ -75,7 +75,7 @@ async def _list_user_tables() -> list[dict[str, Any]]:
             # Postgres: list u_* tables from information_schema.
             cur = await db.execute(
                 "SELECT table_name AS name FROM information_schema.tables "
-                "WHERE table_schema = 'public' "
+                "WHERE table_schema = current_schema() "
                 "AND table_name LIKE 'u\\_%' ESCAPE '\\' "
                 "ORDER BY table_name"
             )
@@ -88,7 +88,7 @@ async def _list_user_tables() -> list[dict[str, Any]]:
                 cur2 = await db.execute(
                     "SELECT column_name AS name, data_type AS type "
                     "FROM information_schema.columns "
-                    "WHERE table_schema = 'public' AND table_name = ? "
+                    "WHERE table_schema = current_schema() AND table_name = ? "
                     "ORDER BY ordinal_position",
                     (name,),
                 )
@@ -428,7 +428,7 @@ async def _load_pg_foreign_keys(live_tables: set[str]) -> list[dict[str, Any]]:
         "  ON tc.constraint_name = ccu.constraint_name "
         " AND tc.table_schema    = ccu.table_schema "
         "WHERE tc.constraint_type = 'FOREIGN KEY' "
-        "  AND tc.table_schema    = 'public'"
+        "  AND tc.table_schema    = current_schema()"
     )
     try:
         async with pg_connection() as db:

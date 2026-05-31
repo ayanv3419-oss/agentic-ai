@@ -1,4 +1,4 @@
-# Deployment Guide — Agentic AI Platform
+# Deployment Guide — Metric AI Platform
 
 > Backend → Render | Frontend → Vercel
 > Last updated: 2025-05-15

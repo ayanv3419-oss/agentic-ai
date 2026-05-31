@@ -269,7 +269,7 @@ class DashboardAgent:
             if is_postgres():
                 cur = await db.execute(
                     "SELECT table_name AS name FROM information_schema.tables "
-                    "WHERE table_schema='public' "
+                    "WHERE table_schema=current_schema() "
                     "AND table_name LIKE 'u\\_%' ESCAPE '\\' "
                     "ORDER BY table_name"
                 )
@@ -289,7 +289,7 @@ class DashboardAgent:
                     cur2 = await db.execute(
                         "SELECT column_name AS name, data_type AS type "
                         "FROM information_schema.columns "
-                        "WHERE table_schema='public' AND table_name=? "
+                        "WHERE table_schema=current_schema() AND table_name=? "
                         "ORDER BY ordinal_position",
                         (name,),
                     )
@@ -313,7 +313,21 @@ class DashboardAgent:
         #    concepts can't be resolved, return an empty (but well-shaped)
         #    payload so the frontend renders zero-state instead of crashing.
         from app.schema_mapping import resolve_schema
-        user_tables = await self._list_user_tables_for_resolver()
+        # A brand-new tenant's schema may have no u_* tables yet — or, on
+        # Postgres, the schema may not even be provisioned when the dashboard
+        # is first opened. Introspection runs under the tenant's search_path
+        # (set centrally by require_principal), so a missing schema / missing
+        # relation surfaces here as a DB error. Treat ANY such failure the
+        # same as "no data yet" and return the zeroed dashboard the frontend
+        # already renders, instead of 500ing a fresh account's first visit.
+        # When introspection succeeds (e.g. the public tenant with real data)
+        # this is byte-for-byte the previous behavior.
+        try:
+            user_tables = await self._list_user_tables_for_resolver()
+        except Exception as e:
+            return self._empty_payload(
+                month, f"schema introspection failed (no tables yet?): {e}"
+            )
         if not user_tables:
             return self._empty_payload(month, "no u_* tables uploaded yet")
         resolved = resolve_schema(user_tables)

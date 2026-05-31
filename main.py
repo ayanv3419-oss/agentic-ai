@@ -1,4 +1,4 @@
-"""Agentic AI — single-command launcher.
+"""Metric AI — single-command launcher.
 
 Usage:
     python main.py

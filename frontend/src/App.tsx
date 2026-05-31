@@ -32,7 +32,9 @@ import {
   LayoutDashboard,
   LogOut,
   MessageSquare,
+  MessageSquarePlus,
   Sparkles,
+  Trash2,
   Upload,
 } from 'lucide-react'
 
@@ -42,6 +44,7 @@ import {
   fetchUploadsList,
   loginWith,
   probeAuthEnabled,
+  signupWith,
   useAppStore,
 } from '@/client_core'
 import type { NavKey } from '@/client_core'
@@ -94,16 +97,41 @@ interface SidebarProps {
 }
 
 function Sidebar({ active, onSelect, onLogout }: SidebarProps) {
+  const sessions = useAppStore((s) => s.sessions)
+  const viewingSessionId = useAppStore((s) => s.viewingSessionId)
+  const refreshSessions = useAppStore((s) => s.refreshSessions)
+  const openSession = useAppStore((s) => s.openSession)
+  const closeSession = useAppStore((s) => s.closeSession)
+  const removeSession = useAppStore((s) => s.removeSession)
+  const clearChat = useAppStore((s) => s.clearChat)
+
+  // Keep Recents fresh: pull on mount. AiAssistant also refreshes after each
+  // turn (same store), so newly-created sessions surface here automatically.
+  useEffect(() => {
+    void refreshSessions()
+  }, [refreshSessions])
+
+  // "New chat" and opening a past session both jump into the AI Assistant view.
+  const startNewChat = () => {
+    clearChat()
+    closeSession()
+    onSelect('ai')
+  }
+  const openChat = (id: string) => {
+    void openSession(id)
+    onSelect('ai')
+  }
+
   return (
-    <aside className="w-64 shrink-0 bg-zinc-950 border-r border-zinc-800 flex flex-col">
-      <div className="px-5 h-16 flex items-center gap-2 border-b border-zinc-800">
+    <aside className="w-64 shrink-0 bg-zinc-950 border-r border-zinc-800 flex flex-col min-h-0">
+      <div className="px-5 h-16 flex items-center gap-2 border-b border-zinc-800 shrink-0">
         <div className="w-7 h-7 rounded-md bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
           <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
         </div>
-        <div className="font-semibold tracking-tight">Agentic AI</div>
+        <div className="font-semibold tracking-tight">Metric AI</div>
       </div>
 
-      <nav className="flex-1 p-3 space-y-1">
+      <nav className="p-3 space-y-1 shrink-0">
         {ITEMS.map((item) => {
           const Icon = item.icon
           const isActive = active === item.key
@@ -133,7 +161,68 @@ function Sidebar({ active, onSelect, onLogout }: SidebarProps) {
         })}
       </nav>
 
-      <div className="p-3 border-t border-zinc-800 space-y-2">
+      {/* Chat sessions — New chat + recency-ordered history (ChatGPT-style). */}
+      <div className="px-3 pt-2 pb-2 shrink-0 border-t border-zinc-800/70">
+        <button
+          type="button"
+          onClick={startNewChat}
+          className="btn btn-secondary w-full justify-center h-9"
+          title="New chat"
+        >
+          <MessageSquarePlus className="w-3.5 h-3.5" />
+          <span>New chat</span>
+        </button>
+      </div>
+
+      <div className="px-3 pb-1 shrink-0">
+        <p className="text-[10px] font-medium uppercase tracking-wide text-zinc-600">Recents</p>
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-y-auto px-2 pb-3 space-y-0.5">
+        {sessions.length === 0 ? (
+          <p className="px-2 py-3 text-xs text-zinc-600">No conversations yet.</p>
+        ) : (
+          sessions.map((s) => {
+            const isOpen = active === 'ai' && s.id === viewingSessionId
+            return (
+              <div
+                key={s.id}
+                className={cn(
+                  'group relative flex items-center rounded-lg transition-colors',
+                  isOpen ? 'bg-zinc-800/80' : 'hover:bg-zinc-900',
+                )}
+              >
+                <button
+                  type="button"
+                  onClick={() => openChat(s.id)}
+                  title={s.title || 'Untitled conversation'}
+                  className={cn(
+                    'flex-1 min-w-0 flex items-center gap-2 px-2.5 py-2 text-left',
+                    isOpen ? 'text-zinc-100' : 'text-zinc-400 group-hover:text-zinc-200',
+                  )}
+                >
+                  <MessageSquare className="w-3.5 h-3.5 shrink-0 text-zinc-600" />
+                  <span className="truncate text-sm">{s.title || 'Untitled conversation'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    void removeSession(s.id)
+                  }}
+                  title="Delete conversation"
+                  aria-label="Delete conversation"
+                  className="absolute right-1 opacity-0 group-hover:opacity-100 focus:opacity-100 p-1.5 rounded-md text-zinc-500 hover:text-red-400 hover:bg-zinc-800 transition-opacity"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )
+          })
+        )}
+      </div>
+
+      <div className="p-3 border-t border-zinc-800 space-y-2 shrink-0">
         <button
           type="button"
           onClick={onLogout}
@@ -163,7 +252,7 @@ function TopBar() {
           <div className="text-xs text-zinc-500 truncate">{shop.ownerName}</div>
         ) : null}
         <div className="text-sm font-medium text-zinc-100 truncate">
-          {shop.shopName || 'Agentic AI'}
+          {shop.shopName || 'Metric AI'}
         </div>
       </div>
       <div className="flex items-center gap-4 text-xs text-zinc-500">
@@ -256,25 +345,52 @@ class ErrorBoundary extends React.Component<
 // dashboard, matching today's behaviour. Phase-3 wiring; the actual
 // credentials live in ADMIN_USERNAME / ADMIN_PASSWORD env vars.
 // ===========================================================================
+type AuthMode = 'login' | 'signup'
+
 function LoginGate({ onSuccess }: { onSuccess: () => void }) {
-  const [username, setUsername] = useState('')
+  const [mode, setMode] = useState<AuthMode>('login')
+  // Login accepts a username OR email (backend admin login is username-based);
+  // signup is strictly email-based. One field backs both — its label changes
+  // with the mode.
+  const [identifier, setIdentifier] = useState('')
   const [password, setPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  const isSignup = mode === 'signup'
+
+  const switchMode = (next: AuthMode) => {
+    if (next === mode) return
+    setMode(next)
+    setError(null)
+  }
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!username || !password) {
-      setError('Username and password are both required.')
+    if (!identifier || !password) {
+      setError(
+        isSignup
+          ? 'Email and password are both required.'
+          : 'Username and password are both required.',
+      )
+      return
+    }
+    if (isSignup && password.length < 6) {
+      setError('Password must be at least 6 characters.')
       return
     }
     setSubmitting(true)
     setError(null)
     try {
-      await loginWith(username, password)
+      if (isSignup) {
+        await signupWith(identifier, password)
+      } else {
+        await loginWith(identifier, password)
+      }
       onSuccess()
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Login failed'
+      const fallback = isSignup ? 'Sign up failed' : 'Login failed'
+      const msg = e instanceof Error ? e.message : fallback
       setError(msg)
     } finally {
       setSubmitting(false)
@@ -292,17 +408,50 @@ function LoginGate({ onSuccess }: { onSuccess: () => void }) {
             <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
           </div>
           <div>
-            <div className="font-semibold tracking-tight">Agentic AI</div>
-            <div className="text-[11px] text-zinc-500">Sign in to continue</div>
+            <div className="font-semibold tracking-tight">Metric AI</div>
+            <div className="text-[11px] text-zinc-500">
+              {isSignup ? 'Create an account to continue' : 'Sign in to continue'}
+            </div>
           </div>
         </div>
+        {/* Mode toggle */}
+        <div className="grid grid-cols-2 gap-1 rounded-md bg-zinc-950 border border-zinc-800 p-1">
+          <button
+            type="button"
+            onClick={() => switchMode('login')}
+            disabled={submitting}
+            className={cn(
+              'py-1.5 rounded text-xs font-medium transition-colors disabled:opacity-50',
+              !isSignup
+                ? 'bg-emerald-500/80 text-zinc-950'
+                : 'text-zinc-400 hover:text-zinc-200',
+            )}
+          >
+            Log in
+          </button>
+          <button
+            type="button"
+            onClick={() => switchMode('signup')}
+            disabled={submitting}
+            className={cn(
+              'py-1.5 rounded text-xs font-medium transition-colors disabled:opacity-50',
+              isSignup
+                ? 'bg-emerald-500/80 text-zinc-950'
+                : 'text-zinc-400 hover:text-zinc-200',
+            )}
+          >
+            Sign up
+          </button>
+        </div>
         <div className="space-y-2">
-          <label className="block text-xs text-zinc-400">Username</label>
+          <label className="block text-xs text-zinc-400">
+            {isSignup ? 'Email' : 'Username'}
+          </label>
           <input
-            type="text"
+            type={isSignup ? 'email' : 'text'}
             autoFocus
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
+            value={identifier}
+            onChange={(e) => setIdentifier(e.target.value)}
             className="w-full px-3 py-2 rounded-md bg-zinc-950 border border-zinc-800 text-sm text-zinc-100 focus:outline-none focus:border-emerald-500"
             disabled={submitting}
           />
@@ -327,7 +476,13 @@ function LoginGate({ onSuccess }: { onSuccess: () => void }) {
           disabled={submitting}
           className="w-full py-2 rounded-md bg-emerald-500/80 hover:bg-emerald-500 text-zinc-950 text-sm font-medium disabled:opacity-50"
         >
-          {submitting ? 'Signing in…' : 'Sign in'}
+          {submitting
+            ? isSignup
+              ? 'Creating account…'
+              : 'Signing in…'
+            : isSignup
+              ? 'Sign up'
+              : 'Sign in'}
         </button>
       </form>
     </div>

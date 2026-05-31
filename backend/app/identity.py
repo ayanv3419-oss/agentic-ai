@@ -1,0 +1,338 @@
+"""Identity / Auth foundation — per-user accounts + a tenant per owner.
+
+Multi-tenant slice 1. This module owns the ``users`` / ``tenants`` tables
+(registered in ``app.infrastructure.init_database``) and turns an
+email + password into a tenant-bearing :class:`Principal`:
+
+    principal = await signup("ada@example.com", "hunter2")
+    token     = mint_token(principal)
+    ...
+    principal = verify_token(token)        # round-trips back
+
+Design notes (deliberately mirroring the rest of the backend):
+
+* **Portable SQL.** Every statement uses ``?`` placeholders and runs through
+  ``app.infrastructure.get_connection``, which transparently translates to
+  ``$1, $2, ...`` on Postgres. The schema is all-TEXT so the same DDL works on
+  both engines (see ``_USERS_DDL`` / ``_TENANTS_DDL`` in infrastructure.py).
+* **Same id / timestamp idioms** as the ``conversations`` tables:
+  ``uuid.uuid4().hex`` ids and ``datetime.now(timezone.utc).isoformat(
+  timespec="seconds")`` timestamps.
+* **No duplicated crypto.** The bearer-token machinery is the HMAC primitives
+  already in :mod:`app.auth` (``_b64u_encode`` / ``_b64u_decode`` / ``_sign``)
+  signed with ``settings.auth_token_secret``. We only widen the *payload* from
+  the admin token's ``{u, iat, exp}`` to ``{u, uid, tid, iat, exp}`` so a
+  verified token resolves a full Principal without a DB hit.
+* **bcrypt** for password hashing (already in ``backend/requirements.txt``).
+  bcrypt silently truncates input beyond 72 bytes, so we truncate explicitly
+  to keep hashing/verification consistent.
+
+``mint_token`` is the only function that can raise here (a misconfigured
+secret would be a programmer error worth surfacing). ``authenticate`` and
+``verify_token`` NEVER raise — callers degrade to a 401 / guest path.
+"""
+from __future__ import annotations
+
+import hmac
+import json
+import logging
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+import bcrypt
+
+from app.auth import _b64u_decode, _b64u_encode, _sign
+from app.infrastructure import get_connection, settings
+
+_log = logging.getLogger("agentic_ai.identity")
+
+# bcrypt only considers the first 72 bytes of the password. Truncate up front
+# so the hash we store and the value we later verify see the exact same bytes.
+_BCRYPT_MAX_BYTES = 72
+
+# Minimum password length enforced at signup. Not a secret — a UX/safety floor.
+_MIN_PASSWORD_LEN = 6
+
+
+@dataclass(frozen=True)
+class Principal:
+    """The authenticated actor for a request: a user bound to their tenant."""
+
+    user_id: str
+    tenant_id: str
+    email: str
+
+
+class EmailExists(Exception):
+    """Raised by :func:`signup` when the (normalized) email is already taken."""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_email(email: str) -> str:
+    """Canonical form used for storage AND lookup: stripped + lowercased."""
+    return (email or "").strip().lower()
+
+
+def _now_iso() -> str:
+    """ISO-8601 UTC, second precision — same idiom as the conversations tables."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _hash_password(password: str) -> str:
+    """bcrypt-hash ``password`` and return a utf-8 string safe to store."""
+    digest = bcrypt.hashpw(password.encode("utf-8")[:_BCRYPT_MAX_BYTES],
+                           bcrypt.gensalt())
+    return digest.decode("utf-8")
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    """Constant-time bcrypt check. Never raises — a malformed stored hash
+    (or any unexpected input) is treated as a non-match."""
+    try:
+        return bcrypt.checkpw(
+            password.encode("utf-8")[:_BCRYPT_MAX_BYTES],
+            (password_hash or "").encode("utf-8"),
+        )
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Account lifecycle
+# ---------------------------------------------------------------------------
+
+async def signup(email: str, password: str) -> Principal:
+    """Create a user + their owning tenant and return the resulting Principal.
+
+    Validation: email must be non-empty (after strip/lower) and the password
+    at least ``_MIN_PASSWORD_LEN`` chars — otherwise ``ValueError``. A duplicate
+    email raises :class:`EmailExists`. The password is bcrypt-hashed; we INSERT
+    one ``users`` row and one ``tenants`` row (``owner_user_id`` = the new user,
+    ``name`` defaulting to the email's local-part).
+
+    FIRST-SIGNUP INHERITANCE (multi-tenant slice 2c): the very first account on
+    a fresh install (``users`` table empty) is bound to the existing default
+    tenant ``"public"`` instead of a freshly-minted one — so the operator who
+    signs up first inherits all the data + uploads already sitting in the
+    public schema, and we do NOT create a new (empty) tenant schema for them.
+    Every subsequent signup mints a brand-new uuid tenant and provisions its
+    own isolated Postgres schema via ``ensure_tenant_schema``.
+    """
+    norm = _normalize_email(email)
+    if not norm:
+        raise ValueError("email is required")
+    if not password or len(password) < _MIN_PASSWORD_LEN:
+        raise ValueError(
+            f"password must be at least {_MIN_PASSWORD_LEN} characters"
+        )
+
+    user_id = uuid.uuid4().hex
+    created_at = _now_iso()
+    password_hash = _hash_password(password)
+    # Tenant display name defaults to the email's local-part ("ada" of
+    # "ada@example.com"); falls back to the full normalized email if there's
+    # no "@".
+    tenant_name = norm.split("@", 1)[0] or norm
+
+    async with get_connection() as db:
+        # Pre-check keeps the error path engine-agnostic (no reliance on the
+        # UNIQUE-constraint error text differing between SQLite and Postgres).
+        cur = await db.execute("SELECT id FROM users WHERE email = ?", (norm,))
+        existing = await cur.fetchall()
+        await cur.close()
+        if existing:
+            raise EmailExists(norm)
+
+        # FIRST-SIGNUP INHERITANCE — is the users table currently empty? If so
+        # this is the very first account, so it inherits the existing default
+        # ("public") tenant + its data instead of minting a fresh one. Counted
+        # inside the same transaction as the INSERT below, after the duplicate
+        # pre-check, so the decision is consistent. Defensive: any hiccup
+        # reading the count falls through to the safe default (mint a fresh
+        # tenant), never an exception out of signup.
+        is_first_user = False
+        try:
+            cur = await db.execute("SELECT COUNT(*) AS n FROM users")
+            count_rows = await cur.fetchall()
+            await cur.close()
+            if count_rows:
+                row0 = count_rows[0]
+                # Row access is portable across SQLite (sqlite3.Row / tuple)
+                # and the Postgres adapter (mapping-like row).
+                try:
+                    n_users = row0["n"]
+                except (KeyError, IndexError, TypeError):
+                    n_users = row0[0]
+                is_first_user = int(n_users or 0) == 0
+        except Exception:
+            _log.exception(
+                "users count failed during signup (defaulting to fresh tenant)"
+            )
+            is_first_user = False
+
+        if is_first_user:
+            # Inherit the existing default tenant — no new schema.
+            tenant_id = "public"
+        else:
+            tenant_id = uuid.uuid4().hex
+
+        await db.execute(
+            "INSERT INTO users (id, email, password_hash, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, norm, password_hash, created_at),
+        )
+        if is_first_user:
+            # Ensure a tenants row for the inherited "public" tenant exists and
+            # is owned by this first user. Upsert so a pre-seeded public row
+            # (or a re-run) doesn't trip the PK — engine-agnostic via
+            # INSERT .. ON CONFLICT (works on both SQLite and Postgres).
+            await db.execute(
+                "INSERT INTO tenants (id, owner_user_id, name, created_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (id) DO UPDATE SET "
+                "owner_user_id = EXCLUDED.owner_user_id, "
+                "name = EXCLUDED.name",
+                (tenant_id, user_id, tenant_name, created_at),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO tenants (id, owner_user_id, name, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (tenant_id, user_id, tenant_name, created_at),
+            )
+        await db.commit()
+
+    # Provision the tenant's Postgres schema so its u_* tables land in an
+    # isolated namespace before the owner uploads anything (multi-tenant slice
+    # 2b). Idempotent (CREATE SCHEMA IF NOT EXISTS) and defensive: a
+    # provisioning hiccup must never fail an otherwise-successful signup, so we
+    # log and continue — the schema is also ensured lazily on first ingest.
+    #
+    # SKIPPED for the first-signup inheritance case: that user runs in the
+    # existing "public" schema, which already exists and already holds the
+    # data they're meant to inherit — creating/binding a new schema would be
+    # wrong (and "public" is not a per-tenant schema we manage).
+    if not is_first_user:
+        try:
+            from app.db_engine import ensure_tenant_schema
+            await ensure_tenant_schema(tenant_id)
+        except Exception:
+            _log.exception(
+                "ensure_tenant_schema failed for tenant=%r (signup continues)",
+                tenant_id,
+            )
+
+    return Principal(user_id=user_id, tenant_id=tenant_id, email=norm)
+
+
+async def authenticate(email: str, password: str) -> "Principal | None":
+    """Verify credentials and return the Principal, else ``None``.
+
+    Looks the user up by normalized email, bcrypt-verifies the password, and
+    resolves the user's tenant via ``tenants.owner_user_id``. Returns ``None``
+    on any miss (unknown email, wrong password, or — defensively — a user with
+    no tenant row). Never raises.
+    """
+    norm = _normalize_email(email)
+    if not norm or not password:
+        return None
+    try:
+        async with get_connection() as db:
+            cur = await db.execute(
+                "SELECT id, password_hash FROM users WHERE email = ?", (norm,)
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            if not rows:
+                return None
+            user = dict(rows[0])
+            if not _verify_password(password, user.get("password_hash") or ""):
+                return None
+
+            cur = await db.execute(
+                "SELECT id FROM tenants WHERE owner_user_id = ? "
+                "ORDER BY created_at ASC LIMIT 1",
+                (user["id"],),
+            )
+            t_rows = await cur.fetchall()
+            await cur.close()
+            if not t_rows:
+                return None
+            tenant_id = dict(t_rows[0])["id"]
+    except Exception:
+        # A DB hiccup must never surface as a 500 on the login path.
+        _log.exception("authenticate failed for email=%r", norm)
+        return None
+
+    return Principal(user_id=user["id"], tenant_id=tenant_id, email=norm)
+
+
+# ---------------------------------------------------------------------------
+# Tenant-bearing bearer tokens — reuse app.auth's HMAC primitives, widened
+# payload {u, uid, tid, iat, exp}. Signed/verified with the same secret as the
+# admin token, so a single AUTH_TOKEN_SECRET rotation invalidates everything.
+# ---------------------------------------------------------------------------
+
+def mint_token(principal: Principal) -> str:
+    """Mint a fresh signed token carrying the full Principal.
+
+    Payload: ``{"u": email, "uid": user_id, "tid": tenant_id, "iat", "exp"}``.
+    TTL is ``settings.auth_token_ttl_hours``; the signature is
+    ``HMAC-SHA256(settings.auth_token_secret, payload_b64)`` via the shared
+    :func:`app.auth._sign`. Same wire shape ``<payload_b64>.<sig_b64>`` as the
+    existing admin token, so one verifier could read either.
+    """
+    now = int(time.time())
+    ttl = max(1, settings.auth_token_ttl_hours) * 3600
+    payload: dict[str, Any] = {
+        "u": principal.email,
+        "uid": principal.user_id,
+        "tid": principal.tenant_id,
+        "iat": now,
+        "exp": now + ttl,
+    }
+    payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    payload_b64 = _b64u_encode(payload_json.encode("utf-8"))
+    sig_b64 = _sign(payload_b64, settings.auth_token_secret)
+    return f"{payload_b64}.{sig_b64}"
+
+
+def verify_token(token: str) -> "Principal | None":
+    """Return the Principal for a valid, unexpired token, else ``None``.
+
+    Checks the HMAC signature (constant-time) and expiry using the same secret
+    as :func:`mint_token`. A tampered payload or signature, a missing/expired
+    ``exp``, or any malformed input yields ``None``. Never raises.
+    """
+    if not token or "." not in token:
+        return None
+    try:
+        payload_b64, sig_b64 = token.rsplit(".", 1)
+    except ValueError:
+        return None
+    expected_sig = _sign(payload_b64, settings.auth_token_secret)
+    # Constant-time compare — a timing side-channel leaks the secret over
+    # enough samples.
+    if not hmac.compare_digest(expected_sig, sig_b64):
+        return None
+    try:
+        payload = json.loads(_b64u_decode(payload_b64).decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    u = payload.get("u")
+    uid = payload.get("uid")
+    tid = payload.get("tid")
+    exp = payload.get("exp")
+    if not isinstance(u, str) or not isinstance(uid, str) or not isinstance(tid, str):
+        return None
+    if not isinstance(exp, (int, float)) or exp < time.time():
+        return None
+    return Principal(user_id=uid, tenant_id=tid, email=u)

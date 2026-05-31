@@ -1,4 +1,4 @@
-# Agentic AI — Domain Context
+# Metric AI — Domain Context
 
 > Read this before touching any code. Defines the vocabulary, module boundaries,
 > invariants, and known risks every agent and contributor must respect.
@@ -9,7 +9,7 @@
 
 ## 1. What this system is
 
-**Agentic AI** is a local-first, single-user, LLM-coordinated analytics platform for small businesses.
+**Metric AI** is a local-first, single-user, LLM-coordinated analytics platform for small businesses.
 Users upload CSV/XLSX financial records (sales + purchases), then ask natural-language questions.
 The system answers with grounded numeric results, narrative insight, and chart-ready aggregates — streamed live.
 

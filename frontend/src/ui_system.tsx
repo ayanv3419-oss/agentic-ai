@@ -36,6 +36,8 @@ import {
   FileSpreadsheet,
   LayoutDashboard,
   Loader2,
+  MessageSquare,
+  MessageSquarePlus,
   RefreshCw,
   Save,
   ShoppingBag,
@@ -855,12 +857,40 @@ const newId = (): string =>
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`
 
 export function AiAssistant() {
-  const messages = useAppStore((s) => s.chatHistory)
+  const liveMessages = useAppStore((s) => s.chatHistory)
   const isStreaming = useAppStore((s) => s.isStreaming)
   const appendMessage = useAppStore((s) => s.appendMessage)
   const updateMessage = useAppStore((s) => s.updateMessage)
   const clearChat = useAppStore((s) => s.clearChat)
   const setStreaming = useAppStore((s) => s.setStreaming)
+
+  // Recents (read-only history) — server-sourced session list + the
+  // currently-open read-only transcript. When viewingSessionId is null the
+  // live chat renders exactly as before; otherwise the main area shows the
+  // fetched viewedMessages read-only and the composer is hidden.
+  const sessions = useAppStore((s) => s.sessions)
+  const viewingSessionId = useAppStore((s) => s.viewingSessionId)
+  const viewedMessages = useAppStore((s) => s.viewedMessages)
+  const refreshSessions = useAppStore((s) => s.refreshSessions)
+  const closeSession = useAppStore((s) => s.closeSession)
+  const isViewing = viewingSessionId !== null
+  // The transcript shown in the main scroller: the read-only session when one
+  // is open, otherwise the live chat.
+  const messages = isViewing ? viewedMessages : liveMessages
+
+  // Refresh the Recents list on mount.
+  useEffect(() => { void refreshSessions() }, [refreshSessions])
+
+  // Refresh after each turn finishes so a brand-new session and its (async,
+  // best-effort) server-generated title surface in the list. We watch the
+  // streaming flag falling edge: when a turn ends, isStreaming flips true→false.
+  const wasStreamingRef = useRef(false)
+  useEffect(() => {
+    if (wasStreamingRef.current && !isStreaming) {
+      void refreshSessions()
+    }
+    wasStreamingRef.current = isStreaming
+  }, [isStreaming, refreshSessions])
   // Banner inputs: when serverDataVersion advances past the version
   // captured at conversation-start, the next reply uses fresher data
   // than the answers already on screen. We surface that explicitly so
@@ -1049,80 +1079,157 @@ export function AiAssistant() {
     }
   }
 
+  // "New chat" mints a fresh conversation (clearChat rotates conversationId)
+  // and drops out of any read-only session view back to the live composer.
+  const handleNewChat = () => {
+    clearChat()
+    closeSession()
+  }
+
   return (
     <div className="flex-1 flex flex-col min-h-0">
-      <ChatHeader onClear={clearChat} hasMessages={messages.length > 0} />
+        {isViewing ? (
+          <ReadOnlyHeader
+            title={sessions.find((s) => s.id === viewingSessionId)?.title || 'Conversation'}
+            onBack={closeSession}
+          />
+        ) : (
+          <ChatHeader onClear={clearChat} hasMessages={messages.length > 0} />
+        )}
 
-      <div ref={scrollerRef} className="flex-1 overflow-y-auto">
-        <div className="max-w-3xl mx-auto px-6 md:px-10 py-8">
-          {messages.length === 0 ? (
-            <EmptyState onPick={(s) => setInput(s)} />
-          ) : (
-            <div className="space-y-6">
-              {messages.map((m) => (
-                <MessageRow key={m.id} message={m} />
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
-
-      <div className="border-t border-zinc-800 bg-zinc-950">
-        <div className="max-w-3xl mx-auto px-6 md:px-10 py-4">
-          {dataChangedMidConversation && !bannerDismissed && (
-            <div className="mb-3 flex items-start gap-2 text-xs text-emerald-300/90 bg-emerald-950/30 border border-emerald-900/40 rounded-md px-3 py-2">
-              <span className="mt-0.5">📊</span>
-              <span className="flex-1">
-                Data updated since this conversation started — new replies will use the latest data.
-              </span>
-              <button
-                type="button"
-                onClick={() => setBannerDismissed(true)}
-                className="text-emerald-400/60 hover:text-emerald-200 text-[10px] uppercase tracking-wide"
-                aria-label="Dismiss banner"
-              >
-                Dismiss
-              </button>
-            </div>
-          )}
-          <div className="relative flex items-end gap-2 rounded-2xl border border-zinc-800 bg-zinc-900/60 focus-within:border-emerald-500/50 transition-colors p-2">
-            <textarea
-              ref={textareaRef}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={onKeyDown}
-              rows={1}
-              placeholder="Ask anything about your business…"
-              className="flex-1 resize-none bg-transparent px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none"
-            />
-            {isStreaming ? (
-              <button
-                type="button"
-                onClick={stop}
-                className="btn btn-secondary h-9 px-3"
-                title="Stop"
-              >
-                <Square className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Stop</span>
-              </button>
+        <div ref={scrollerRef} className="flex-1 overflow-y-auto">
+          <div className="max-w-3xl mx-auto px-6 md:px-10 py-8">
+            {messages.length === 0 ? (
+              isViewing ? (
+                <p className="py-16 text-center text-sm text-zinc-500">
+                  This conversation has no messages.
+                </p>
+              ) : (
+                <EmptyState onPick={(s) => setInput(s)} />
+              )
             ) : (
-              <button
-                type="button"
-                onClick={() => void handleSend()}
-                disabled={!canSend}
-                className="btn btn-primary h-9 px-3"
-                title="Send"
-              >
-                <Send className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Send</span>
-              </button>
+              <div className="space-y-6">
+                {messages.map((m) => (
+                  <MessageRow key={m.id} message={m} />
+                ))}
+              </div>
             )}
           </div>
-          <p className="mt-2 text-[11px] text-zinc-600 text-center">
-            Press Enter to send · Shift + Enter for newline
-          </p>
+        </div>
+
+        {isViewing ? (
+          <div className="border-t border-zinc-800 bg-zinc-950">
+            <div className="max-w-3xl mx-auto px-6 md:px-10 py-4">
+              <div className="flex items-center justify-between gap-3 rounded-2xl border border-zinc-800 bg-zinc-900/40 px-4 py-3">
+                <p className="text-xs text-zinc-500">
+                  You're viewing a past conversation. Start a new chat to ask more.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleNewChat}
+                  className="btn btn-primary h-9 px-3 shrink-0"
+                  title="Start a new chat"
+                >
+                  <MessageSquarePlus className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">New chat</span>
+                </button>
+              </div>
+              <p className="mt-2 text-[11px] text-zinc-600 text-center">
+                <button
+                  type="button"
+                  onClick={closeSession}
+                  className="text-zinc-500 hover:text-zinc-300 underline-offset-2 hover:underline"
+                >
+                  Back to live chat
+                </button>
+              </p>
+            </div>
+          </div>
+        ) : (
+          <div className="border-t border-zinc-800 bg-zinc-950">
+            <div className="max-w-3xl mx-auto px-6 md:px-10 py-4">
+              {dataChangedMidConversation && !bannerDismissed && (
+                <div className="mb-3 flex items-start gap-2 text-xs text-emerald-300/90 bg-emerald-950/30 border border-emerald-900/40 rounded-md px-3 py-2">
+                  <span className="mt-0.5">📊</span>
+                  <span className="flex-1">
+                    Data updated since this conversation started — new replies will use the latest data.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setBannerDismissed(true)}
+                    className="text-emerald-400/60 hover:text-emerald-200 text-[10px] uppercase tracking-wide"
+                    aria-label="Dismiss banner"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+              <div className="relative flex items-end gap-2 rounded-2xl border border-zinc-800 bg-zinc-900/60 focus-within:border-emerald-500/50 transition-colors p-2">
+                <textarea
+                  ref={textareaRef}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={onKeyDown}
+                  rows={1}
+                  placeholder="Ask anything about your business…"
+                  className="flex-1 resize-none bg-transparent px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none"
+                />
+                {isStreaming ? (
+                  <button
+                    type="button"
+                    onClick={stop}
+                    className="btn btn-secondary h-9 px-3"
+                    title="Stop"
+                  >
+                    <Square className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">Stop</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => void handleSend()}
+                    disabled={!canSend}
+                    className="btn btn-primary h-9 px-3"
+                    title="Send"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">Send</span>
+                  </button>
+                )}
+              </div>
+              <p className="mt-2 text-[11px] text-zinc-600 text-center">
+                Press Enter to send · Shift + Enter for newline
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
+  )
+}
+
+// Header shown while viewing a read-only past conversation: title + a control
+// back to the live chat (the composer is hidden in this mode).
+function ReadOnlyHeader({ title, onBack }: { title: string; onBack: () => void }) {
+  return (
+    <div className="border-b border-zinc-800 px-6 md:px-10 py-4 flex items-center justify-between">
+      <div className="flex items-center gap-3 min-w-0">
+        <div className="w-9 h-9 rounded-lg bg-zinc-900 border border-zinc-800 flex items-center justify-center shrink-0">
+          <MessageSquare className="w-4 h-4 text-zinc-400" />
+        </div>
+        <div className="min-w-0">
+          <h1 className="text-base font-semibold tracking-tight truncate">{title}</h1>
+          <p className="text-xs text-zinc-500">Past conversation · read-only</p>
         </div>
       </div>
+      <button
+        type="button"
+        onClick={onBack}
+        className="btn btn-ghost shrink-0"
+        title="Back to live chat"
+      >
+        <X className="w-3.5 h-3.5" />
+        <span className="hidden sm:inline">Close</span>
+      </button>
     </div>
   )
 }
@@ -1194,6 +1301,212 @@ function EmptyState({ onPick }: { onPick: (s: string) => void }) {
   )
 }
 
+// ---- Lightweight Markdown renderer ---------------------------------------
+// The Coordinator answers in Markdown — GFM pipe tables, **bold**, lists and
+// headings. We render the common subset inline instead of pulling in a
+// markdown dependency (keeps the bundle lean + offline-buildable). Anything
+// we don't recognise falls through as plain text.
+
+function mdSplitRow(row: string): string[] {
+  let t = row.trim()
+  if (t.startsWith('|')) t = t.slice(1)
+  if (t.endsWith('|')) t = t.slice(0, -1)
+  return t.split('|').map((c) => c.trim())
+}
+
+function mdIsTableSeparator(row: string): boolean {
+  const t = row.trim()
+  if (!t.includes('-') || !t.includes('|')) return false
+  const cells = mdSplitRow(t)
+  return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c))
+}
+
+type MdAlign = 'left' | 'right' | 'center'
+
+function mdAlignClass(a: MdAlign): string {
+  return a === 'right' ? 'text-right' : a === 'center' ? 'text-center' : 'text-left'
+}
+
+// Inline spans: **bold**, `code`, *italic*. Everything else is plain text.
+function mdInline(text: string, keyPrefix: string): ReactNode[] {
+  const out: ReactNode[] = []
+  const re = /(\*\*[^*]+\*\*|`[^`]+`|\*[^*\n]+\*)/g
+  let last = 0
+  let n = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out.push(text.slice(last, m.index))
+    const tok = m[0]
+    if (tok.startsWith('**')) {
+      out.push(
+        <strong key={`${keyPrefix}-b${n}`} className="font-semibold text-white">
+          {tok.slice(2, -2)}
+        </strong>,
+      )
+    } else if (tok.startsWith('`')) {
+      out.push(
+        <code
+          key={`${keyPrefix}-c${n}`}
+          className="rounded bg-zinc-800 px-1 py-0.5 font-mono text-[0.85em] text-emerald-300"
+        >
+          {tok.slice(1, -1)}
+        </code>,
+      )
+    } else {
+      out.push(<em key={`${keyPrefix}-i${n}`}>{tok.slice(1, -1)}</em>)
+    }
+    last = m.index + tok.length
+    n++
+  }
+  if (last < text.length) out.push(text.slice(last))
+  return out
+}
+
+function Markdown({ source }: { source: string }) {
+  const lines = source.replace(/\r\n/g, '\n').split('\n')
+  const blocks: ReactNode[] = []
+  let i = 0
+  let key = 0
+
+  while (i < lines.length) {
+    const trimmed = lines[i].trim()
+    if (trimmed === '') {
+      i++
+      continue
+    }
+
+    // Table — a row with "|" immediately followed by a separator row.
+    if (trimmed.includes('|') && i + 1 < lines.length && mdIsTableSeparator(lines[i + 1])) {
+      const header = mdSplitRow(trimmed)
+      const aligns: MdAlign[] = mdSplitRow(lines[i + 1]).map((c) =>
+        c.startsWith(':') && c.endsWith(':') ? 'center' : c.endsWith(':') ? 'right' : 'left',
+      )
+      i += 2
+      const rows: string[][] = []
+      while (i < lines.length && lines[i].trim() !== '' && lines[i].includes('|')) {
+        rows.push(mdSplitRow(lines[i]))
+        i++
+      }
+      const tk = key++
+      blocks.push(
+        <div key={`md-t${tk}`} className="my-2 overflow-x-auto rounded-lg border border-zinc-800">
+          <table className="w-full border-collapse text-sm">
+            <thead>
+              <tr className="bg-zinc-800/50">
+                {header.map((h, hi) => (
+                  <th
+                    key={hi}
+                    className={cn(
+                      'border-b border-zinc-700 px-3 py-2 font-semibold text-zinc-200',
+                      mdAlignClass(aligns[hi] ?? 'left'),
+                    )}
+                  >
+                    {mdInline(h, `md-t${tk}h${hi}`)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, ri) => (
+                <tr key={ri} className="even:bg-zinc-900/40">
+                  {r.map((c, ci) => (
+                    <td
+                      key={ci}
+                      className={cn(
+                        'border-b border-zinc-800/70 px-3 py-1.5 text-zinc-300',
+                        mdAlignClass(aligns[ci] ?? 'left'),
+                      )}
+                    >
+                      {mdInline(c, `md-t${tk}r${ri}c${ci}`)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>,
+      )
+      continue
+    }
+
+    // Heading (#..######).
+    const hm = /^(#{1,6})\s+(.*)$/.exec(trimmed)
+    if (hm) {
+      const level = (hm[1] ?? '').length
+      const cls =
+        level <= 1
+          ? 'text-base font-semibold text-white'
+          : level === 2
+            ? 'text-sm font-semibold text-zinc-100'
+            : 'text-sm font-medium text-zinc-200'
+      const hk = key++
+      blocks.push(
+        <p key={`md-h${hk}`} className={cn('mt-1', cls)}>
+          {mdInline(hm[2] ?? '', `md-h${hk}`)}
+        </p>,
+      )
+      i++
+      continue
+    }
+
+    // Bullet list (- or *).
+    if (/^[-*]\s+/.test(trimmed)) {
+      const items: string[] = []
+      while (i < lines.length && /^[-*]\s+/.test(lines[i].trim())) {
+        items.push(lines[i].trim().replace(/^[-*]\s+/, ''))
+        i++
+      }
+      const lk = key++
+      blocks.push(
+        <ul key={`md-ul${lk}`} className="list-disc space-y-1 pl-5 text-zinc-100">
+          {items.map((it, ii) => (
+            <li key={ii}>{mdInline(it, `md-ul${lk}i${ii}`)}</li>
+          ))}
+        </ul>,
+      )
+      continue
+    }
+
+    // Numbered list (1. 2. ...).
+    if (/^\d+\.\s+/.test(trimmed)) {
+      const items: string[] = []
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
+        items.push(lines[i].trim().replace(/^\d+\.\s+/, ''))
+        i++
+      }
+      const lk = key++
+      blocks.push(
+        <ol key={`md-ol${lk}`} className="list-decimal space-y-1 pl-5 text-zinc-100">
+          {items.map((it, ii) => (
+            <li key={ii}>{mdInline(it, `md-ol${lk}i${ii}`)}</li>
+          ))}
+        </ol>,
+      )
+      continue
+    }
+
+    // Paragraph — gather consecutive plain lines into one wrapped block.
+    const para: string[] = []
+    while (i < lines.length) {
+      const t = lines[i].trim()
+      if (t === '' || /^(#{1,6})\s+/.test(t) || /^[-*]\s+/.test(t) || /^\d+\.\s+/.test(t)) break
+      if (t.includes('|') && i + 1 < lines.length && mdIsTableSeparator(lines[i + 1])) break
+      para.push(t)
+      i++
+    }
+    if (para.length > 0) {
+      const pk = key++
+      blocks.push(
+        <p key={`md-p${pk}`} className="leading-relaxed text-zinc-100">
+          {mdInline(para.join(' '), `md-p${pk}`)}
+        </p>,
+      )
+    }
+  }
+
+  return <div className="space-y-2 text-sm">{blocks}</div>
+}
+
 function MessageRow({ message }: { message: ChatMessage }) {
   if (message.role === 'user') {
     return (
@@ -1230,9 +1543,7 @@ function MessageRow({ message }: { message: ChatMessage }) {
               message.chart && 'mt-2',
             )}
           >
-            <p className="whitespace-pre-wrap text-sm text-zinc-100 leading-relaxed">
-              {message.content}
-            </p>
+            <Markdown source={message.content} />
           </div>
         )}
 
