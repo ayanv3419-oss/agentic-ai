@@ -232,6 +232,57 @@ def _is_text_type(data_type: str) -> bool:
     return t in _TEXTLIKE_TYPES
 
 
+async def effective_resolved(tenant_id: str, tables: list[dict[str, Any]]):
+    """Resolve the dataset schema, preferring a tenant's confirmed mapping.
+
+    If the tenant has saved a schema mapping (via POST /schema/confirm) that
+    carries concept assignments, build a ``ResolvedSchema`` straight from it —
+    every mapped concept becomes a confidence-1.0 ``"user"`` Resolution, so the
+    human-confirmed column overrides whatever the deterministic resolver would
+    have guessed. Otherwise fall back to ``resolve_schema(tables)`` — the
+    current, default behavior.
+    """
+    from app.schema_mapping.resolver import (
+        ColumnRef,
+        Resolution,
+        ResolvedSchema,
+        _margin_computable,
+        resolve_schema,
+    )
+    from app.schema_mapping.store import load_tenant_mapping
+
+    mapping = await load_tenant_mapping(tenant_id)
+    concepts = (mapping or {}).get("concepts") if isinstance(mapping, dict) else None
+    if not concepts:
+        return resolve_schema(tables)
+
+    resolved: dict[str, Resolution] = {}
+    for concept, loc in concepts.items():
+        if not isinstance(loc, dict):
+            continue
+        table = loc.get("table")
+        column = loc.get("column")
+        if not table or not column:
+            continue
+        resolved[concept] = Resolution(
+            concept=concept,
+            column=ColumnRef(table, column),
+            confidence=1.0,
+            match="user",
+        )
+
+    # An empty (all-skipped) concepts block is no better than no mapping;
+    # fall back rather than emit an empty ResolvedSchema.
+    if not resolved:
+        return resolve_schema(tables)
+
+    try:
+        can_margin = _margin_computable(resolved, tables)
+    except Exception:
+        can_margin = False
+    return ResolvedSchema(resolved, {}, can_margin)
+
+
 class DashboardAgent:
     """Reads the user's uploaded dataset and aggregates KPIs + time series.
 
@@ -312,7 +363,6 @@ class DashboardAgent:
         # 2. Resolve the dataset schema. If no u_* tables exist or required
         #    concepts can't be resolved, return an empty (but well-shaped)
         #    payload so the frontend renders zero-state instead of crashing.
-        from app.schema_mapping import resolve_schema
         # A brand-new tenant's schema may have no u_* tables yet — or, on
         # Postgres, the schema may not even be provisioned when the dashboard
         # is first opened. Introspection runs under the tenant's search_path
@@ -330,7 +380,13 @@ class DashboardAgent:
             )
         if not user_tables:
             return self._empty_payload(month, "no u_* tables uploaded yet")
-        resolved = resolve_schema(user_tables)
+        # Prefer a tenant's human-confirmed schema mapping over the
+        # deterministic resolver. The active tenant is bound into the
+        # current_tenant_var contextvar by require_principal/set_query_tenant
+        # before this agent runs (see the /dashboard route), so read it there.
+        from app.db_engine import current_tenant_var
+        tenant_id = current_tenant_var.get()
+        resolved = await effective_resolved(tenant_id, user_tables)
 
         date_ref = resolved.ref("transaction_date")
         rev_ref = resolved.ref("revenue")

@@ -141,9 +141,19 @@ class InsightFmtAgent(Tool):
         text = (resp.content or "").strip()
         if not text:
             return ToolOutcome(ok=False, error="insightFmt returned empty text")
+        # Echo the chart spec that SqlExecutor already built from the real
+        # result rows onto the terminal answer's output, so the `final`
+        # payload carries the renderable chart object alongside the prose.
+        # insightFmt NEVER builds or alters chart data — it only surfaces
+        # what is already in state. Omitted entirely when there's nothing
+        # to plot (e.g. a single-scalar answer).
+        out: dict[str, Any] = {"answer": text}
+        chart = getattr(ctx.state, "chart_payload", None)
+        if chart is not None:
+            out["chart"] = chart
         return ToolOutcome(
             ok=True,
-            output={"answer": text},
+            output=out,
             state_updates={"final_answer": text},
         )
 

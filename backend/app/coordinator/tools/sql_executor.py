@@ -36,15 +36,39 @@ def _enforce_limit(sql: str, default_limit: int) -> str:
     cleaned = sql.rstrip().rstrip(";").strip()
     # Newlines around the wrap so a trailing line-comment (`-- ...`) inside
     # `cleaned` cannot comment out the closing paren or the outer LIMIT.
-    return f"SELECT * FROM (\n{cleaned}\n) LIMIT {default_limit}"
+    # The alias `_capped` is required: Postgres rejects a subquery in FROM
+    # without an alias ("subquery in FROM must have an alias").
+    return f"SELECT * FROM (\n{cleaned}\n) AS _capped LIMIT {default_limit}"
+
+
+def _is_numeric_str(s: str) -> bool:
+    """True if ``s`` parses as a number (ignoring thousands separators).
+    Lets DB drivers that render numerics as text (asyncpg returns Decimal
+    aggregates as strings like '238694.00') still classify as a number."""
+    s = s.replace(",", "").strip()
+    if not s:
+        return False
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
 
 
 def _infer_column_types(
     rows: list[dict[str, Any]],
 ) -> dict[str, str]:
     """Classify each column as 'text' / 'number' / 'other' by scanning
-    up to _TYPE_SAMPLE_ROWS rows. None values are ignored. Booleans are
-    excluded from 'number' (they're an isinstance(int) trap)."""
+    up to _TYPE_SAMPLE_ROWS rows.
+
+    All sampled rows are scanned per column; the first NON-None value
+    determines the type. This prevents sparse columns (where the first
+    row happens to be None) from being silently dropped as 'other',
+    which previously caused charts to vanish for sparse data. Falls back
+    to 'other' only when every sampled value is None. Booleans are
+    excluded from 'number' (they're an isinstance(int) trap). The
+    bool-before-number check ordering and return shape are unchanged.
+    """
     if not rows:
         return {}
     cols = list(rows[0].keys())
@@ -55,17 +79,28 @@ def _infer_column_types(
         for r in sample:
             v = r.get(c)
             if v is None:
+                # Skip None — keep scanning for a non-None value.
                 continue
             if isinstance(v, bool):
                 # bool is int subclass in Python; treat as 'other'.
                 kind = "other"
                 break
-            if isinstance(v, (int, float)):
-                kind = "number"
-                break
             if isinstance(v, str):
-                kind = "text"
+                # Numeric strings (asyncpg renders SUM()/AVG() as Decimal text
+                # like '238694.00') count as 'number' so the chart y-axis is
+                # found; date-like strings ('2025', '2025-05', '2025-05-01')
+                # stay 'text' so they remain the x-axis label.
+                s = v.strip()
+                kind = ("number" if (s and not _DATE_VAL.match(s)
+                                     and _is_numeric_str(s)) else "text")
                 break
+            # int / float / Decimal (any float()-able non-string) → number.
+            try:
+                float(v)
+                kind = "number"
+            except (TypeError, ValueError):
+                kind = "other"
+            break
         out[c] = kind
     return out
 
@@ -80,6 +115,56 @@ _PERCENT_COL_RE = re.compile(
     r".*pct$|.*percent.*|.*ratio.*|.*margin$|.*_share$",
     re.I,
 )
+
+# Words in the user's question that ask for a share-of-total / proportion view.
+# When present AND the ranking has a small number of slices, the chart spec
+# kind becomes "pie" instead of "bar".
+_PIE_INTENT_RE = re.compile(
+    r"\b(share|proportion|percentage of total|percent of total|"
+    r"distribution|composition|split|breakdown|make[- ]?up|pie)\b",
+    re.I,
+)
+_PIE_MAX_SLICES = 8  # pie is unreadable past ~8 slices → fall back to bar
+
+
+def _spec_kind(
+    legacy_kind: str,
+    point_count: int,
+    question: str | None,
+) -> str | None:
+    """Map the legacy SalesChart kind → the frontend-agnostic chart spec
+    kind required on the `final` payload: "line" | "bar" | "pie".
+
+      - "trend"   → "line"  (time series)
+      - "ranking" → "pie"   when the question asks for share-of-total AND
+                    there are <= _PIE_MAX_SLICES slices; otherwise "bar".
+      - "summary" → None    (single scalar — task says omit the chart spec;
+                    there is nothing to plot as a series of points).
+
+    Returns None when no point-based spec should be emitted.
+    """
+    if legacy_kind == "trend":
+        return "line"
+    if legacy_kind == "ranking":
+        q = question or ""
+        if 2 <= point_count <= _PIE_MAX_SLICES and _PIE_INTENT_RE.search(q):
+            return "pie"
+        return "bar"
+    return None
+
+
+def _spec_title(question: str | None, y_label: str, x_label: str) -> str:
+    """A short, human chart title. Prefer the user's own question (trimmed);
+    fall back to "<measure> by <dimension>". Never fabricates data."""
+    q = (question or "").strip()
+    if q:
+        q = q.rstrip("?.! ").strip()
+        if q:
+            # Capitalise first letter without touching the rest.
+            return q[0].upper() + q[1:]
+    measure = (y_label or "value").replace("_", " ")
+    dim = (x_label or "category").replace("_", " ")
+    return f"{measure} by {dim}"
 
 
 def _derive_aggregation_type(y_col: str | None, supplied: str | None) -> str:
@@ -162,11 +247,49 @@ def _order_by_col(sql: str | None, cols: list[str]) -> str | None:
     return first if first in cols else None
 
 
+def _attach_spec(
+    chart: dict[str, Any],
+    points: list[dict[str, Any]],
+    y_label: str,
+    x_label: str,
+    question: str | None,
+) -> dict[str, Any]:
+    """Enrich an existing SalesChart dict IN-PLACE with the frontend-agnostic
+    chart spec fields required on the `final` answer payload:
+
+        chart_type : "bar" | "line" | "pie"
+        title      : str
+        x_label    : str
+        y_label    : str
+        points     : [{"label": str, "value": number}]
+
+    These are ADDITIVE — the legacy SalesChart keys (kind / series / items /
+    totals / y_label / granularity) are left untouched so the current
+    frontend keeps rendering exactly as before. The `points` values come
+    straight from the same result rows the legacy series/items were built
+    from; nothing is fabricated. `chart_type` is omitted (along with the
+    other spec fields) when the result is a single scalar.
+    """
+    kind = _spec_kind(str(chart.get("kind") or ""), len(points), question)
+    if kind is None or not points:
+        return chart
+    chart["chart_type"] = kind
+    chart["x_label"] = x_label
+    chart["y_label"] = y_label
+    chart["title"] = _spec_title(question, y_label, x_label)
+    chart["points"] = [
+        {"label": str(p.get("name")), "value": _num(p.get("value"))}
+        for p in points
+    ]
+    return chart
+
+
 def _build_chart_payload(
     rows: list[dict[str, Any]],
     sql: str | None = None,
     granularity: str | None = None,
     aggregation_type: str | None = None,
+    question: str | None = None,
 ) -> dict[str, Any] | None:
     """Build a SalesChart payload - the exact shape the frontend ChatChart
     renders. Returns:
@@ -232,14 +355,20 @@ def _build_chart_payload(
         if x_col and types.get(x_col) == "text" and not _re3.match(r"^\d", x_val):
             # Single-row ranking result (e.g. LIMIT 1 on brand/category)
             # Emit as ranking so the frontend shows a bar item, not a big number.
-            return {
+            _yl = _y_label_for(y_col)
+            _chart = {
                 "kind": "ranking",
                 "granularity": gran,
                 "totals": {"total_sales": _num(rows[0].get(y_col)), "orders": 0, "customers": 0},
                 "series": [],
                 "items": [{"name": x_val, "sales": _num(rows[0].get(y_col)), "orders": 0}],
-                "y_label": _y_label_for(y_col),
+                "y_label": _yl,
             }
+            return _attach_spec(
+                _chart,
+                [{"name": x_val, "value": _num(rows[0].get(y_col))}],
+                _yl, x_col, question,
+            )
         return {
             "kind": "summary",
             "granularity": gran,
@@ -284,7 +413,7 @@ def _build_chart_payload(
         total_val = sum(p["value"] for p in points)
 
     if _looks_like_dates(x_col, capped):
-        return {
+        _chart = {
             "kind": "trend",
             "granularity": gran,
             "totals": {"total_sales": total_val, "orders": 0, "customers": 0},
@@ -294,8 +423,9 @@ def _build_chart_payload(
             ],
             "y_label": y_label,
         }
+        return _attach_spec(_chart, points, y_label, x_col, question)
 
-    return {
+    _chart = {
         "kind": "ranking",
         "granularity": gran,
         "totals": {"total_sales": total_val, "orders": 0, "customers": 0},
@@ -306,6 +436,7 @@ def _build_chart_payload(
         ],
         "y_label": y_label,
     }
+    return _attach_spec(_chart, points, y_label, x_col, question)
 
 
 class SqlExecutorTool(Tool):
@@ -367,6 +498,7 @@ class SqlExecutorTool(Tool):
             result, sql,
             granularity=ctx.state.granularity,
             aggregation_type=_kpi_hint.get("aggregation_type"),
+            question=getattr(ctx.state, "question", None),
         )
         import logging as _lg
         _lg.getLogger("agentic_ai.sql_executor").info(

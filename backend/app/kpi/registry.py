@@ -27,7 +27,7 @@ from typing import Any
 
 import aiosqlite
 
-from app.infrastructure import db_path
+from app.infrastructure import db_path, get_connection
 
 
 _log = logging.getLogger("agentic_ai.kpi.registry")
@@ -57,8 +57,8 @@ CREATE TABLE IF NOT EXISTS {KPI_TABLE} (
     aliases            TEXT NOT NULL DEFAULT '[]',
     enabled            INTEGER NOT NULL DEFAULT 1,
     tier               TEXT NOT NULL DEFAULT 'deterministic',
-    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+    updated_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 )
 """
 
@@ -1973,20 +1973,28 @@ async def init_kpi_table() -> None:
     Also runs a small migration that adds the ``tier`` column to
     pre-existing tables — older deployments do not have it, and the new
     KpiRow / engine code assume it is present.
+
+    Uses get_connection() so the function works on both SQLite (local)
+    and Postgres (prod). The PRAGMA table_info migration is SQLite-only;
+    on Postgres the get_connection shim handles schema translation via
+    the standard information_schema instead.
     """
-    async with aiosqlite.connect(db_path()) as db:
+    from app.db_engine import is_postgres
+    async with get_connection() as db:
         await db.execute(_DDL)
         for stmt in _INDEX_DDL:
             await db.execute(stmt)
-        # Migration: add tier column when missing (older deployments).
-        cur = await db.execute(f"PRAGMA table_info({KPI_TABLE})")
-        cols = {row[1] for row in await cur.fetchall()}
-        await cur.close()
-        if "tier" not in cols:
-            await db.execute(
-                f"ALTER TABLE {KPI_TABLE} "
-                f"ADD COLUMN tier TEXT NOT NULL DEFAULT 'deterministic'"
-            )
+        # Migration: add tier column when missing (older SQLite deployments).
+        # PRAGMA table_info is SQLite-only and must not run on Postgres.
+        if not is_postgres():
+            cur = await db.execute(f"PRAGMA table_info({KPI_TABLE})")
+            cols = {row[1] for row in await cur.fetchall()}
+            await cur.close()
+            if "tier" not in cols:
+                await db.execute(
+                    f"ALTER TABLE {KPI_TABLE} "
+                    f"ADD COLUMN tier TEXT NOT NULL DEFAULT 'deterministic'"
+                )
         await db.commit()
 
 
@@ -2002,7 +2010,7 @@ async def list_kpis(category: str | None = None, enabled_only: bool = True) -> l
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY kpi_category, kpi_name"
-    async with aiosqlite.connect(db_path()) as db:
+    async with get_connection() as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(sql, tuple(params))
         rows = await cur.fetchall()
@@ -2011,7 +2019,7 @@ async def list_kpis(category: str | None = None, enabled_only: bool = True) -> l
 
 
 async def get_kpi(kpi_id: str) -> KpiRow | None:
-    async with aiosqlite.connect(db_path()) as db:
+    async with get_connection() as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             f"SELECT * FROM {KPI_TABLE} WHERE id = ? OR kpi_name = ?",
@@ -2050,7 +2058,7 @@ async def upsert_kpi(kpi: dict[str, Any]) -> None:
         str(kpi.get("tier") or "deterministic"),
         now,
     )
-    async with aiosqlite.connect(db_path()) as db:
+    async with get_connection() as db:
         await db.execute(
             f"""INSERT INTO {KPI_TABLE}
                 (id, kpi_name, kpi_category, description, formula_expression,
@@ -2077,10 +2085,10 @@ async def upsert_kpi(kpi: dict[str, Any]) -> None:
 
 
 async def disable_kpi(kpi_id: str) -> bool:
-    async with aiosqlite.connect(db_path()) as db:
+    async with get_connection() as db:
         cur = await db.execute(
             f"UPDATE {KPI_TABLE} SET enabled = 0, "
-            f"updated_at = datetime('now') WHERE id = ?",
+            f"updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (kpi_id,),
         )
         await db.commit()
@@ -2088,10 +2096,10 @@ async def disable_kpi(kpi_id: str) -> bool:
 
 
 async def enable_kpi(kpi_id: str) -> bool:
-    async with aiosqlite.connect(db_path()) as db:
+    async with get_connection() as db:
         cur = await db.execute(
             f"UPDATE {KPI_TABLE} SET enabled = 1, "
-            f"updated_at = datetime('now') WHERE id = ?",
+            f"updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (kpi_id,),
         )
         await db.commit()

@@ -26,13 +26,28 @@ import sqlite3
 from datetime import date as _date_cls, datetime
 from pathlib import Path
 from threading import Lock
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from openpyxl import load_workbook
 
-from app.infrastructure import db_path, get_connection, settings
+from app.infrastructure import db_path, get_connection, quoted, settings
 
 log = logging.getLogger("agentic_ai.dynamic_ingest")
+
+# Optional per-sheet progress hook: callable(done, total, msg). Used by the
+# async /upload_workbook background task to surface ingestion progress.
+ProgressCb = Callable[[int, int, str], None]
+
+
+def _emit_progress(cb: "ProgressCb | None", done: int, total: int, msg: str) -> None:
+    """Invoke a progress callback, swallowing any error. Progress reporting
+    must never abort or corrupt an ingest."""
+    if cb is None:
+        return
+    try:
+        cb(done, total, msg)
+    except Exception:  # pragma: no cover - defensive
+        log.warning("progress_cb raised; ignoring", exc_info=True)
 
 # Tables here NEVER collide with these static system tables.
 _RESERVED_TABLE_NAMES: frozenset[str] = frozenset({
@@ -834,6 +849,7 @@ def ingest_workbook_sync(
     wb_path: Path,
     source_file_name: str,
     batch_id: str,
+    progress_cb: "ProgressCb | None" = None,
 ) -> dict[str, Any]:
     """Loop every sheet in the workbook, ingest each as a dynamic table.
 
@@ -853,9 +869,12 @@ def ingest_workbook_sync(
         except Exception:
             pass
 
+    total = len(sheet_names)
+    _emit_progress(progress_cb, 0, total, "Reading workbook")
+
     ingested: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
-    for sheet in sheet_names:
+    for done, sheet in enumerate(sheet_names, start=1):
         try:
             summary = ingest_sheet(
                 wb_path=wb_path,
@@ -870,6 +889,7 @@ def ingest_workbook_sync(
         except Exception as e:
             log.exception("dynamic_ingest: sheet=%r crashed", sheet)
             skipped.append({"sheet": sheet, "reason": f"{type(e).__name__}: {e}"})
+        _emit_progress(progress_cb, done, total, f"Processed sheet {done}/{total}: {sheet}")
 
     return {
         "batch_id":      batch_id,
@@ -1045,6 +1065,7 @@ async def ingest_workbook_pg(
     wb_path: Path,
     source_file_name: str,
     batch_id: str,
+    progress_cb: "ProgressCb | None" = None,
 ) -> dict[str, Any]:
     """Async Postgres workbook ingest. Mirrors ingest_workbook_sync."""
     wb = load_workbook(filename=str(wb_path), read_only=True, data_only=True)
@@ -1056,9 +1077,12 @@ async def ingest_workbook_pg(
         except Exception:
             pass
 
+    total = len(sheet_names)
+    _emit_progress(progress_cb, 0, total, "Reading workbook")
+
     ingested: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
-    for sheet in sheet_names:
+    for done, sheet in enumerate(sheet_names, start=1):
         try:
             summary = await ingest_sheet_pg(
                 wb_path=wb_path,
@@ -1073,6 +1097,7 @@ async def ingest_workbook_pg(
         except Exception as e:
             log.exception("dynamic_ingest_pg: sheet=%r crashed", sheet)
             skipped.append({"sheet": sheet, "reason": f"{type(e).__name__}: {e}"})
+        _emit_progress(progress_cb, done, total, f"Processed sheet {done}/{total}: {sheet}")
 
     return {
         "batch_id":      batch_id,
@@ -1089,12 +1114,20 @@ async def ingest_workbook(
     wb_path: Path,
     source_file_name: str,
     batch_id: str,
+    progress_cb: "ProgressCb | None" = None,
 ) -> dict[str, Any]:
     """Async dispatcher — Postgres or SQLite based on DATABASE_URL.
 
     Was previously a sync function. The async signature is a small breaking
     change at the one call site (core_system.py upload route) which already
     runs inside an async handler — just `await` the call.
+
+    ``progress_cb`` is an OPTIONAL ``callable(done: int, total: int, msg: str)``
+    invoked once before the loop (``done=0``) and once after each sheet is
+    ingested/skipped. It must be cheap and non-blocking (it runs on the event
+    loop for the PG path, and in the worker thread for the SQLite path). Any
+    exception it raises is swallowed so progress reporting can never break an
+    upload.
     """
     import asyncio as _asyncio
     from app.db_engine import is_postgres
@@ -1103,6 +1136,7 @@ async def ingest_workbook(
             wb_path=wb_path,
             source_file_name=source_file_name,
             batch_id=batch_id,
+            progress_cb=progress_cb,
         )
     # SQLite path stays synchronous + uses raw sqlite3 — push it to a thread
     # so it doesn't block the event loop.
@@ -1111,6 +1145,7 @@ async def ingest_workbook(
         wb_path=wb_path,
         source_file_name=source_file_name,
         batch_id=batch_id,
+        progress_cb=progress_cb,
     )
 
 
@@ -1119,12 +1154,133 @@ async def ingest_workbook(
 # ---------------------------------------------------------------------------
 
 def list_dynamic_tables() -> list[dict[str, Any]]:
-    """All currently-registered dynamic tables with metadata."""
+    """All currently-registered dynamic tables with metadata.
+
+    WARNING: registry-sourced and therefore GLOBAL across tenants. Do NOT use
+    this for any per-request/user-facing listing — it leaks other tenants'
+    table names, columns, source filenames, and row counts. The HTTP route
+    GET /tables/dynamic uses :func:`list_dynamic_tables_for_tenant` instead,
+    which introspects only the current tenant's schema. This sync helper is
+    kept for internal callers (prompt schema summary, validator whitelist)
+    that run outside a request/tenant context.
+    """
     reg = load_registry()
     return [
         {"table": name, **meta}
         for name, meta in sorted(reg.items())
     ]
+
+
+# Metadata columns every dynamic table carries (see _build_create_sql*).
+# Excluded from the user-facing column list so the introspected shape matches
+# what the registry historically reported.
+_DYNAMIC_META_COLUMNS: frozenset[str] = frozenset(
+    {"_id", "_batch_id", "_source_sheet", "_inserted_at"}
+)
+
+
+async def list_dynamic_tables_for_tenant() -> list[dict[str, Any]]:
+    """Tenant-scoped dynamic-table listing — ZERO cross-tenant leakage.
+
+    Unlike :func:`list_dynamic_tables` (which reads the global registry file),
+    this introspects the CURRENT tenant's schema only, so it sees exactly the
+    ``u_*`` tables that tenant owns. The caller is responsible for binding the
+    query tenant (e.g. ``set_query_tenant``) BEFORE awaiting this, so that
+    ``current_schema()`` / ``search_path`` already point at the tenant's schema.
+
+    Each entry mirrors the legacy registry shape as closely as the per-tenant
+    schema allows::
+
+        {
+          "table": "u_sales",
+          "columns": [{"name": "...", "type": "..."}, ...],   # user cols only
+          "row_count": <int>,
+          "source_sheet": "...",          # from the table's _source_sheet
+          "uploaded_at": "...",           # MAX(_inserted_at), ISO string
+        }
+
+    ``source_file`` is intentionally OMITTED: it is not tracked inside the
+    tenant's own schema (only in the shared ``public.uploads`` table, keyed by
+    batch_id), so sourcing it would either reintroduce cross-tenant exposure or
+    require an unreliable join. Consumers must treat it as optional.
+    """
+    from app.db_engine import is_postgres
+
+    out: list[dict[str, Any]] = []
+    async with get_connection() as db:
+        # 1. List this tenant's u_* tables (own schema only).
+        if is_postgres():
+            cur = await db.execute(
+                "SELECT table_name AS name FROM information_schema.tables "
+                "WHERE table_schema=current_schema() "
+                "AND table_name LIKE 'u\\_%' ESCAPE '\\' "
+                "ORDER BY table_name"
+            )
+        else:
+            cur = await db.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name LIKE 'u\\_%' ESCAPE '\\' "
+                "ORDER BY name"
+            )
+        table_rows = await cur.fetchall()
+        await cur.close()
+        names = [n for n in (dict(r).get("name") for r in table_rows) if n]
+
+        for name in names:
+            # 2. Columns (name + type), excluding the internal _* metadata cols.
+            if is_postgres():
+                cur2 = await db.execute(
+                    "SELECT column_name AS name, data_type AS type "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema=current_schema() AND table_name=? "
+                    "ORDER BY ordinal_position",
+                    (name,),
+                )
+            else:
+                cur2 = await db.execute(f"PRAGMA table_info({quoted(name)})")
+            col_rows = await cur2.fetchall()
+            await cur2.close()
+            columns = [
+                {"name": dict(c)["name"], "type": (dict(c).get("type") or "TEXT")}
+                for c in col_rows
+                if dict(c).get("name") not in _DYNAMIC_META_COLUMNS
+            ]
+
+            entry: dict[str, Any] = {"table": name, "columns": columns}
+
+            # 3. row_count + source_sheet + uploaded_at, sourced from the
+            #    tenant's OWN table (the _source_sheet / _inserted_at metadata
+            #    columns written at ingest time). Best-effort: a freshly
+            #    created/locked table shouldn't 500 the whole listing.
+            try:
+                cur3 = await db.execute(
+                    f'SELECT COUNT(*) AS n, '
+                    f'MIN(_source_sheet) AS source_sheet, '
+                    f'MAX(_inserted_at) AS uploaded_at '
+                    f'FROM {quoted(name)}'
+                )
+                agg = await cur3.fetchall()
+                await cur3.close()
+                if agg:
+                    a = dict(agg[0])
+                    entry["row_count"] = int(a.get("n") or 0)
+                    if a.get("source_sheet") is not None:
+                        entry["source_sheet"] = a["source_sheet"]
+                    if a.get("uploaded_at") is not None:
+                        # asyncpg may return a datetime; normalise to str so
+                        # the JSON envelope matches the registry's ISO strings.
+                        entry["uploaded_at"] = str(a["uploaded_at"])
+            except Exception:
+                log.warning(
+                    "list_dynamic_tables_for_tenant: metadata aggregate failed "
+                    "for %r; reporting row_count=0",
+                    name,
+                    exc_info=True,
+                )
+                entry.setdefault("row_count", 0)
+
+            out.append(entry)
+    return out
 
 
 def dynamic_table_columns(table: str) -> list[dict[str, str]] | None:
@@ -1140,6 +1296,9 @@ def dynamic_schema_summary() -> str:
 
     Returns "" when no dynamic tables exist so we don't pollute the prompt.
     """
+    # TODO(tenant-leak): switch to list_dynamic_tables_for_tenant once caller is async.
+    # This function is sync; its callers (LLM prompt builder in core_system) are also
+    # sync-call sites, so converting would require a non-trivial async refactor.
     tables = list_dynamic_tables()
     if not tables:
         return ""
@@ -1159,6 +1318,9 @@ def dynamic_schema_summary() -> str:
 def known_dynamic_identifiers() -> set[str]:
     """All table + column names from the registry — for SQL validator
     whitelist."""
+    # TODO(tenant-leak): switch to list_dynamic_tables_for_tenant once caller is async.
+    # This function is sync; the SQL validator whitelist is built synchronously in the
+    # coordinator tool, so converting would require a non-trivial async refactor.
     out: set[str] = set()
     for t in list_dynamic_tables():
         out.add(t["table"])

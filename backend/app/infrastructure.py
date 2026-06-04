@@ -116,11 +116,9 @@ class Settings(BaseSettings):
     # --- Auth (Phase 3) -------------------------------------------------
     # When False (default), every route is public — matches the historical
     # single-user-MVP behaviour and avoids bricking a deploy that hasn't
-    # set credentials. Flip to True on Render once ADMIN_USERNAME +
-    # ADMIN_PASSWORD + AUTH_TOKEN_SECRET are configured.
+    # set credentials. Flip to True on Render once AUTH_TOKEN_SECRET is
+    # configured; user accounts are self-serve via POST /auth/signup.
     auth_enabled:        bool = Field(default=False, alias="AUTH_ENABLED")
-    admin_username:      str  = Field(default="",    alias="ADMIN_USERNAME")
-    admin_password:      str  = Field(default="",    alias="ADMIN_PASSWORD")
     # Sentinel value used as the in-source default. If auth is enabled and
     # AUTH_TOKEN_SECRET is still this value (i.e. the deployer forgot to
     # set a real one), the app refuses to start — see `_validate_auth()`
@@ -175,11 +173,12 @@ class Settings(BaseSettings):
     def _validate_auth(self) -> None:
         """Refuse to start with insecure auth configuration.
 
-        Triggered only when ``auth_enabled=True``. We require all three of
-        AUTH_TOKEN_SECRET, ADMIN_USERNAME, ADMIN_PASSWORD to be non-empty
-        and the secret to differ from the in-source sentinel. This catches
-        the "AUTH_ENABLED=true but I forgot to set the secret" deploy bug
-        that would otherwise sign tokens with a publicly known string.
+        Triggered only when ``auth_enabled=True``. We require AUTH_TOKEN_SECRET
+        to be non-empty and to differ from the in-source sentinel — this catches
+        the "AUTH_ENABLED=true but I forgot to set the secret" deploy bug that
+        would otherwise sign tokens with a publicly known string. User accounts
+        are self-serve via ``POST /auth/signup`` (no separate admin login), so
+        ADMIN_USERNAME/ADMIN_PASSWORD are not required.
         """
         if not self.auth_enabled:
             return
@@ -189,10 +188,6 @@ class Settings(BaseSettings):
                 "AUTH_TOKEN_SECRET is unset or still the in-source default — "
                 "set it to a strong random string."
             )
-        if not self.admin_username:
-            problems.append("ADMIN_USERNAME is empty.")
-        if not self.admin_password:
-            problems.append("ADMIN_PASSWORD is empty.")
         if problems:
             raise RuntimeError(
                 "AUTH_ENABLED=true but auth config is insecure:\n  - "
@@ -531,6 +526,24 @@ CREATE TABLE IF NOT EXISTS tenants (
 _IDENTITY_INDEXES: tuple[str, ...] = (
     'CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)',
 )
+
+
+# ---------------------------------------------------------------------------
+# Per-tenant schema mapping (LLM/user-driven concept → column map). First-party
+# table in `public`, one row per tenant, isolated by the tenant_id PRIMARY KEY
+# (NOT by search_path) exactly like uploads/conversations. The active mapping
+# is stored as JSON text; the schema is all-TEXT with a Python-supplied
+# timestamp, so the SAME CREATE TABLE string applies in the SQLite branch AND
+# in _init_database_postgres(). See app/schema_mapping/store.py.
+# ---------------------------------------------------------------------------
+
+_TENANT_SCHEMA_MAPS_DDL = """
+CREATE TABLE IF NOT EXISTS tenant_schema_maps (
+    tenant_id     TEXT PRIMARY KEY,
+    mapping_json  TEXT,
+    updated_at    TEXT
+)
+"""
 
 
 def uploads_dir() -> Path:
@@ -875,6 +888,8 @@ async def _init_database_postgres() -> None:
         await db.execute(_TENANTS_DDL)
         for stmt in _IDENTITY_INDEXES:
             await db.execute(stmt)
+        # Per-tenant schema mapping — first-party, all-TEXT, same DDL as SQLite.
+        await db.execute(_TENANT_SCHEMA_MAPS_DDL)
         # Multi-tenant slice 2a — additive tenant_id scaffolding (PG-native,
         # idempotent). The 'public' sentinel is tenant_context.DEFAULT_TENANT_ID.
         # No RLS and no read-scoping in this step; existing rows backfilled so
@@ -1028,6 +1043,8 @@ async def init_database() -> None:
         await db.execute(_TENANTS_DDL)
         for stmt in _IDENTITY_INDEXES:
             await db.execute(stmt)
+        # Per-tenant schema mapping (LLM/user concept → column map) — idempotent.
+        await db.execute(_TENANT_SCHEMA_MAPS_DDL)
         await db.commit()
     log.info("financial DB initialized at %s", p)
 
@@ -1171,6 +1188,7 @@ async def record_upload_meta(
     rows_inserted: int,
     rows_failed: int,
     *,
+    tenant_id: str = "public",
     source: str = "upload",
     status: str = "active",
     min_date: str | None = None,
@@ -1190,12 +1208,13 @@ async def record_upload_meta(
     async with get_connection() as db:
         await db.execute(
             """INSERT INTO public.uploads
-               (batch_id, filename, target, rows_inserted, rows_failed,
+               (batch_id, tenant_id, filename, target, rows_inserted, rows_failed,
                 source, status, min_date, max_date, error_message, file_path,
                 file_hash, file_bytes, dedup_mode,
                 rows_skipped_duplicate, rows_replaced)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (batch_id) DO UPDATE SET
+                 tenant_id = EXCLUDED.tenant_id,
                  filename = EXCLUDED.filename,
                  target = EXCLUDED.target,
                  rows_inserted = EXCLUDED.rows_inserted,
@@ -1211,7 +1230,7 @@ async def record_upload_meta(
                  dedup_mode = EXCLUDED.dedup_mode,
                  rows_skipped_duplicate = EXCLUDED.rows_skipped_duplicate,
                  rows_replaced = EXCLUDED.rows_replaced""",
-            (batch_id, filename, target, rows_inserted, rows_failed,
+            (batch_id, tenant_id, filename, target, rows_inserted, rows_failed,
              source, status, min_date, max_date, error_message, file_path,
              file_hash, file_bytes, dedup_mode,
              rows_skipped_duplicate, rows_replaced),
@@ -1233,18 +1252,30 @@ async def list_uploads_meta(
     )
 
 
-async def get_upload_meta(batch_id: str) -> dict[str, Any] | None:
+async def get_upload_meta(batch_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
+    if tenant_id is not None:
+        return await fetch_one(
+            f"SELECT {_UPLOAD_META_COLS} FROM public.uploads WHERE batch_id = ? AND tenant_id = ?",
+            (batch_id, tenant_id),
+        )
     return await fetch_one(
         f"SELECT {_UPLOAD_META_COLS} FROM public.uploads WHERE batch_id = ?",
         (batch_id,),
     )
 
 
-async def find_active_upload_by_file_hash(file_hash: str) -> dict[str, Any] | None:
+async def find_active_upload_by_file_hash(file_hash: str, tenant_id: str | None = None) -> dict[str, Any] | None:
     """Return the metadata of an existing active upload whose source file
     hashes to the same SHA256. None if no match."""
     if not file_hash:
         return None
+    if tenant_id is not None:
+        return await fetch_one(
+            f"SELECT {_UPLOAD_META_COLS} FROM public.uploads "
+            "WHERE file_hash = ? AND status = 'active' AND tenant_id = ? "
+            "ORDER BY uploaded_at DESC LIMIT 1",
+            (file_hash, tenant_id),
+        )
     return await fetch_one(
         f"SELECT {_UPLOAD_META_COLS} FROM public.uploads "
         "WHERE file_hash = ? AND status = 'active' "
@@ -1253,7 +1284,7 @@ async def find_active_upload_by_file_hash(file_hash: str) -> dict[str, Any] | No
     )
 
 
-async def archive_upload(batch_id: str) -> dict[str, Any]:
+async def archive_upload(batch_id: str, tenant_id: str | None = None) -> dict[str, Any]:
     """Soft-deactivate a dataset: move its rows from the live table to the
     archive table and flip status='archived'. The source file is kept.
     Analytics SELECTs target the live table only, so the AI immediately
@@ -1261,7 +1292,7 @@ async def archive_upload(batch_id: str) -> dict[str, Any]:
 
     Idempotent: archiving an already-archived batch is a no-op success.
     """
-    meta = await get_upload_meta(batch_id)
+    meta = await get_upload_meta(batch_id, tenant_id=tenant_id)
     if meta is None:
         raise ValueError(f"unknown batch_id: {batch_id}")
     target = meta["target"]
@@ -1314,10 +1345,10 @@ async def archive_upload(batch_id: str) -> dict[str, Any]:
     }
 
 
-async def unarchive_upload(batch_id: str) -> dict[str, Any]:
+async def unarchive_upload(batch_id: str, tenant_id: str | None = None) -> dict[str, Any]:
     """Reverse of archive_upload: move rows back from the archive table to
     the live table and flip status='active'."""
-    meta = await get_upload_meta(batch_id)
+    meta = await get_upload_meta(batch_id, tenant_id=tenant_id)
     if meta is None:
         raise ValueError(f"unknown batch_id: {batch_id}")
     target = meta["target"]
@@ -1431,7 +1462,7 @@ async def _disconnect_workbook(batch_id: str, meta: dict[str, Any]) -> dict[str,
     }
 
 
-async def disconnect_upload(batch_id: str) -> dict[str, Any]:
+async def disconnect_upload(batch_id: str, tenant_id: str | None = None) -> dict[str, Any]:
     """Remove a dataset permanently. Deletes:
       • All rows in sales/purchase AND sales_archive/purchase_archive
         tagged with this batch_id (handles archived datasets correctly),
@@ -1441,7 +1472,7 @@ async def disconnect_upload(batch_id: str) -> dict[str, Any]:
 
     The user must explicitly call this — nothing else removes a dataset.
     """
-    meta = await get_upload_meta(batch_id)
+    meta = await get_upload_meta(batch_id, tenant_id=tenant_id)
     if meta is None:
         raise ValueError(f"unknown batch_id: {batch_id}")
     target = meta["target"]
@@ -1872,15 +1903,23 @@ def cache_key_for(
     question: str,
     *,
     conversation_id: str | None = None,
+    tenant_id: str = "public",
 ) -> str:
-    """Cache key embeds (prompt_version, data_version, conversation_id, question).
+    """Cache key embeds (tenant_id, prompt_version, data_version, conversation_id, question).
     Bumping ``_PROMPT_VERSION`` invalidates every cached answer in one shot —
     used whenever the system prompt or formatter prompt changes meaningfully,
-    so users immediately see the new behaviour instead of stale answers."""
+    so users immediately see the new behaviour instead of stale answers.
+
+    ``tenant_id`` is placed FIRST so the key is unambiguously tenant-scoped:
+    two tenants asking the identical question never collide on the same global
+    cache file (which would leak one tenant's financial answers to another).
+    It defaults to ``"public"`` so AUTH-off / single-tenant keys are byte-for-byte
+    unchanged from before tenant scoping was added."""
+    tenant = (tenant_id or "public").strip()
     convo = (conversation_id or "default").strip()
     version = get_data_version()
     norm_q = (question or "").strip().lower()
-    payload = f"{_PROMPT_VERSION}|{version}|{convo}|{norm_q}"
+    payload = f"{tenant}|{_PROMPT_VERSION}|{version}|{convo}|{norm_q}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

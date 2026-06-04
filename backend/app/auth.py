@@ -1,8 +1,8 @@
 """Auth helpers — HMAC-signed bearer tokens + a FastAPI dependency.
 
-Design (matches the Phase-3 plan in CONTEXT.md):
-  * Single admin user. Credentials come from ``ADMIN_USERNAME`` /
-    ``ADMIN_PASSWORD`` env vars. There is no user table.
+Design:
+  * Self-serve accounts live in the ``users`` table (see ``app.identity``);
+    ``POST /auth/login`` / ``/auth/signup`` authenticate against it.
   * On ``POST /auth/login`` we mint a self-contained token
     ``<payload_b64>.<sig_b64>``  where ``payload = {"u": username,
     "iat": int, "exp": int}`` and ``sig = HMAC-SHA256(secret, payload_b64)``.
@@ -115,27 +115,3 @@ async def require_auth(request: Request) -> str | None:
             headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
         )
     return user
-
-
-def check_admin_credentials(username: str, password: str) -> bool:
-    """Validate against env vars. Case-insensitive on username, exact on
-    password. Constant-time compare for both.
-
-    No credentials are hardcoded: when ``ADMIN_USERNAME`` / ``ADMIN_PASSWORD``
-    are unset there is nothing to match against, so this returns False. (Real
-    per-user accounts live in the ``users`` table via ``app.identity`` — this
-    legacy admin path is only active when both env vars are explicitly set.)
-    """
-    admin_u = settings.admin_username
-    admin_p = settings.admin_password
-    if not admin_u or not admin_p:
-        return False
-    u_ok = hmac.compare_digest(
-        (username or "").strip().lower().encode("utf-8"),
-        (admin_u or "").strip().lower().encode("utf-8"),
-    )
-    p_ok = hmac.compare_digest(
-        (password or "").encode("utf-8"),
-        (admin_p or "").encode("utf-8"),
-    )
-    return u_ok and p_ok

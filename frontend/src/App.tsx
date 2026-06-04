@@ -30,17 +30,14 @@ import {
   AlertTriangle,
   Building2,
   LayoutDashboard,
-  LogOut,
   MessageSquare,
   MessageSquarePlus,
-  Sparkles,
   Trash2,
   Upload,
 } from 'lucide-react'
 
 import {
   cn,
-  clearAuth,
   fetchUploadsList,
   loginWith,
   probeAuthEnabled,
@@ -49,6 +46,8 @@ import {
 } from '@/client_core'
 import type { NavKey } from '@/client_core'
 import { AiAssistant, Dashboard, ShopInfo, UploadData } from '@/ui_system'
+import { Logo } from '@/logo'
+import { SplashScreen } from '@/splash'
 
 // ===========================================================================
 // Startup gate removed
@@ -93,10 +92,9 @@ const ITEMS: NavItem[] = [
 interface SidebarProps {
   active: NavKey
   onSelect: (key: NavKey) => void
-  onLogout: () => void
 }
 
-function Sidebar({ active, onSelect, onLogout }: SidebarProps) {
+function Sidebar({ active, onSelect }: SidebarProps) {
   const sessions = useAppStore((s) => s.sessions)
   const viewingSessionId = useAppStore((s) => s.viewingSessionId)
   const refreshSessions = useAppStore((s) => s.refreshSessions)
@@ -126,7 +124,7 @@ function Sidebar({ active, onSelect, onLogout }: SidebarProps) {
     <aside className="w-64 shrink-0 bg-zinc-950 border-r border-zinc-800 flex flex-col min-h-0">
       <div className="px-5 h-16 flex items-center gap-2 border-b border-zinc-800 shrink-0">
         <div className="w-7 h-7 rounded-md bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
-          <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+          <Logo className="w-3.5 h-3.5 text-emerald-400" />
         </div>
         <div className="font-semibold tracking-tight">Metric AI</div>
       </div>
@@ -220,18 +218,6 @@ function Sidebar({ active, onSelect, onLogout }: SidebarProps) {
             )
           })
         )}
-      </div>
-
-      <div className="p-3 border-t border-zinc-800 space-y-2 shrink-0">
-        <button
-          type="button"
-          onClick={onLogout}
-          className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-900/40 border border-zinc-800 text-zinc-400 hover:text-zinc-100 hover:border-zinc-700 transition-colors"
-          title="Sign out"
-        >
-          <LogOut className="w-3.5 h-3.5 shrink-0" />
-          <span className="text-xs">Sign out</span>
-        </button>
       </div>
     </aside>
   )
@@ -405,7 +391,7 @@ function LoginGate({ onSuccess }: { onSuccess: () => void }) {
       >
         <div className="flex items-center gap-2">
           <div className="w-7 h-7 rounded-md bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
-            <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+            <Logo className="w-3.5 h-3.5 text-emerald-400" />
           </div>
           <div>
             <div className="font-semibold tracking-tight">Metric AI</div>
@@ -491,11 +477,21 @@ function LoginGate({ onSuccess }: { onSuccess: () => void }) {
 
 
 export default function App() {
-  const [view, setView] = useState<NavKey>('dashboard')
+  // Land in the chat by default (was 'dashboard'). The splash overlay below
+  // covers the first paint and fades into this view.
+  const [view, setView] = useState<NavKey>('ai')
+  // Brand splash. It lives in the main-shell return below, so it only paints
+  // once we're past the LoginGate (i.e. "after login" when auth is on). It
+  // never blocks on the /health probe, so a slow/unreachable backend can't
+  // hang the app on a black screen. Re-armed in the gate's onSuccess so the
+  // post-login entry shows it too. Plays on every mount (no persisted flag).
+  const [showSplash, setShowSplash] = useState(true)
   const authToken = useAppStore((s) => s.auth.token)
   const authEnabled = useAppStore((s) => s.auth.authEnabled)
   // Bump this to force a re-probe of /health (e.g. after login).
   const [authProbe, setAuthProbe] = useState(0)
+  // Fix 1c: Drive OAuth callback — error message surfaced at shell level.
+  const [driveCallbackError, setDriveCallbackError] = useState<string | null>(null)
 
   // Probe /health on boot to discover whether AUTH_ENABLED=true. Result
   // lives in store.auth.authEnabled — the gate below renders only when
@@ -503,6 +499,27 @@ export default function App() {
   useEffect(() => {
     void probeAuthEnabled()
   }, [authProbe])
+
+  // Fix 1c: Detect ?drive=connected / ?drive=error from the OAuth callback.
+  // This must live at the App level (always mounted) so the callback works
+  // even when the user is on a non-Upload view at return time.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const driveParam = params.get('drive')
+    if (!driveParam) return
+    params.delete('drive')
+    const clean = window.location.pathname + (params.toString() ? `?${params}` : '')
+    window.history.replaceState({}, '', clean)
+    if (driveParam === 'connected') {
+      // Switch to the Upload view; UploadData's mount effect will call
+      // loadDriveFiles automatically since it runs on every mount.
+      setView('upload')
+    } else if (driveParam === 'error') {
+      setDriveCallbackError('Google Drive sign-in failed. Please try again.')
+      setView('upload')
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // On every mount, ask the backend which datasets are active and reconcile
   // Zustand so the TopBar always shows the right file name — even after the
@@ -533,19 +550,33 @@ export default function App() {
   // The boolean stays null until probeAuthEnabled resolves; treat null
   // as "not yet enabled" so we don't flash the LoginGate on every boot.
   if (authEnabled === true && !authToken) {
-    return <LoginGate onSuccess={() => setAuthProbe((n) => n + 1)} />
-  }
-
-  const onLogout = () => {
-    clearAuth()
-    // Force the auth probe + uploads fetch to re-run after the token is gone.
-    setAuthProbe((n) => n + 1)
-    window.location.reload()
+    return (
+      <LoginGate
+        onSuccess={() => {
+          setShowSplash(true)
+          setAuthProbe((n) => n + 1)
+        }}
+      />
+    )
   }
 
   return (
     <div className="flex h-screen bg-zinc-950 text-zinc-100">
-      <Sidebar active={view} onSelect={setView} onLogout={onLogout} />
+      {showSplash && <SplashScreen onDone={() => setShowSplash(false)} />}
+      {driveCallbackError && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-lg bg-red-950/90 border border-red-700/60 px-4 py-2.5 text-sm text-red-200 shadow-lg">
+          <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+          <span>{driveCallbackError}</span>
+          <button
+            type="button"
+            onClick={() => setDriveCallbackError(null)}
+            className="ml-1 text-red-400 hover:text-red-200 text-xs font-medium"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+      <Sidebar active={view} onSelect={setView} />
       <main className="flex-1 flex flex-col min-w-0">
         <TopBar />
         <ErrorBoundary key={view} fallbackTitle={`${view} view crashed.`}>
