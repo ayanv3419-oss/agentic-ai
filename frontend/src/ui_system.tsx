@@ -3113,10 +3113,9 @@ export function ShopInfo() {
   const setShop = useAppStore((s) => s.setShop)
   const clearShop = useAppStore((s) => s.clearShop)
   const clearChat = useAppStore((s) => s.clearChat)
-  // Only surface "Sign out" when the backend actually enforces auth. With
-  // AUTH_ENABLED=false there's no login gate to fall back to, so clearing the
-  // token + reloading would just drop the user straight back in — a no-op that
-  // reads as a broken button. Hiding it keeps the control honest.
+  // The sign-out control is always shown. `authEnabled` only shapes the
+  // post-logout UX: with auth on, clearing the token drops the user on the
+  // LoginGate; with auth off there's no gate, so onLogout reloads instead.
   const authEnabled = useAppStore((s) => s.auth.authEnabled)
 
   const [form, setForm] = useState<ShopInfoType>(shop)
@@ -3130,6 +3129,10 @@ export function ShopInfo() {
     // goes null, so no reload is needed — the gate appears immediately.
     clearChat()
     clearAuth()
+    // With auth on, App swaps to the LoginGate the instant the token clears.
+    // With auth off there's no gate to land on, so reload to a clean slate so
+    // the sign-out still visibly takes effect.
+    if (authEnabled !== true) window.location.reload()
   }
 
   const update = <K extends keyof ShopInfoType>(k: K, v: ShopInfoType[K]) =>
@@ -3185,8 +3188,7 @@ export function ShopInfo() {
         </div>
       </form>
 
-      {authEnabled === true && (
-        <div className="mt-10 max-w-2xl rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
+      <div className="mt-10 max-w-2xl rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
           <h3 className="text-sm font-medium text-zinc-200">Account</h3>
           <p className="mt-1 text-xs text-zinc-500">
             Sign out of this device. You will need to log in again to continue.
@@ -3200,8 +3202,7 @@ export function ShopInfo() {
             <LogOut className="w-3.5 h-3.5 shrink-0" />
             <span className="text-xs">Sign out</span>
           </button>
-        </div>
-      )}
+      </div>
     </div>
   )
 }
