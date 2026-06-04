@@ -116,11 +116,9 @@ class Settings(BaseSettings):
     # --- Auth (Phase 3) -------------------------------------------------
     # When False (default), every route is public — matches the historical
     # single-user-MVP behaviour and avoids bricking a deploy that hasn't
-    # set credentials. Flip to True on Render once ADMIN_USERNAME +
-    # ADMIN_PASSWORD + AUTH_TOKEN_SECRET are configured.
+    # set credentials. Flip to True on Render once AUTH_TOKEN_SECRET is
+    # configured; user accounts are self-serve via POST /auth/signup.
     auth_enabled:        bool = Field(default=False, alias="AUTH_ENABLED")
-    admin_username:      str  = Field(default="",    alias="ADMIN_USERNAME")
-    admin_password:      str  = Field(default="",    alias="ADMIN_PASSWORD")
     # Sentinel value used as the in-source default. If auth is enabled and
     # AUTH_TOKEN_SECRET is still this value (i.e. the deployer forgot to
     # set a real one), the app refuses to start — see `_validate_auth()`
@@ -175,11 +173,12 @@ class Settings(BaseSettings):
     def _validate_auth(self) -> None:
         """Refuse to start with insecure auth configuration.
 
-        Triggered only when ``auth_enabled=True``. We require all three of
-        AUTH_TOKEN_SECRET, ADMIN_USERNAME, ADMIN_PASSWORD to be non-empty
-        and the secret to differ from the in-source sentinel. This catches
-        the "AUTH_ENABLED=true but I forgot to set the secret" deploy bug
-        that would otherwise sign tokens with a publicly known string.
+        Triggered only when ``auth_enabled=True``. We require AUTH_TOKEN_SECRET
+        to be non-empty and to differ from the in-source sentinel — this catches
+        the "AUTH_ENABLED=true but I forgot to set the secret" deploy bug that
+        would otherwise sign tokens with a publicly known string. User accounts
+        are self-serve via ``POST /auth/signup`` (no separate admin login), so
+        ADMIN_USERNAME/ADMIN_PASSWORD are not required.
         """
         if not self.auth_enabled:
             return
@@ -189,10 +188,6 @@ class Settings(BaseSettings):
                 "AUTH_TOKEN_SECRET is unset or still the in-source default — "
                 "set it to a strong random string."
             )
-        if not self.admin_username:
-            problems.append("ADMIN_USERNAME is empty.")
-        if not self.admin_password:
-            problems.append("ADMIN_PASSWORD is empty.")
         if problems:
             raise RuntimeError(
                 "AUTH_ENABLED=true but auth config is insecure:\n  - "

@@ -1438,6 +1438,18 @@ async def _run_workbook_ingest(
     from app.tenant_context import set_query_tenant
     set_query_tenant(tenant_id)
 
+    # Defensive: signup-time provisioning is best-effort (identity.py), so a
+    # tenant whose schema was never created would crash on the first CREATE
+    # TABLE under the strict per-tenant search_path. Idempotent + non-fatal.
+    try:
+        from app.db_engine import ensure_tenant_schema
+        await ensure_tenant_schema(tenant_id)
+    except Exception:
+        upload_log.exception(
+            "ensure_tenant_schema failed for tenant=%r (upload continues)",
+            tenant_id,
+        )
+
     job = _UPLOAD_JOBS.get(job_id)
 
     def _progress(done: int, total: int, msg: str) -> None:

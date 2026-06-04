@@ -16,8 +16,9 @@ Public surface:
     resolve_previous_period(spec)     — same length window immediately prior
     invalidate_cache()                — drop cached tokens (call after uploads)
 
-The cache key is the data_version counter (already bumped by every upload),
-so invalidation is automatic.
+The cache is keyed by (tenant_schema, data_version) — every upload bumps the
+version, and each tenant resolves against its own schema, so one tenant's
+"today" is never served to another.
 
 All callers should use these helpers — never `datetime.now()` for analytics.
 """
@@ -41,24 +42,34 @@ _log = logging.getLogger("agentic_ai.time_engine")
 
 
 # ===========================================================================
-# Cache — keyed by data_version
+# Cache — keyed by (tenant_schema, data_version)
 # ===========================================================================
 
 _CACHE_LOCK = Lock()
-_cached_version: int | None = None
-_cached_tokens: dict[str, str] | None = None
-_cached_current: str | None = None
+# Per-tenant cache: tenant_schema -> (data_version, tokens, current_iso).
+# Keyed by the SAME schema pg_connection() routes to (current_tenant_var via
+# tenant_schema), so tenant A's "today" can never be served to tenant B.
+_cache: dict[str, tuple[int, dict[str, str], str | None]] = {}
+
+
+def _tenant_key() -> str:
+    """Cache key = the schema the current request is bound to.
+
+    Leaf-safe local import (time_engine must not import db_engine at module
+    top). Uses tenant_schema(...) — the exact namespace _scan_max_date reads —
+    so AUTH-off ("public") stays byte-identical to the old single-slot cache.
+    """
+    from app.db_engine import current_tenant_var, tenant_schema
+    return tenant_schema(current_tenant_var.get())
 
 
 def invalidate_cache() -> None:
-    """Drop the cached dataset date + tokens. Safe to call any time;
-    bump_data_version() in infrastructure.py already invalidates implicitly,
-    but callers can also force a refresh."""
-    global _cached_version, _cached_tokens, _cached_current
+    """Drop all cached dataset dates + tokens (every tenant). Safe to call any
+    time; bump_data_version() in infrastructure.py already invalidates
+    implicitly, but callers can also force a refresh. Each tenant lazily
+    recomputes against its own schema on the next resolve."""
     with _CACHE_LOCK:
-        _cached_version = None
-        _cached_tokens = None
-        _cached_current = None
+        _cache.clear()
 
 
 # ===========================================================================
@@ -259,30 +270,28 @@ def _compute_tokens(current_iso: str) -> dict[str, str]:
 # ===========================================================================
 
 async def resolve_dataset_date_tokens() -> dict[str, str]:
-    """Resolve every {dataset_*} token. Cached by data_version.
+    """Resolve every {dataset_*} token. Cached by (tenant_schema, data_version).
 
     Returns {} when no data is uploaded yet — callers should treat that as
     a no-op and avoid running time-windowed queries."""
-    global _cached_version, _cached_tokens, _cached_current
+    key = _tenant_key()
     version = get_data_version()
     with _CACHE_LOCK:
-        if _cached_tokens is not None and _cached_version == version:
-            return dict(_cached_tokens)
+        hit = _cache.get(key)
+        if hit is not None and hit[0] == version:
+            return dict(hit[1])
 
     current = await _scan_max_date()
     if current is None:
         with _CACHE_LOCK:
-            _cached_version = version
-            _cached_tokens = {}
-            _cached_current = None
+            _cache[key] = (version, {}, None)
         return {}
 
     tokens = _compute_tokens(current)
     with _CACHE_LOCK:
-        _cached_version = version
-        _cached_tokens = tokens
-        _cached_current = current
-    _log.info("time_engine: dataset_today=%s (data_version=%d)", current, version)
+        _cache[key] = (version, tokens, current)
+    _log.info("time_engine: dataset_today=%s (tenant=%s data_version=%d)",
+              current, key, version)
     return dict(tokens)
 
 

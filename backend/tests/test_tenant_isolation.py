@@ -11,6 +11,9 @@ locks them so a future change can't silently reopen a leak:
      map to two different Postgres schemas, which is what makes the
      ``SET LOCAL search_path`` row isolation in ``app.db_engine.pg_connection``
      actually isolate (``app.db_engine.tenant_schema``).
+  3. The time-engine date-token cache is keyed PER TENANT — the dataset-relative
+     "today / this month" cache (``app.time_engine``) keys by the bound tenant's
+     schema, so tenant A's dates are never served to tenant B.
 
 These are deterministic and need no DB, so they run in CI everywhere. The full
 end-to-end schema isolation (live ingest in tenant A, then assert tenant B's
@@ -95,3 +98,43 @@ class TestTenantSchemaMapping:
         assert s.startswith("t_")
         body = s[2:]
         assert all(ch.islower() or ch.isdigit() or ch == "_" for ch in body), s
+
+
+# ---------------------------------------------------------------------------
+# Invariant 3 — the time-engine date-token cache is tenant-distinct
+# ---------------------------------------------------------------------------
+#
+# resolve_dataset_date_tokens() caches dataset-relative dates ("today", "this
+# month") per tenant. If the cache key were not tenant-distinct, tenant A's
+# dates would be served to tenant B — a real leak that was found and fixed.
+# The key is app.time_engine._tenant_key(); lock that it tracks the bound
+# tenant, matches tenant_schema(), and defaults to "public" when unbound.
+
+
+class TestTimeEngineCacheKeyTenantScoping:
+    def test_key_tracks_bound_tenant(self):
+        from app.db_engine import current_tenant_var, tenant_schema
+        from app.time_engine import _tenant_key
+
+        tok = current_tenant_var.set("tenantA")
+        try:
+            assert _tenant_key() == tenant_schema("tenantA")
+            current_tenant_var.set("tenantB")
+            assert _tenant_key() == tenant_schema("tenantB")
+            assert _tenant_key() != tenant_schema("tenantA"), (
+                "tenant B must not share tenant A's date cache slot (leak!)"
+            )
+        finally:
+            current_tenant_var.reset(tok)
+
+    def test_unbound_default_is_public(self):
+        # AUTH-off / unbound requests must key to "public" so the single-tenant
+        # path is byte-for-byte unchanged.
+        from app.db_engine import current_tenant_var
+        from app.time_engine import _tenant_key
+
+        tok = current_tenant_var.set("public")
+        try:
+            assert _tenant_key() == "public"
+        finally:
+            current_tenant_var.reset(tok)

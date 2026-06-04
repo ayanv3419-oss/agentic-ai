@@ -184,6 +184,11 @@ async def load_table_profile_pg(table: str) -> dict[str, dict[str, Any]]:
     from app.db_engine import pg_connection
     out: dict[str, dict[str, Any]] = {}
     async with pg_connection() as db:
+        # Self-provision: _init_database_postgres() only creates _column_profile
+        # in public; under a tenant search_path the table won't exist yet. A
+        # never-profiled tenant should read empty, not error (mirrors the save
+        # path and relationships.save_relationships_pg).
+        await db.execute(_COLUMN_PROFILE_DDL_PG)
         try:
             cur = await db.execute(
                 "SELECT column_name, pct_non_null, pct_numeric, pct_date, "
