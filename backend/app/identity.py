@@ -116,13 +116,9 @@ async def signup(email: str, password: str) -> Principal:
     one ``users`` row and one ``tenants`` row (``owner_user_id`` = the new user,
     ``name`` defaulting to the email's local-part).
 
-    FIRST-SIGNUP INHERITANCE (multi-tenant slice 2c): the very first account on
-    a fresh install (``users`` table empty) is bound to the existing default
-    tenant ``"public"`` instead of a freshly-minted one — so the operator who
-    signs up first inherits all the data + uploads already sitting in the
-    public schema, and we do NOT create a new (empty) tenant schema for them.
-    Every subsequent signup mints a brand-new uuid tenant and provisions its
-    own isolated Postgres schema via ``ensure_tenant_schema``.
+    Every signup — including the very first — mints a brand-new uuid tenant and
+    provisions its own isolated Postgres schema via ``ensure_tenant_schema``. No
+    account ever inherits the shared ``"public"`` schema (self-serve isolation).
     """
     norm = _normalize_email(email)
     if not norm:
@@ -149,63 +145,20 @@ async def signup(email: str, password: str) -> Principal:
         if existing:
             raise EmailExists(norm)
 
-        # FIRST-SIGNUP INHERITANCE — is the users table currently empty? If so
-        # this is the very first account, so it inherits the existing default
-        # ("public") tenant + its data instead of minting a fresh one. Counted
-        # inside the same transaction as the INSERT below, after the duplicate
-        # pre-check, so the decision is consistent. Defensive: any hiccup
-        # reading the count falls through to the safe default (mint a fresh
-        # tenant), never an exception out of signup.
-        is_first_user = False
-        try:
-            cur = await db.execute("SELECT COUNT(*) AS n FROM users")
-            count_rows = await cur.fetchall()
-            await cur.close()
-            if count_rows:
-                row0 = count_rows[0]
-                # Row access is portable across SQLite (sqlite3.Row / tuple)
-                # and the Postgres adapter (mapping-like row).
-                try:
-                    n_users = row0["n"]
-                except (KeyError, IndexError, TypeError):
-                    n_users = row0[0]
-                is_first_user = int(n_users or 0) == 0
-        except Exception:
-            _log.exception(
-                "users count failed during signup (defaulting to fresh tenant)"
-            )
-            is_first_user = False
-
-        if is_first_user:
-            # Inherit the existing default tenant — no new schema.
-            tenant_id = "public"
-        else:
-            tenant_id = uuid.uuid4().hex
+        # Every signup gets its OWN fresh, isolated tenant — no account ever
+        # inherits the shared "public" schema (self-serve isolation).
+        tenant_id = uuid.uuid4().hex
 
         await db.execute(
             "INSERT INTO users (id, email, password_hash, created_at) "
             "VALUES (?, ?, ?, ?)",
             (user_id, norm, password_hash, created_at),
         )
-        if is_first_user:
-            # Ensure a tenants row for the inherited "public" tenant exists and
-            # is owned by this first user. Upsert so a pre-seeded public row
-            # (or a re-run) doesn't trip the PK — engine-agnostic via
-            # INSERT .. ON CONFLICT (works on both SQLite and Postgres).
-            await db.execute(
-                "INSERT INTO tenants (id, owner_user_id, name, created_at) "
-                "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT (id) DO UPDATE SET "
-                "owner_user_id = EXCLUDED.owner_user_id, "
-                "name = EXCLUDED.name",
-                (tenant_id, user_id, tenant_name, created_at),
-            )
-        else:
-            await db.execute(
-                "INSERT INTO tenants (id, owner_user_id, name, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (tenant_id, user_id, tenant_name, created_at),
-            )
+        await db.execute(
+            "INSERT INTO tenants (id, owner_user_id, name, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (tenant_id, user_id, tenant_name, created_at),
+        )
         await db.commit()
 
     # Provision the tenant's Postgres schema so its u_* tables land in an
@@ -213,20 +166,14 @@ async def signup(email: str, password: str) -> Principal:
     # 2b). Idempotent (CREATE SCHEMA IF NOT EXISTS) and defensive: a
     # provisioning hiccup must never fail an otherwise-successful signup, so we
     # log and continue — the schema is also ensured lazily on first ingest.
-    #
-    # SKIPPED for the first-signup inheritance case: that user runs in the
-    # existing "public" schema, which already exists and already holds the
-    # data they're meant to inherit — creating/binding a new schema would be
-    # wrong (and "public" is not a per-tenant schema we manage).
-    if not is_first_user:
-        try:
-            from app.db_engine import ensure_tenant_schema
-            await ensure_tenant_schema(tenant_id)
-        except Exception:
-            _log.exception(
-                "ensure_tenant_schema failed for tenant=%r (signup continues)",
-                tenant_id,
-            )
+    try:
+        from app.db_engine import ensure_tenant_schema
+        await ensure_tenant_schema(tenant_id)
+    except Exception:
+        _log.exception(
+            "ensure_tenant_schema failed for tenant=%r (signup continues)",
+            tenant_id,
+        )
 
     return Principal(user_id=user_id, tenant_id=tenant_id, email=norm)
 

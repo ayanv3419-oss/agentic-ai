@@ -16,9 +16,29 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 log = logging.getLogger("agentic_ai.profiler")
+
+# Self-provisioning DDL — mirrors infrastructure._COLUMN_PROFILE_DDL_PG exactly.
+# _init_database_postgres() only creates _column_profile in the public schema;
+# under a tenant search_path the table doesn't exist, so we CREATE IF NOT EXISTS
+# here before every save, matching how relationships.py self-provisions _relationships.
+_COLUMN_PROFILE_DDL_PG = """
+CREATE TABLE IF NOT EXISTS _column_profile (
+    table_name      TEXT NOT NULL,
+    column_name     TEXT NOT NULL,
+    pct_non_null    DOUBLE PRECISION NOT NULL DEFAULT 0,
+    pct_numeric     DOUBLE PRECISION NOT NULL DEFAULT 0,
+    pct_date        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    distinct_count  BIGINT NOT NULL DEFAULT 0,
+    min_val         TEXT,
+    max_val         TEXT,
+    profiled_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (table_name, column_name)
+)
+"""
 
 _SYSTEM_COLS: frozenset[str] = frozenset({
     "_id", "_batch_id", "_source_sheet", "_inserted_at",
@@ -130,7 +150,7 @@ async def save_profiles_pg(profiles: list[ColumnProfile]) -> int:
         "INSERT INTO _column_profile "
         "(table_name, column_name, pct_non_null, pct_numeric, pct_date, "
         " distinct_count, min_val, max_val, profiled_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW()) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT (table_name, column_name) DO UPDATE SET "
         "  pct_non_null = EXCLUDED.pct_non_null, "
         "  pct_numeric = EXCLUDED.pct_numeric, "
@@ -138,14 +158,18 @@ async def save_profiles_pg(profiles: list[ColumnProfile]) -> int:
         "  distinct_count = EXCLUDED.distinct_count, "
         "  min_val = EXCLUDED.min_val, "
         "  max_val = EXCLUDED.max_val, "
-        "  profiled_at = NOW()"
+        "  profiled_at = EXCLUDED.profiled_at"
     )
+    _now = datetime.now(timezone.utc).isoformat()
     payload = [
         (p.table_name, p.column_name, p.pct_non_null, p.pct_numeric,
-         p.pct_date, p.distinct_count, p.min_val, p.max_val)
+         p.pct_date, p.distinct_count, p.min_val, p.max_val, _now)
         for p in profiles
     ]
     async with pg_connection() as db:
+        # Self-provision: _init_database_postgres() only creates _column_profile
+        # in public; under a tenant search_path the table won't exist yet.
+        await db.execute(_COLUMN_PROFILE_DDL_PG)
         await db.executemany(sql, payload)
     return len(payload)
 

@@ -34,3 +34,18 @@ _dbg_test_cache*
 .DS_Store
 *.log
 Thumbs.db
+
+# --- Local scratch & agent working files (never part of the project) -------
+# Throwaway dev logs, probes, one-off scripts, and planning notes that pile up
+# at the repo root during development. The real source lives under backend/ and
+# frontend/. These patterns are anchored to the root ("/") so they never hide a
+# legitimately tracked file deeper in the tree.
+/_*.err
+/_*.out
+/_*.sse
+/_*.json
+/_*.py
+/_*.md
+/_*.txt
+_dev_pids.txt
+_audit_*.log

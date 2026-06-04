@@ -36,14 +36,15 @@ import {
   FileSpreadsheet,
   LayoutDashboard,
   Loader2,
+  LogOut,
   MessageSquare,
   MessageSquarePlus,
+  Mic,
   RefreshCw,
   Save,
   ShoppingBag,
   ShoppingCart,
   Send,
-  Sparkles,
   Square,
   Trash2,
   TrendingUp,
@@ -53,6 +54,8 @@ import {
   X,
   XCircle,
 } from 'lucide-react'
+import { Logo } from '@/logo'
+import { useSpeechInput } from '@/use_speech_input'
 import {
   Area,
   AreaChart,
@@ -61,6 +64,8 @@ import {
   CartesianGrid,
   Cell,
   Legend,
+  Line,
+  LineChart,
   Pie,
   PieChart,
   ResponsiveContainer,
@@ -72,32 +77,40 @@ import {
 import {
   ApiError,
   cn,
+  clearAuth,
+  confirmSchema,
   disconnectUpload,
   fetchAuthMe,
   fetchDashboard,
   fetchDriveStatus,
   fetchUploadsList,
+  getUploadStatus,
   googleLoginUrl,
   logout,
+  proposeSchema,
   streamAIQuery,
   syncDrive,
   uploadSales,
-  uploadWorkbook,
+  uploadWorkbookAsync,
   useAppStore,
 } from '@/client_core'
 import type {
   AuthMe,
   ChartKind,
+  ChatChartPayload,
   ChatMessage,
   DashboardData,
   DriveFile,
   PeriodTotals,
   RankingItem,
   SalesChart,
+  SchemaMapping,
+  SchemaProposal,
   SseEvent,
   ShopInfo as ShopInfoType,
   ToolEvent,
   UploadEntry,
+  UploadJobStatus,
   UploadStatus,
 } from '@/client_core'
 
@@ -912,6 +925,26 @@ export function AiAssistant() {
   const scrollerRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
+  // Voice dictation: the mic button streams recognized speech into the
+  // composer. We remember whatever was already typed when listening started
+  // (baseText) and append the running transcript to it, so dictation adds to —
+  // never clobbers — text the user typed by hand. Sending stays manual
+  // (Enter / Send), so the rest of the chat flow is untouched.
+  const baseTextRef = useRef('')
+  const speech = useSpeechInput((transcript) => {
+    const base = baseTextRef.current.trim()
+    setInput(base ? `${base} ${transcript}` : transcript)
+  })
+  const handleMicToggle = () => {
+    if (speech.listening) {
+      speech.stop()
+      return
+    }
+    baseTextRef.current = input
+    speech.start()
+    textareaRef.current?.focus()
+  }
+
   // autoscroll on new content
   useEffect(() => {
     const el = scrollerRef.current
@@ -940,6 +973,9 @@ export function AiAssistant() {
   const handleSend = async () => {
     const text = input.trim()
     if (!text || isStreaming) return
+
+    // Sending ends any in-progress dictation.
+    speech.stop()
 
     const userMsg: ChatMessage = {
       id: newId(),
@@ -1002,17 +1038,29 @@ export function AiAssistant() {
               const ok = Boolean(data?.ok)
               const duration = Number(data?.duration_ms ?? 0)
               const error = data?.error ? String(data.error) : undefined
-              toolEvents = toolEvents.map((te) =>
-                te.tool === tool && te.status === 'running'
-                  ? { ...te, status: ok ? 'done' : 'failed', durationMs: duration, error }
-                  : te,
-              )
+              // Fix 4: match the LAST still-running entry for this tool name so
+              // a tool called twice in one loop doesn't clobber the first entry.
+              let matched = false
+              const updated = [...toolEvents].reverse().map((te) => {
+                if (!matched && te.tool === tool && te.status === 'running') {
+                  matched = true
+                  return { ...te, status: (ok ? 'done' : 'failed') as ToolEvent['status'], durationMs: duration, error }
+                }
+                return te
+              }).reverse()
+              toolEvents = updated
               updateMessage(assistantMsg.id, { toolEvents })
               break
             }
             case 'final': {
               const answer = String(data?.answer ?? '')
-              const chart = (data?.chart ?? null) as SalesChart | null
+              // The final payload may carry either the simple W5 chart
+              // ({kind,title,points[]}) or the legacy SalesChart. Stash
+              // whichever arrived; MessageRow branches on the shape.
+              const chart = (data?.chart ?? null) as
+                | SalesChart
+                | ChatChartPayload
+                | null
               updateMessage(assistantMsg.id, {
                 content: answer,
                 chart,
@@ -1171,9 +1219,30 @@ export function AiAssistant() {
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={onKeyDown}
                   rows={1}
-                  placeholder="Ask anything about your business…"
+                  placeholder={
+                    speech.listening
+                      ? 'Listening… speak now'
+                      : 'Ask anything about your business…'
+                  }
                   className="flex-1 resize-none bg-transparent px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none"
                 />
+                {speech.supported && (
+                  <button
+                    type="button"
+                    onClick={handleMicToggle}
+                    className={cn(
+                      'inline-flex items-center justify-center rounded-lg h-9 w-9 shrink-0 transition-colors',
+                      speech.listening
+                        ? 'bg-red-500/15 text-red-400 ring-1 ring-red-500/40 animate-pulse'
+                        : 'text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800',
+                    )}
+                    title={speech.listening ? 'Stop dictation' : 'Dictate — speak instead of typing'}
+                    aria-label={speech.listening ? 'Stop voice dictation' : 'Start voice dictation'}
+                    aria-pressed={speech.listening}
+                  >
+                    <Mic className="w-4 h-4" />
+                  </button>
+                )}
                 {isStreaming ? (
                   <button
                     type="button"
@@ -1197,6 +1266,9 @@ export function AiAssistant() {
                   </button>
                 )}
               </div>
+              {speech.error && (
+                <p className="mt-2 text-[11px] text-red-400 text-center">{speech.error}</p>
+              )}
               <p className="mt-2 text-[11px] text-zinc-600 text-center">
                 Press Enter to send · Shift + Enter for newline
               </p>
@@ -1239,7 +1311,7 @@ function ChatHeader({ onClear, hasMessages }: { onClear: () => void; hasMessages
     <div className="border-b border-zinc-800 px-6 md:px-10 py-4 flex items-center justify-between">
       <div className="flex items-center gap-3">
         <div className="w-9 h-9 rounded-lg bg-zinc-900 border border-zinc-800 flex items-center justify-center">
-          <Sparkles className="w-4 h-4 text-emerald-400" />
+          <Logo className="w-4 h-4 text-emerald-400" />
         </div>
         <div>
           <h1 className="text-base font-semibold tracking-tight">AI Assistant</h1>
@@ -1269,7 +1341,7 @@ function EmptyState({ onPick }: { onPick: (s: string) => void }) {
     <div className="py-16 animate-fade-in">
       <div className="text-center">
         <div className="inline-flex w-14 h-14 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 items-center justify-center mb-5 shadow-lg shadow-emerald-900/20">
-          <Sparkles className="w-6 h-6 text-emerald-400" />
+          <Logo className="w-6 h-6 text-emerald-400" />
         </div>
         <h2 className="text-2xl font-semibold tracking-tight">How can I help today?</h2>
         <p className="mt-2 text-sm text-zinc-500 max-w-sm mx-auto">
@@ -1314,7 +1386,8 @@ function mdSplitRow(row: string): string[] {
   return t.split('|').map((c) => c.trim())
 }
 
-function mdIsTableSeparator(row: string): boolean {
+function mdIsTableSeparator(row: string | undefined): boolean {
+  if (!row) return false
   const t = row.trim()
   if (!t.includes('-') || !t.includes('|')) return false
   const cells = mdSplitRow(t)
@@ -1529,12 +1602,17 @@ function MessageRow({ message }: { message: ChatMessage }) {
   return (
     <div className="flex items-start gap-3 animate-slide-up">
       <div className="w-8 h-8 rounded-full bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center shrink-0">
-        <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+        <Logo className="w-3.5 h-3.5 text-emerald-400" />
       </div>
       <div className="min-w-0 flex-1 max-w-[85%]">
         {showThinking && <ThinkingBlock toolEvents={message.toolEvents} />}
 
-        {message.chart && <ChatChart chart={message.chart} />}
+        {message.chart &&
+          (isChatChartPayload(message.chart) ? (
+            <PointsChart chart={message.chart} />
+          ) : (
+            <ChatChart chart={message.chart} />
+          ))}
 
         {message.content && (
           <div
@@ -1584,6 +1662,179 @@ const KIND_BADGE_LABEL: Record<ChartKind, string> = {
   rca:        'Root cause',
   forecast:   'Forecast',
   anomaly:    'Anomaly scan',
+}
+
+// Discriminate the simple W5 chart payload ({kind:bar|line|pie, points[]})
+// emitted on the agent's `final` event from the richer legacy SalesChart
+// (series/items/comparison). The W5 shape is the only one carrying a `points`
+// array, so its presence is a safe discriminator.
+function isChatChartPayload(
+  chart: SalesChart | ChatChartPayload,
+): chart is ChatChartPayload {
+  return Array.isArray((chart as ChatChartPayload).points)
+}
+
+// W5 chat chart. Renders the agent-supplied {kind, title, x_label, y_label,
+// points[]} as a compact, dark-themed recharts figure: line→LineChart,
+// bar→BarChart, pie→PieChart. Returns null when there are no points so an
+// empty chart object never paints an empty card.
+function PointsChart({ chart }: { chart: ChatChartPayload }) {
+  const points = chart.points ?? []
+  if (points.length === 0) return null
+
+  const kind = chart.chart_type
+  // Long category labels (party names, products) only fit when rotated; short
+  // ones (dates, single words) stay horizontal. Mirrors the dashboard heuristic.
+  const longLabels = points.some((p) => (p.label ?? '').length > 6)
+  const angle = points.length > 4 && longLabels ? -28 : 0
+  const xHeight = angle === 0 ? 28 : 60
+  const chartHeight = 180 + Math.max(0, xHeight - 28)
+
+  const fmtValue = (v: number): string =>
+    (v ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })
+  const fmtCompact = (v: number): string => {
+    if (Math.abs(v) >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`
+    if (Math.abs(v) >= 1_000) return `${(v / 1_000).toFixed(1)}k`
+    return `${v}`
+  }
+  const fmtTick = (l: string): string =>
+    l && l.length > 12 ? `${l.slice(0, 11)}…` : l
+  const yName = chart.y_label || 'Value'
+
+  return (
+    <div className="rounded-2xl rounded-tl-md bg-zinc-900/60 border border-zinc-800 px-4 py-3">
+      {chart.title && (
+        <div className="mb-2 text-sm font-medium tracking-tight text-zinc-100">
+          {chart.title}
+        </div>
+      )}
+      <div className="-ml-2" style={{ height: kind === 'pie' ? 240 : chartHeight }}>
+        <ResponsiveContainer>
+          {kind === 'pie' ? (
+            <PieChart>
+              <Pie
+                data={points}
+                dataKey="value"
+                nameKey="label"
+                cx="50%"
+                cy="50%"
+                innerRadius={50}
+                outerRadius={92}
+                paddingAngle={points.length > 1 ? 2 : 0}
+                stroke="#0a0a0a"
+                strokeWidth={2}
+              >
+                {points.map((entry, idx) => (
+                  <Cell
+                    key={`${entry.label}-${idx}`}
+                    fill={PIE_PALETTE[idx % PIE_PALETTE.length]}
+                  />
+                ))}
+              </Pie>
+              <Tooltip
+                contentStyle={CHART_TOOLTIP_STYLE}
+                formatter={(v: number, _n, ctx) => {
+                  const label =
+                    (ctx?.payload as { label?: string } | undefined)?.label ?? ''
+                  return [fmtValue(v), label]
+                }}
+              />
+              <Legend
+                verticalAlign="middle"
+                align="right"
+                layout="vertical"
+                iconType="circle"
+                wrapperStyle={{ fontSize: 11, color: '#a1a1aa', paddingLeft: 12 }}
+                formatter={(value: string) => (
+                  <span style={{ color: '#d4d4d8' }}>{fmtTick(value)}</span>
+                )}
+              />
+            </PieChart>
+          ) : kind === 'line' ? (
+            <LineChart data={points} margin={{ top: 4, right: 6, left: 0, bottom: 4 }}>
+              <CartesianGrid stroke="#27272a" strokeDasharray="3 3" vertical={false} />
+              <XAxis
+                dataKey="label"
+                stroke="#71717a"
+                fontSize={11}
+                tickLine={false}
+                axisLine={false}
+                tickMargin={8}
+                interval="preserveStartEnd"
+                minTickGap={16}
+                angle={angle}
+                textAnchor={angle === 0 ? 'middle' : 'end'}
+                height={xHeight}
+                tickFormatter={fmtTick}
+                label={
+                  chart.x_label
+                    ? { value: chart.x_label, position: 'insideBottom', offset: -2, fill: '#71717a', fontSize: 11 }
+                    : undefined
+                }
+              />
+              <YAxis
+                stroke="#71717a"
+                fontSize={11}
+                tickLine={false}
+                axisLine={false}
+                width={48}
+                tickFormatter={fmtCompact}
+              />
+              <Tooltip
+                contentStyle={CHART_TOOLTIP_STYLE}
+                cursor={{ stroke: '#3f3f46', strokeDasharray: '3 3' }}
+                formatter={(v: number) => [fmtValue(v), yName]}
+              />
+              <Line
+                type="monotone"
+                dataKey="value"
+                stroke="#10b981"
+                strokeWidth={2}
+                dot={false}
+                activeDot={{ r: 4 }}
+              />
+            </LineChart>
+          ) : (
+            <BarChart data={points} margin={{ top: 4, right: 6, left: 0, bottom: 4 }}>
+              <CartesianGrid stroke="#27272a" strokeDasharray="3 3" vertical={false} />
+              <XAxis
+                dataKey="label"
+                stroke="#71717a"
+                fontSize={11}
+                tickLine={false}
+                axisLine={false}
+                tickMargin={8}
+                interval="preserveStartEnd"
+                angle={angle}
+                textAnchor={angle === 0 ? 'middle' : 'end'}
+                height={xHeight}
+                tickFormatter={fmtTick}
+                label={
+                  chart.x_label
+                    ? { value: chart.x_label, position: 'insideBottom', offset: -2, fill: '#71717a', fontSize: 11 }
+                    : undefined
+                }
+              />
+              <YAxis
+                stroke="#71717a"
+                fontSize={11}
+                tickLine={false}
+                axisLine={false}
+                width={48}
+                tickFormatter={fmtCompact}
+              />
+              <Tooltip
+                contentStyle={CHART_TOOLTIP_STYLE}
+                cursor={{ fill: 'rgba(63, 63, 70, 0.3)' }}
+                formatter={(v: number) => [fmtValue(v), yName]}
+              />
+              <Bar dataKey="value" fill="#10b981" radius={[4, 4, 0, 0]} />
+            </BarChart>
+          )}
+        </ResponsiveContainer>
+      </div>
+    </div>
+  )
 }
 
 function ChatChart({ chart }: { chart: SalesChart }) {
@@ -1942,6 +2193,24 @@ export function UploadData() {
   const [error, setError] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
+  // Live progress of an async workbook upload (W4). Null when no upload is in
+  // flight; otherwise the latest poll of GET /upload_status drives a progress
+  // bar. The interval id is held in a ref so we can stop polling on unmount or
+  // when the job finishes — preventing a setState-after-unmount leak.
+  const [uploadProgress, setUploadProgress] = useState<UploadJobStatus | null>(null)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  useEffect(() => {
+    return () => {
+      if (pollRef.current !== null) clearInterval(pollRef.current)
+    }
+  }, [])
+
+  // After a successful workbook upload the backend's LLM proposes how to read
+  // the data (which column is the sales date, revenue, ...). We hold the
+  // proposal here and render a confirm panel; clearing it (Confirm or Skip)
+  // dismisses the panel.
+  const [schemaProposal, setSchemaProposal] = useState<SchemaProposal | null>(null)
+
   const [auth, setAuth] = useState<AuthMe | null>(null)
   const [driveSyncing, setDriveSyncing] = useState(false)
   const [uploadsRefreshKey, setUploadsRefreshKey] = useState(0)
@@ -1960,7 +2229,9 @@ export function UploadData() {
     try {
       const status = await fetchDriveStatus()
       setDriveFiles(status.files)
-      setAuth((prev) => ({ ...(prev ?? {}), authenticated: status.connected }))
+      // Fix 1a: also carry through google_configured so the panel knows
+      // OAuth is wired even when not yet connected.
+      setAuth((prev) => ({ ...(prev ?? {}), authenticated: status.connected, google_configured: status.configured }))
     } catch (e) {
       setDriveError(e instanceof Error ? e.message : 'Could not list Drive files.')
     } finally {
@@ -1974,7 +2245,9 @@ export function UploadData() {
       try {
         const me = await fetchAuthMe()
         setAuth(me)
-        if (me.authenticated) void loadDriveFiles()
+        // Fix 1b: load Drive files when connected OR when OAuth is configured
+        // (so the panel reflects "configured but not connected" state too).
+        if (me.authenticated || me.google_configured) void loadDriveFiles()
       } catch {
         setAuth({ authenticated: false })
       }
@@ -1982,22 +2255,10 @@ export function UploadData() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Pick up the OAuth-callback signal: refresh status + load the file picker.
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search)
-    const status = params.get('drive')
-    if (status === 'error') setDriveError('Google sign-in failed. Please try again.')
-    if (status === 'connected') {
-      setDriveNote('Google Drive connected. Pick the files to import below.')
-      void loadDriveFiles()
-    }
-    if (status) {
-      params.delete('drive')
-      const clean = window.location.pathname + (params.toString() ? `?${params}` : '')
-      window.history.replaceState({}, '', clean)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  // (Fix 1c) OAuth return detection moved to App.tsx (always mounted).
+  // UploadData's own mount effect already calls loadDriveFiles, so when
+  // App.tsx switches the view to 'upload' after a connect the file picker
+  // refreshes automatically.
 
   const toggleFile = (id: string) => {
     setSelectedFileIds((prev) => {
@@ -2080,34 +2341,110 @@ export function UploadData() {
     setFile(f)
   }
 
+  const describeError = (e: unknown, fallback: string): string => {
+    if (e instanceof ApiError) {
+      const detail = (e.detail as { detail?: string } | undefined)?.detail
+      return detail ?? e.message
+    }
+    if (e instanceof Error) return e.message
+    return fallback
+  }
+
+  // Shared "ingest finished" tail used by both the CSV (blocking) and workbook
+  // (async-polled) paths: record the dataset pill, clear the picker, refresh the
+  // uploads table, then drop into the EXISTING propose→confirm mapping step.
+  // Best-effort: a propose failure must never block the upload, so it's swallowed.
+  const finishIngest = async (name: string, rows: number) => {
+    setDataset({
+      name,
+      rows,
+      uploadedAt: new Date().toISOString(),
+      source: 'upload',
+    })
+    setFile(null)
+    if (inputRef.current) inputRef.current.value = ''
+    refreshUploadsList()
+    try {
+      setSchemaProposal(await proposeSchema())
+    } catch (proposeErr) {
+      // eslint-disable-next-line no-console
+      console.warn('[schema] propose failed; skipping confirm step', proposeErr)
+    }
+  }
+
+  // Poll GET /upload_status every 1.5s until the async workbook job finishes.
+  // Keeps the UI responsive (no 90s blocking request): each tick updates the
+  // progress panel; `done` drops into finishIngest, `error` surfaces the error.
+  const startPolling = (jobId: string, fileName: string) => {
+    if (pollRef.current !== null) clearInterval(pollRef.current)
+    const stop = () => {
+      if (pollRef.current !== null) {
+        clearInterval(pollRef.current)
+        pollRef.current = null
+      }
+    }
+    pollRef.current = setInterval(() => {
+      void (async () => {
+        try {
+          const status = await getUploadStatus(jobId)
+          setUploadProgress(status)
+          if (status.status === 'done') {
+            stop()
+            setUploadProgress(null)
+            setBusy(false)
+            const rows = Number(
+              (status.summary as { rows_inserted?: number; rows?: number } | undefined)
+                ?.rows_inserted ??
+                (status.summary as { rows?: number } | undefined)?.rows ??
+                0,
+            )
+            await finishIngest(fileName, Number.isFinite(rows) ? rows : 0)
+          } else if (status.status === 'error') {
+            stop()
+            setUploadProgress(null)
+            setBusy(false)
+            setError(status.error || status.message || 'Upload failed during processing.')
+            refreshUploadsList()
+          }
+        } catch (e) {
+          stop()
+          setUploadProgress(null)
+          setBusy(false)
+          setError(describeError(e, 'Lost contact while processing the upload.'))
+        }
+      })()
+    }, 1500)
+  }
+
   const onSubmit = async () => {
     if (!file) return
     setBusy(true)
     setError(null)
+    setUploadProgress(null)
+    const isWorkbook = /\.xlsx?$/i.test(file.name)
     try {
-      const isWorkbook = /\.xlsx?$/i.test(file.name)
-      const resp = isWorkbook ? await uploadWorkbook(file) : await uploadSales(file)
-      setDataset({
-        name: resp.filename,
-        rows: resp.rows_inserted,
-        uploadedAt: new Date().toISOString(),
-        source: 'upload',
-      })
-      setFile(null)
-      if (inputRef.current) inputRef.current.value = ''
-      refreshUploadsList()
-    } catch (e) {
-      if (e instanceof ApiError) {
-        const detail = (e.detail as { detail?: string } | undefined)?.detail
-        setError(detail ?? e.message)
-      } else if (e instanceof Error) {
-        setError(e.message)
+      if (isWorkbook) {
+        // Async path: returns immediately with a job id, then we poll. busy stays
+        // true (and is cleared by the poller) so the button can't re-fire.
+        const { job_id } = await uploadWorkbookAsync(file)
+        setUploadProgress({
+          status: 'running',
+          done_sheets: 0,
+          total_sheets: 0,
+          message: 'Starting…',
+        })
+        startPolling(job_id, file.name)
       } else {
-        setError('Upload failed.')
+        // CSV path is a fast synchronous insert (/upload) — keep it blocking.
+        const resp = await uploadSales(file)
+        await finishIngest(resp.filename, resp.rows_inserted)
+        setBusy(false)
       }
+    } catch (e) {
+      setError(describeError(e, 'Upload failed.'))
       // Even errors are recorded server-side — refresh so the user sees them.
       refreshUploadsList()
-    } finally {
+      setUploadProgress(null)
       setBusy(false)
     }
   }
@@ -2169,12 +2506,18 @@ export function UploadData() {
 
           {error && <p className="mt-3 text-xs text-red-400">{error}</p>}
 
+          {uploadProgress && <UploadProgress progress={uploadProgress} />}
+
           <button
             onClick={onSubmit}
             disabled={!file || busy}
             className="btn btn-primary mt-5 w-full"
           >
-            {busy ? 'Uploading…' : 'Upload'}
+            {uploadProgress
+              ? 'Processing…'
+              : busy
+                ? 'Uploading…'
+                : 'Upload'}
           </button>
         </section>
 
@@ -2297,6 +2640,20 @@ export function UploadData() {
         </section>
       </div>
 
+      {schemaProposal && (
+        <SchemaConfirm
+          proposal={schemaProposal}
+          onDone={() => {
+            setSchemaProposal(null)
+            // Reuse the existing post-upload refresh path: bump the dashboard
+            // (fetchDashboard stamps the store's data_version) and the uploads
+            // list so confirmed numbers show up without a manual reload.
+            void fetchDashboard().catch(() => {})
+            refreshUploadsList()
+          }}
+        />
+      )}
+
       {dataset && (
         <section className="mt-8 card p-5 flex items-center gap-4 animate-slide-up">
           <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
@@ -2321,6 +2678,193 @@ export function UploadData() {
         />
       </div>
     </div>
+  )
+}
+
+// Live progress panel for an async workbook upload (W4). Renders a themed
+// progress bar driven by done_sheets/total_sheets plus the backend's status
+// message. Before the first sheet count arrives (total_sheets === 0) it shows a
+// slim indeterminate-style bar so the user sees immediate feedback.
+function UploadProgress({ progress }: { progress: UploadJobStatus }) {
+  const { done_sheets, total_sheets, message } = progress
+  const known = total_sheets > 0
+  const pct = known
+    ? Math.min(100, Math.round((done_sheets / total_sheets) * 100))
+    : 8
+  return (
+    <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-900/60 px-3.5 py-3">
+      <div className="flex items-center gap-2 text-sm text-zinc-200">
+        <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-400 shrink-0" />
+        <span className="flex-1 min-w-0 truncate">
+          {known
+            ? `Processing sheet ${done_sheets}/${total_sheets}`
+            : 'Preparing your workbook'}
+          {message ? ` · ${message}` : '…'}
+        </span>
+        {known && (
+          <span className="text-xs text-zinc-500 tabular-nums shrink-0">{pct}%</span>
+        )}
+      </div>
+      <div className="mt-2.5 h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+        <div
+          className={cn(
+            'h-full rounded-full bg-emerald-500 transition-all duration-500',
+            !known && 'animate-pulse',
+          )}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+    </div>
+  )
+}
+
+// Concepts shown in the confirm panel, in display order. transaction_date and
+// revenue are guaranteed by the backend contract; the rest render only when the
+// proposal includes them.
+const SCHEMA_CONCEPTS: Array<{ key: string; label: string }> = [
+  { key: 'transaction_date', label: 'Sales date' },
+  { key: 'revenue',          label: 'Revenue / sales amount' },
+  { key: 'customer',         label: 'Customer' },
+  { key: 'invoice_id',       label: 'Invoice #' },
+  { key: 'quantity',         label: 'Quantity' },
+]
+
+interface SchemaConfirmProps {
+  proposal: SchemaProposal
+  onDone: () => void
+}
+
+/**
+ * "Confirm how we read your data" panel. Renders after a successful workbook
+ * upload so the user can verify (and tweak) the LLM's proposed column mapping
+ * before it drives dashboard numbers. Each detected concept gets an editable
+ * <select>; the column universe is derived from every table.column the
+ * proposal already references (grouped by table), since the backend contract
+ * exposes no separate column list. Confirm posts the mapping; Skip dismisses.
+ */
+function SchemaConfirm({ proposal, onDone }: SchemaConfirmProps) {
+  // Editable working copy of the concept→table.column map. Seeded from the
+  // proposal; mutated by the per-concept selects.
+  const [mapping, setMapping] = useState<SchemaMapping>(proposal.mapping)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  // Column universe grouped by table, harvested from every concept the
+  // proposal references. Lets each select offer the columns known for its own
+  // table (the detected value is always present, so the select can never be
+  // empty for a detected concept).
+  const columnsByTable = useMemo(() => {
+    const acc: Record<string, Set<string>> = {}
+    for (const ref of Object.values(proposal.mapping.concepts)) {
+      if (!ref) continue
+      ;(acc[ref.table] ??= new Set<string>()).add(ref.column)
+    }
+    return acc
+  }, [proposal])
+
+  const present = SCHEMA_CONCEPTS.filter(({ key }) => mapping.concepts[key])
+  const issues = proposal.validation?.issues ?? []
+  const validationOk = proposal.validation?.ok !== false
+
+  const onColumnChange = (key: string, column: string) => {
+    setMapping((prev) => {
+      const ref = prev.concepts[key]
+      if (!ref) return prev
+      return {
+        ...prev,
+        concepts: { ...prev.concepts, [key]: { ...ref, column } },
+      }
+    })
+  }
+
+  const onConfirm = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      await confirmSchema(mapping)
+      onDone()
+    } catch (e) {
+      if (e instanceof ApiError) {
+        const body = e.detail as { detail?: string; issues?: string[] } | undefined
+        setError(
+          body?.issues?.length
+            ? body.issues.join('; ')
+            : body?.detail ?? e.message,
+        )
+      } else if (e instanceof Error) {
+        setError(e.message)
+      } else {
+        setError('Could not save your data mapping.')
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section className="mt-8 card p-6 animate-slide-up">
+      <div className="flex items-center gap-2 mb-1">
+        <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+        <h2 className="font-medium text-sm">Confirm how we read your data</h2>
+      </div>
+      <p className="text-xs text-zinc-500 mb-5">
+        We auto-detected which columns hold each value. Check these are right —
+        they drive every number on your dashboard.
+      </p>
+
+      {!validationOk && issues.length > 0 && (
+        <div className="mb-5 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2.5">
+          <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+          <div className="text-[11px] text-amber-200/90 leading-relaxed">
+            {issues.map((issue, i) => (
+              <div key={i}>{issue}</div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="divide-y divide-zinc-800/60 border border-zinc-800 rounded-lg">
+        {present.map(({ key, label }) => {
+          const ref = mapping.concepts[key]!
+          const cols = Array.from(
+            new Set([...(columnsByTable[ref.table] ?? new Set<string>()), ref.column]),
+          )
+          return (
+            <div
+              key={key}
+              className="flex items-center justify-between gap-3 px-3 py-2.5"
+            >
+              <div className="min-w-0">
+                <div className="text-sm text-zinc-200">{label}</div>
+                <div className="text-[11px] text-zinc-500 truncate">{ref.table}</div>
+              </div>
+              <select
+                value={ref.column}
+                onChange={(e) => onColumnChange(key, e.target.value)}
+                className="bg-zinc-900 border border-zinc-800 rounded-md text-xs px-2 py-1 max-w-[55%]"
+              >
+                {cols.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )
+        })}
+      </div>
+
+      {error && <p className="mt-3 text-xs text-red-400">{error}</p>}
+
+      <div className="mt-5 flex items-center gap-3">
+        <button onClick={onConfirm} disabled={busy} className="btn btn-primary">
+          {busy ? 'Saving…' : 'Confirm'}
+        </button>
+        <button onClick={onDone} disabled={busy} className="btn btn-secondary">
+          Skip for now
+        </button>
+      </div>
+    </section>
   )
 }
 
@@ -2568,9 +3112,25 @@ export function ShopInfo() {
   const shop = useAppStore((s) => s.shop)
   const setShop = useAppStore((s) => s.setShop)
   const clearShop = useAppStore((s) => s.clearShop)
+  const clearChat = useAppStore((s) => s.clearChat)
+  // Only surface "Sign out" when the backend actually enforces auth. With
+  // AUTH_ENABLED=false there's no login gate to fall back to, so clearing the
+  // token + reloading would just drop the user straight back in — a no-op that
+  // reads as a broken button. Hiding it keeps the control honest.
+  const authEnabled = useAppStore((s) => s.auth.authEnabled)
 
   const [form, setForm] = useState<ShopInfoType>(shop)
   const [savedAt, setSavedAt] = useState<string | null>(null)
+
+  const onLogout = () => {
+    // Sign out instantly: clear the conversation + auth state in place. The old
+    // window.location.reload() re-downloaded the whole app and re-ran every boot
+    // probe (/health, /uploads, /conversations), which made sign-out feel slow.
+    // App.tsx already renders the LoginGate reactively the moment the auth token
+    // goes null, so no reload is needed — the gate appears immediately.
+    clearChat()
+    clearAuth()
+  }
 
   const update = <K extends keyof ShopInfoType>(k: K, v: ShopInfoType[K]) =>
     setForm((f) => ({ ...f, [k]: v }))
@@ -2624,6 +3184,24 @@ export function ShopInfo() {
           {savedAt && <span className="text-xs text-zinc-500">Saved at {savedAt}</span>}
         </div>
       </form>
+
+      {authEnabled === true && (
+        <div className="mt-10 max-w-2xl rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
+          <h3 className="text-sm font-medium text-zinc-200">Account</h3>
+          <p className="mt-1 text-xs text-zinc-500">
+            Sign out of this device. You will need to log in again to continue.
+          </p>
+          <button
+            type="button"
+            onClick={onLogout}
+            className="mt-4 flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-900/40 border border-zinc-800 text-zinc-400 hover:text-zinc-100 hover:border-zinc-700 transition-colors"
+            title="Sign out"
+          >
+            <LogOut className="w-3.5 h-3.5 shrink-0" />
+            <span className="text-xs">Sign out</span>
+          </button>
+        </div>
+      )}
     </div>
   )
 }

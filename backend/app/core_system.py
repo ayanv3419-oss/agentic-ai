@@ -42,7 +42,7 @@ from app.coordinator.llm import check_llm_health
 from app.dynamic_ingest import (
     drop_all_dynamic_tables,
     ingest_workbook,
-    list_dynamic_tables,
+    list_dynamic_tables_for_tenant,
     reconcile_registry,
 )
 from app.database import engine_kind, engine_status
@@ -347,30 +347,15 @@ async def auth_login(req: LoginRequest, request: Request) -> dict:
             ),
         )
 
-    # Multi-tenant slice 1: real per-user accounts. Try the `users` table
-    # first — on a match we mint a *tenant-bearing* token from the resolved
-    # Principal. `authenticate` never raises and returns None on no-match,
-    # so we simply fall through to the legacy admin path below.
+    # Self-serve accounts only: authenticate against the `users` table and, on
+    # a match, mint a *tenant-bearing* token from the resolved Principal.
+    # `authenticate` never raises and returns None on no-match. (The legacy
+    # ADMIN_USERNAME/ADMIN_PASSWORD path was removed — it minted a tenant-less
+    # token that every data route rejects, so it could never reach any data.)
     from app import identity
-    from app.auth import check_admin_credentials, mint_token
 
     principal = await identity.authenticate(username, password)
-    if principal is not None:
-        log.info("auth/login: success (account) for user=%r", username[:40])
-        return {
-            "ok": True,
-            "authenticated": True,
-            "username": principal.email,
-            "token": identity.mint_token(principal),
-            "token_ttl_hours": settings.auth_token_ttl_hours,
-            "auth_enabled": settings.auth_enabled,
-        }
-
-    # Legacy single-admin path — only active when ADMIN_USERNAME /
-    # ADMIN_PASSWORD are explicitly set (no hardcoded fallback). Mints a
-    # plain (tenant-less) HMAC token, exactly as before, so dev setups that
-    # relied on the admin login keep working when AUTH_ENABLED=false.
-    if not check_admin_credentials(username, password):
+    if principal is None:
         log.info("auth/login: rejected attempt for user=%r", username[:40])
         return JSONResponse(
             status_code=401,
@@ -381,18 +366,12 @@ async def auth_login(req: LoginRequest, request: Request) -> dict:
             ),
         )
 
-    # Mint a self-contained HMAC-signed token. Validates standalone via
-    # AUTH_TOKEN_SECRET — no server-side session store. Frontend sends it
-    # back as `Authorization: Bearer ...` on every subsequent request,
-    # and the auth middleware enforces when AUTH_ENABLED=true.
-    canonical_username = settings.admin_username or username
-    token = mint_token(canonical_username)
-    log.info("auth/login: success for user=%r", username[:40])
+    log.info("auth/login: success (account) for user=%r", username[:40])
     return {
         "ok": True,
         "authenticated": True,
-        "username": canonical_username,
-        "token": token,
+        "username": principal.email,
+        "token": identity.mint_token(principal),
         "token_ttl_hours": settings.auth_token_ttl_hours,
         "auth_enabled": settings.auth_enabled,
     }
@@ -413,10 +392,17 @@ async def auth_me(request: Request) -> dict:
         from app import identity
         principal = identity.verify_token(auth_hdr[7:].strip())
         if principal is not None:
+            try:
+                connected = await asyncio.to_thread(google_drive.is_connected)
+            except Exception:
+                log.warning("drive is_connected check failed", exc_info=True)
+                connected = False
             return {
                 "user_id": principal.user_id,
                 "email": principal.email,
                 "tenant_id": principal.tenant_id,
+                "authenticated": connected,
+                "google_configured": google_drive.is_configured(),
             }
 
     try:
@@ -1192,6 +1178,7 @@ async def upload(
                 target=target_for_record if target_for_record in ALLOWED_TABLES else "sales",
                 rows_inserted=0,
                 rows_failed=0,
+                tenant_id=principal.tenant_id,
                 source="upload",
                 status="error",
                 error_message=reason[:500],
@@ -1274,7 +1261,7 @@ async def upload(
         # dedup_mode='block', refuse with a 409 so the user explicitly
         # chooses how to proceed.
         file_hash, file_bytes_total = compute_file_hash(persistent_path)
-        existing = await find_active_upload_by_file_hash(file_hash)
+        existing = await find_active_upload_by_file_hash(file_hash, tenant_id=principal.tenant_id)
         if existing is not None and dedup_mode == "block":
             crashed = True   # delete the just-spooled redundant copy
             return JSONResponse(status_code=409, content=envelope(
@@ -1410,7 +1397,138 @@ async def upload(
 # the user has multi-domain data (sales + inventory + product catalog +
 # hierarchy) that doesn't fit the legacy two-table model.
 
-@api_router.post("/upload_workbook")
+# In-memory registry of async workbook-ingest jobs, keyed by job_id (== batch_id).
+# Each entry is the shape returned by GET /upload_status/{job_id}:
+#   {
+#     "status":      "running" | "done" | "error",
+#     "done_sheets": int,
+#     "total_sheets": int,
+#     "message":     str,
+#     "summary":     dict | None,   # the ingest summary (+ totals) once done
+#     "error":       str | None,    # error text when status == "error"
+#     "tenant_id":   str,           # owner; used to scope status reads
+#     "filename":    str,
+#   }
+# Lives only for the process lifetime (single-process uvicorn). A restart loses
+# in-flight jobs, which is acceptable for an upload-progress affordance.
+_UPLOAD_JOBS: dict[str, dict] = {}
+
+
+async def _run_workbook_ingest(
+    *,
+    job_id: str,
+    tenant_id: str,
+    persistent_path: Path,
+    filename: str,
+    bytes_written: int,
+) -> None:
+    """Background coroutine that runs the actual multi-sheet ingestion.
+
+    Spawned with ``asyncio.create_task`` from the /upload_workbook handler so
+    the HTTP response can return immediately (202). Updates ``_UPLOAD_JOBS``
+    as it progresses and on completion / failure.
+
+    TENANT BINDING: a freshly-created asyncio task does NOT reliably inherit
+    the request's contextvars, so we MUST re-bind the query tenant explicitly
+    at the very top — before any DB-touching call (ingest_workbook,
+    record_upload_meta, _post_ingest_refresh). Without this the upload could
+    land in the wrong (default) schema and break tenant isolation.
+    """
+    upload_log = logging.getLogger("agentic_ai.api.upload_workbook")
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(tenant_id)
+
+    job = _UPLOAD_JOBS.get(job_id)
+
+    def _progress(done: int, total: int, msg: str) -> None:
+        j = _UPLOAD_JOBS.get(job_id)
+        if j is None:
+            return
+        j["done_sheets"] = done
+        j["total_sheets"] = total
+        j["message"] = msg
+
+    crashed = False
+    try:
+        try:
+            summary = await ingest_workbook(
+                wb_path=persistent_path,
+                source_file_name=filename,
+                batch_id=job_id,
+                progress_cb=_progress,
+            )
+        except Exception as e:
+            upload_log.exception("dynamic_ingest: crashed (job=%s)", job_id)
+            crashed = True
+            if job is not None:
+                job["status"] = "error"
+                job["error"] = f"{type(e).__name__}: {e}"
+                job["message"] = "Ingest failed"
+            return
+
+        # Audit row + bump data_version so caches invalidate. Both run under
+        # the tenant binding set above: record_upload_meta writes the shared
+        # public.uploads table, while _post_ingest_refresh introspects THIS
+        # tenant's u_* schema (relationship detection), so the binding matters.
+        total_rows = sum(s["rows_inserted"] for s in summary["ingested"])
+        try:
+            await record_upload_meta(
+                batch_id=job_id,
+                filename=filename,
+                target="(workbook)",
+                rows_inserted=total_rows,
+                rows_failed=0,
+                tenant_id=tenant_id,
+                source="upload",
+                status="active",
+            )
+        except Exception:
+            upload_log.warning("could not record uploads meta", exc_info=True)
+        new_version = await _post_ingest_refresh()
+
+        upload_log.info(
+            "upload_workbook ok sheets=%d rows=%d batch=%s file=%s data_version=%d",
+            len(summary["ingested"]), total_rows, job_id, persistent_path.name,
+            new_version,
+        )
+
+        if job is not None:
+            job["status"] = "done"
+            job["message"] = "Upload complete"
+            job["done_sheets"] = summary["sheet_count"]
+            job["total_sheets"] = summary["sheet_count"]
+            job["summary"] = {
+                "batch_id":       job_id,
+                "filename":       filename,
+                "sheet_count":    summary["sheet_count"],
+                "tables":         summary["tables"],
+                "ingested":       summary["ingested"],
+                "skipped":        summary["skipped"],
+                "total_rows":     total_rows,
+                "rows_inserted":  total_rows,   # matches UploadResponse contract
+                "data_version":   new_version,
+                "bytes_received": bytes_written,
+                "file_path":      str(persistent_path),
+            }
+    except Exception as e:
+        upload_log.exception("upload_workbook: unhandled crash (job=%s)", job_id)
+        crashed = True
+        if job is not None:
+            job["status"] = "error"
+            job["error"] = f"{type(e).__name__}: {e}"
+            job["message"] = "Upload failed"
+    finally:
+        # Preserve the original partial-file cleanup behavior: a failed ingest
+        # removes the spooled workbook so it isn't left dangling on disk.
+        if crashed:
+            try:
+                if persistent_path.exists():
+                    persistent_path.unlink()
+            except Exception:
+                log.warning("cleanup of failed upload file failed: %s", persistent_path, exc_info=True)
+
+
+@api_router.post("/upload_workbook", status_code=202)
 async def upload_workbook(
     request: Request,
     file: UploadFile = File(...),
@@ -1433,10 +1551,15 @@ async def upload_workbook(
             kind="upload",
         ))
 
+    # Capture the tenant on the request thread — the background task can't rely
+    # on inheriting the request's contextvars, so we pass this explicitly and
+    # re-bind it inside _run_workbook_ingest before any DB work.
+    tenant_id = principal.tenant_id
+
     # Spool to disk under data/uploads/{batch_id}.xlsx — kept until disconnect.
     persistent_path = uploads_dir() / f"{batch_id}.xlsx"
     bytes_written = 0
-    crashed = False
+    spool_failed = False
     try:
         try:
             with persistent_path.open("wb") as out:
@@ -1446,7 +1569,7 @@ async def upload_workbook(
                         break
                     bytes_written += len(chunk)
                     if bytes_written > settings.max_upload_bytes:
-                        crashed = True
+                        spool_failed = True
                         return JSONResponse(status_code=413, content=envelope(
                             "File too large",
                             detail=f"Max {settings.max_upload_bytes // (1024*1024)} MB per upload.",
@@ -1455,7 +1578,7 @@ async def upload_workbook(
                     out.write(chunk)
         except Exception as e:
             upload_log.exception("spool: failed")
-            crashed = True
+            spool_failed = True
             return JSONResponse(status_code=400, content=envelope(
                 "Could not read upload",
                 detail=f"{type(e).__name__}: {e}",
@@ -1463,77 +1586,86 @@ async def upload_workbook(
             ))
 
         if bytes_written == 0:
-            crashed = True
+            spool_failed = True
             return JSONResponse(status_code=400, content=envelope(
                 "Empty file", kind="upload",
             ))
-
-        # Ingest every sheet — drop+create+insert per sheet.
-        try:
-            summary = await ingest_workbook(
-                wb_path=persistent_path,
-                source_file_name=filename,
-                batch_id=batch_id,
-            )
-        except Exception as e:
-            upload_log.exception("dynamic_ingest: crashed")
-            crashed = True
-            return JSONResponse(status_code=500, content=envelope(
-                "Ingest failed",
-                detail=f"{type(e).__name__}: {e}",
-                kind="internal",
-            ))
-
-        # Audit row + bump data_version so caches invalidate.
-        total_rows = sum(s["rows_inserted"] for s in summary["ingested"])
-        try:
-            await record_upload_meta(
-                batch_id=batch_id,
-                filename=filename,
-                target="(workbook)",
-                rows_inserted=total_rows,
-                rows_failed=0,
-                source="upload",
-                status="active",
-            )
-        except Exception:
-            upload_log.warning("could not record uploads meta", exc_info=True)
-        new_version = await _post_ingest_refresh()
-
-        upload_log.info(
-            "upload_workbook ok sheets=%d rows=%d batch=%s file=%s data_version=%d",
-            len(summary["ingested"]), total_rows, batch_id, persistent_path.name,
-            new_version,
-        )
-
-        return {
-            "batch_id":      batch_id,
-            "filename":      filename,
-            "sheet_count":   summary["sheet_count"],
-            "tables":        summary["tables"],
-            "ingested":      summary["ingested"],
-            "skipped":       summary["skipped"],
-            "total_rows":    total_rows,
-            "rows_inserted": total_rows,   # matches UploadResponse contract
-            "data_version":  new_version,
-            "bytes_received": bytes_written,
-            "file_path":     str(persistent_path),
-        }
-    except Exception as e:
-        upload_log.exception("upload_workbook: unhandled crash")
-        crashed = True
-        return JSONResponse(status_code=500, content=envelope(
-            "Upload failed",
-            detail=f"{type(e).__name__}: {e}",
-            kind="internal",
-        ))
     finally:
-        if crashed:
+        # Only clean up here for spooling failures handled inline. Once the
+        # background task owns the file, IT is responsible for cleanup on error.
+        if spool_failed:
             try:
                 if persistent_path.exists():
                     persistent_path.unlink()
             except Exception:
                 log.warning("cleanup of failed upload file failed: %s", persistent_path, exc_info=True)
+
+    # Read total sheet count up front (cheap) so the very first status poll has
+    # a meaningful total_sheets. Best-effort — ingestion still reports it too.
+    total_sheets = 0
+    try:
+        from openpyxl import load_workbook as _load_wb
+        _wb = _load_wb(filename=str(persistent_path), read_only=True, data_only=True)
+        try:
+            total_sheets = len(_wb.sheetnames)
+        finally:
+            try:
+                _wb.close()
+            except Exception:
+                pass
+    except Exception:
+        upload_log.warning("could not pre-read sheet count for %s", persistent_path, exc_info=True)
+
+    # Register the job, then kick off ingestion in the background and return 202
+    # immediately so the client never blocks on the ~minute-long ingest.
+    _UPLOAD_JOBS[batch_id] = {
+        "status":       "running",
+        "done_sheets":  0,
+        "total_sheets": total_sheets,
+        "message":      "Queued",
+        "summary":      None,
+        "error":        None,
+        "tenant_id":    tenant_id,
+        "filename":     filename,
+    }
+
+    asyncio.create_task(_run_workbook_ingest(
+        job_id=batch_id,
+        tenant_id=tenant_id,
+        persistent_path=persistent_path,
+        filename=filename,
+        bytes_written=bytes_written,
+    ))
+
+    return {"job_id": batch_id, "status": "running"}
+
+
+@api_router.get("/upload_status/{job_id}")
+async def upload_status(
+    job_id: str,
+    principal: Principal = Depends(require_principal),
+):
+    """Poll the progress of an async /upload_workbook ingestion job.
+
+    Scoped to the calling tenant: a job started by one tenant is invisible to
+    another (returns 404), so the in-memory registry can't leak cross-tenant
+    upload state.
+    """
+    job = _UPLOAD_JOBS.get(job_id)
+    if job is None or job.get("tenant_id") != principal.tenant_id:
+        return JSONResponse(status_code=404, content=envelope(
+            "Unknown upload job",
+            detail=f"No upload job with id {job_id!r}.",
+            kind="upload",
+        ))
+    return {
+        "status":       job["status"],
+        "done_sheets":  job["done_sheets"],
+        "total_sheets": job["total_sheets"],
+        "message":      job["message"],
+        "summary":      job["summary"],
+        "error":        job["error"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1546,16 +1678,98 @@ async def list_dynamic_tables_route(
 ):
     # DATA-PATH route: lists u_* tables. Bind the query tenant so the listing
     # resolves against the tenant's OWN schema rather than the default.
+    # NOTE: use the tenant-scoped introspecting variant (NOT the global
+    # registry) so this never leaks other tenants' table metadata.
     from app.tenant_context import set_query_tenant
     set_query_tenant(principal.tenant_id)
-    return {"tables": list_dynamic_tables()}
+    return {"tables": await list_dynamic_tables_for_tenant()}
 
 
 @api_router.post("/tables/dynamic/disconnect_all")
-async def disconnect_all_dynamic_tables():
+async def disconnect_all_dynamic_tables(principal: Principal = Depends(require_principal)):
     dropped = await drop_all_dynamic_tables()
     new_version = await _post_ingest_refresh()
     return {"dropped": dropped, "data_version": new_version}
+
+
+# ---------------------------------------------------------------------------
+# /schema/* — tenant schema-concept mapping (propose / confirm / current).
+# Lets a tenant override the deterministic resolver with an LLM-proposed,
+# human-confirmed mapping of canonical concepts -> their real columns. All
+# three are DATA-PATH routes (they introspect / read the tenant's own u_*
+# schema), so each binds the query tenant first like /dashboard does.
+# ---------------------------------------------------------------------------
+
+class SchemaConfirmRequest(BaseModel):
+    """Body for POST /schema/confirm — the mapping the user is confirming.
+
+    Extra fields ignored so a slightly-divergent frontend build still slots
+    in. ``mapping`` mirrors the store/llm_mapper dict format:
+    ``{"concepts": {...}, "source": ..., "updated_at": ...}``.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    mapping: dict[str, Any] = Field(default_factory=dict)
+
+
+@api_router.post("/schema/propose")
+async def schema_propose(
+    principal: Principal = Depends(require_principal),
+):
+    # DATA-PATH route: introspects the tenant's u_* schema. Bind the query
+    # tenant so the proposal + validation resolve against the tenant's OWN
+    # schema rather than the default search_path.
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(principal.tenant_id)
+    from app.schema_mapping.llm_mapper import propose_mapping, validate_mapping
+
+    mapping = await propose_mapping(principal.tenant_id)
+    tables = await list_dynamic_tables_for_tenant()
+    validation = validate_mapping(mapping, tables)
+    return {"mapping": mapping, "validation": validation}
+
+
+@api_router.post("/schema/confirm")
+async def schema_confirm(
+    req: SchemaConfirmRequest,
+    principal: Principal = Depends(require_principal),
+):
+    # DATA-PATH route: validates against the tenant's u_* schema before
+    # persisting. Bind the query tenant first.
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(principal.tenant_id)
+    from app.schema_mapping.llm_mapper import validate_mapping
+    from app.schema_mapping.store import save_tenant_mapping
+
+    mapping = dict(req.mapping or {})
+    tables = await list_dynamic_tables_for_tenant()
+    validation = validate_mapping(mapping, tables)
+    if not validation.get("ok"):
+        return JSONResponse(status_code=400, content=envelope(
+            "Invalid schema mapping",
+            detail="The mapping failed validation; see issues.",
+            kind="validation",
+            extra={"issues": validation.get("issues", [])},
+        ))
+    # Force source="user" — a confirmed mapping is human-authored regardless
+    # of what the body claims.
+    mapping["source"] = "user"
+    await save_tenant_mapping(principal.tenant_id, mapping)
+    return {"ok": True}
+
+
+@api_router.get("/schema/current")
+async def schema_current(
+    principal: Principal = Depends(require_principal),
+):
+    # DATA-PATH route: reads the tenant's stored mapping. Bind the query
+    # tenant first for consistency with the other /schema/* routes.
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(principal.tenant_id)
+    from app.schema_mapping.store import load_tenant_mapping
+
+    return {"mapping": await load_tenant_mapping(principal.tenant_id)}
 
 
 # ---------------------------------------------------------------------------
@@ -1746,7 +1960,7 @@ async def uploads(
 
 
 @api_router.post("/uploads/{batch_id}/archive")
-async def upload_archive(batch_id: str):
+async def upload_archive(batch_id: str, principal: Principal = Depends(require_principal)):
     """Soft-deactivate a dataset. AI immediately stops using it. Source
     file is preserved on disk; rows are moved to the archive table. Use
     `/uploads/{batch_id}/unarchive` to reactivate."""
@@ -1756,7 +1970,7 @@ async def upload_archive(batch_id: str):
             kind="validation",
         ))
     try:
-        result = await archive_upload(batch_id)
+        result = await archive_upload(batch_id, tenant_id=principal.tenant_id)
     except ValueError as e:
         return JSONResponse(status_code=400, content=envelope(
             "Archive failed", detail=str(e), kind="validation",
@@ -1775,7 +1989,7 @@ async def upload_archive(batch_id: str):
 
 
 @api_router.post("/uploads/{batch_id}/unarchive")
-async def upload_unarchive(batch_id: str):
+async def upload_unarchive(batch_id: str, principal: Principal = Depends(require_principal)):
     """Restore an archived dataset back to active. Rows move from the
     archive table to the live table; AI starts using them again."""
     if not batch_id or len(batch_id) > 64:
@@ -1784,7 +1998,7 @@ async def upload_unarchive(batch_id: str):
             kind="validation",
         ))
     try:
-        result = await unarchive_upload(batch_id)
+        result = await unarchive_upload(batch_id, tenant_id=principal.tenant_id)
     except ValueError as e:
         return JSONResponse(status_code=400, content=envelope(
             "Unarchive failed", detail=str(e), kind="validation",
@@ -1838,14 +2052,14 @@ async def datasets_view(
 
 
 @api_router.post("/uploads/{batch_id}/disconnect")
-async def upload_disconnect(batch_id: str):
+async def upload_disconnect(batch_id: str, principal: Principal = Depends(require_principal)):
     if not batch_id or len(batch_id) > 64:
         return JSONResponse(status_code=400, content=envelope(
             "Invalid batch_id", detail="batch_id is empty or too long.",
             kind="validation",
         ))
     try:
-        result = await disconnect_upload(batch_id)
+        result = await disconnect_upload(batch_id, tenant_id=principal.tenant_id)
     except ValueError as e:
         return JSONResponse(status_code=404, content=envelope(
             "Dataset not found", detail=str(e), kind="validation",
@@ -1867,7 +2081,7 @@ async def upload_disconnect(batch_id: str):
 # ---------------------------------------------------------------------------
 
 @api_router.post("/cache/clear")
-async def cache_clear():
+async def cache_clear(principal: Principal = Depends(require_principal)):
     n = invalidate_all()
     new_version = bump_data_version()
     return {"cleared": n, "data_version": new_version}

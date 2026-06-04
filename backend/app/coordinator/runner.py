@@ -70,7 +70,11 @@ async def run_query_turn(
             "question": state.question,
         })
 
-        cache_key = cache_key_for(state.question, conversation_id=state.conversation_id)
+        cache_key = cache_key_for(
+            state.question,
+            conversation_id=state.conversation_id,
+            tenant_id=state.tenant_id,
+        )
         cached = get_cached(cache_key)
         if cached and isinstance(cached, dict) and cached.get("final_answer"):
             await emit("cache.hit", {

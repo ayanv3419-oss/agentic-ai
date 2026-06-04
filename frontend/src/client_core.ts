@@ -32,13 +32,36 @@ export interface ToolEvent {
   reasoning?: string
 }
 
+// Chart payload carried on the AI answer's `final` SSE event (W5). This is the
+// simple, LLM-emitted shape: a kind + labelled points. It is distinct from the
+// richer legacy `SalesChart` (granularity/series/items/comparison) that the
+// dashboard + ResultAggregator produce — both can land on a ChatMessage, and
+// the renderer picks a component by inspecting which shape arrived.
+export interface ChatChartPoint {
+  label: string
+  value: number
+}
+
+export interface ChatChartPayload {
+  // Backend (W5) emits the bar/line/pie discriminator as `chart_type` (the
+  // legacy `kind` field stays = summary/trend/ranking for the old SalesChart).
+  chart_type: 'bar' | 'line' | 'pie'
+  title?: string
+  x_label?: string
+  y_label?: string
+  points: ChatChartPoint[]
+}
+
 export interface ChatMessage {
   id: string
   role: ChatRole
   content: string
   status: ChatStatus
   toolEvents: ToolEvent[]
-  chart?: SalesChart | null
+  // A message may carry either the simple W5 ChatChartPayload (kind bar/line/pie
+  // + points) emitted by the agent's `final` event, or the legacy SalesChart
+  // (series/items/comparison). The renderer branches on the shape.
+  chart?: SalesChart | ChatChartPayload | null
   error?: string
   timestamp: string
 }
@@ -103,6 +126,23 @@ export interface UploadResponse {
   validation?: { batch_rows: number; min_date: string; max_date: string }
   bytes_received?: number
   table_total?: number
+}
+
+// Async workbook upload (W4). POST /upload_workbook now returns immediately
+// with a job_id; the client polls GET /upload_status/{job_id} until the job
+// finishes. `summary` mirrors UploadResponse-style aggregates when done.
+export interface UploadJob {
+  job_id: string
+  status: 'running' | 'done' | 'error'
+}
+
+export interface UploadJobStatus {
+  status: 'running' | 'done' | 'error'
+  done_sheets: number
+  total_sheets: number
+  message: string
+  summary?: Record<string, unknown>
+  error?: string
 }
 
 export type UploadStatus = 'active' | 'error' | 'removed'
@@ -240,6 +280,40 @@ export interface DriveSyncResult {
   rows_inserted_total: number
 }
 
+// Schema mapping — the backend's LLM proposes how to read an uploaded
+// workbook (which table.column holds the sales date, revenue, etc.). The
+// user confirms this once via the Upload flow before it drives dashboard
+// numbers. Only transaction_date + revenue are guaranteed; the rest are
+// optional, so every concept slot is independently nullable.
+export interface ConceptRef {
+  table: string
+  column: string
+}
+
+export interface SchemaMapping {
+  concepts: {
+    transaction_date?: ConceptRef
+    revenue?: ConceptRef
+    customer?: ConceptRef
+    invoice_id?: ConceptRef
+    quantity?: ConceptRef
+    [concept: string]: ConceptRef | undefined
+  }
+  source?: string
+  updated_at?: string
+}
+
+export interface SchemaValidation {
+  ok: boolean
+  issues: string[]
+  mapping: SchemaMapping
+}
+
+export interface SchemaProposal {
+  mapping: SchemaMapping
+  validation: SchemaValidation
+}
+
 // Chat session history (read-only "Recents"). Server-sourced metadata for one
 // stored conversation. Lives in the backend DB (conversations table) and is
 // listed recency-first by the Recents sidebar.
@@ -319,6 +393,10 @@ async function handle<T>(res: Response, label: string): Promise<T> {
     const detail = await res.json().catch(() => undefined)
     // eslint-disable-next-line no-console
     console.error(`[api] ${label} → HTTP ${res.status}`, detail)
+    // Fix 2: clear stored auth token on 401 so LoginGate reappears
+    if (res.status === 401) {
+      try { useAppStore.getState().setAuthToken(null, null) } catch { /* store may not be ready */ }
+    }
     throw new ApiError(`${label} ${res.status}`, res.status, detail)
   }
   return (await res.json()) as T
@@ -579,6 +657,26 @@ export async function uploadWorkbook(file: File): Promise<UploadResponse> {
   return result
 }
 
+// Async workbook upload (W4). POST /upload_workbook returns immediately with a
+// job id instead of blocking for the whole ingest. Reuses uploadFile so the
+// multipart body + Authorization header + BASE_URL come from the shared
+// primitive — only the response shape differs from the legacy uploadWorkbook.
+export async function uploadWorkbookAsync(file: File): Promise<UploadJob> {
+  return uploadFile<UploadJob>('/upload_workbook', file, {})
+}
+
+// Poll the progress of an async workbook upload. apiGet supplies the bearer
+// token + BASE_URL + error handling. When the backend reports `done` it stamps
+// a fresh data_version (if present) so the Dashboard auto-reloads.
+export async function getUploadStatus(jobId: string): Promise<UploadJobStatus> {
+  const result = await apiGet<UploadJobStatus>(
+    `/upload_status/${encodeURIComponent(jobId)}`,
+  )
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  useAppStore.getState().observeServerDataVersion((result as any)?.data_version)
+  return result
+}
+
 export async function fetchUploadsList(): Promise<UploadsListResponse> {
   return apiGet<UploadsListResponse>('/uploads')
 }
@@ -638,6 +736,27 @@ export async function syncDrive(
     target,
     dedup_mode: dedupMode,
   })
+}
+
+// ---------------------------------------------------------------------------
+// Schema mapping confirmation. After a workbook upload the backend's LLM
+// proposes a mapping; the user confirms it once before it drives dashboard
+// numbers. All three reuse apiGet/apiPost so the bearer token + BASE_URL +
+// error handling are inherited from the shared primitives.
+// ---------------------------------------------------------------------------
+
+export async function proposeSchema(): Promise<SchemaProposal> {
+  return apiPost<SchemaProposal>('/schema/propose')
+}
+
+export async function confirmSchema(
+  mapping: SchemaMapping,
+): Promise<{ ok: boolean }> {
+  return apiPost<{ ok: boolean }>('/schema/confirm', { mapping })
+}
+
+export async function getCurrentSchema(): Promise<{ mapping: SchemaMapping | null }> {
+  return apiGet<{ mapping: SchemaMapping | null }>('/schema/current')
 }
 
 // ---------------------------------------------------------------------------
@@ -841,7 +960,7 @@ export const useAppStore = create<AppState>()(
       clearShop: () => set({ shop: emptyShop }),
 
       appendMessage: (m) =>
-        set((s) => ({ chatHistory: [...s.chatHistory, m] })),
+        set((s) => ({ chatHistory: [...s.chatHistory, m].slice(-MAX_PERSISTED_MESSAGES) })),
       updateMessage: (id, patch) =>
         set((s) => ({
           chatHistory: s.chatHistory.map((m) =>

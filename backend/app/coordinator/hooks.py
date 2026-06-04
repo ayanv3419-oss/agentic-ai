@@ -139,23 +139,40 @@ def sql_dryrun_guard(state: TurnState, call: ToolCall) -> HookOutcome:
     sql_to_run = str(call.arguments.get("sql") or "").strip()
     sql_validated = state.sql_draft or ""
 
-    if sql_to_run and sql_validated:
-        if _norm_sql(sql_to_run) != _norm_sql(sql_validated):
-            return HookOutcome(
-                skip=True,
-                reason=(
-                    "SqlExecutor SQL does not match the SqlDryRun-validated "
-                    "SQL - re-run SqlDryRun on the updated SQL first"
+    # Block immediately when SqlExecutor is called with an empty sql argument;
+    # there is nothing to execute and the dry-run guard cannot compare.
+    if not sql_to_run:
+        return HookOutcome(
+            skip=True,
+            reason="SqlExecutor called with empty sql",
+            forced_result=ToolOutcome(
+                ok=False,
+                error=(
+                    "SqlExecutor is blocked: the 'sql' argument is empty. "
+                    "Generate a valid SELECT, call SqlDryRun on it, then "
+                    "call SqlExecutor with the same SQL."
                 ),
-                forced_result=ToolOutcome(
-                    ok=False,
-                    error=(
-                        "SqlExecutor is blocked: the SQL you supplied differs "
-                        "from the SQL that passed SqlDryRun. Call SqlDryRun "
-                        "again on the new SQL, then call SqlExecutor."
-                    ),
+            ),
+        )
+
+    # Bait-and-switch check: runs whenever a validated SQL is recorded,
+    # regardless of whether sql_to_run is set (empty case is caught above).
+    if sql_validated and _norm_sql(sql_to_run) != _norm_sql(sql_validated):
+        return HookOutcome(
+            skip=True,
+            reason=(
+                "SqlExecutor SQL does not match the SqlDryRun-validated "
+                "SQL - re-run SqlDryRun on the updated SQL first"
+            ),
+            forced_result=ToolOutcome(
+                ok=False,
+                error=(
+                    "SqlExecutor is blocked: the SQL you supplied differs "
+                    "from the SQL that passed SqlDryRun. Call SqlDryRun "
+                    "again on the new SQL, then call SqlExecutor."
                 ),
-            )
+            ),
+        )
 
     return HookOutcome()
 

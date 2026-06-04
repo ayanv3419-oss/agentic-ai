@@ -409,13 +409,16 @@ async def ensure_tenant_schema(tenant_id: str) -> None:
     """Idempotently provision a tenant's schema (``CREATE SCHEMA IF NOT EXISTS``).
 
     Additive and safe to call repeatedly. The ``"public"`` tenant already has its
-    schema, so it's a no-op. Runs on a fresh connection with the default
-    search_path (the tenant is intentionally NOT set on this connection)."""
+    schema, so it's a no-op. Uses a RAW pool connection (bypassing pg_connection's
+    search_path wrapper) so the CREATE SCHEMA runs before the schema exists — using
+    pg_connection() here would attempt SET LOCAL search_path to the not-yet-created
+    schema and fail."""
     schema = tenant_schema(tenant_id)
     if schema == "public":
         return
-    async with pg_connection() as db:  # default search_path (tenant not set yet)
-        await db.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
 
 
 @asynccontextmanager
