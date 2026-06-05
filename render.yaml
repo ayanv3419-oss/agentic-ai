@@ -40,18 +40,17 @@ services:
         value: "true"
       - key: AUTH_TOKEN_SECRET
         generateValue: true   # strong random token-signing secret
-      # --- LLM (OpenRouter — free Qwen, OpenAI-compatible) -----------------
-      # OpenRouter aggregates dozens of providers behind one OpenAI-compatible
-      # endpoint and offers Qwen models on a free tier (50 req/day @ $0
-      # balance, 1000 req/day with $10+ unused credit, 20 req/min cap).
-      # Globally accessible — works from networks where Together.ai or
-      # DashScope are blocked.  Sign up at https://openrouter.ai/keys.
+      # --- LLM (Google AI Studio — Gemini, OpenAI-compatible) --------------
+      # Gemini via Google's OpenAI-compatible endpoint. Free tier ~20 req/min,
+      # globally reachable, no card required. Get a key at
+      # https://aistudio.google.com/apikey and set LLM_API_KEY in the Render
+      # dashboard (never commit it). Same provider you use locally as fallback.
       - key: LLM_BASE_URL
-        value: "https://openrouter.ai/api/v1"
+        value: "https://generativelanguage.googleapis.com/v1beta/openai"
       - key: LLM_API_KEY
-        sync: false   # OpenRouter key (sk-or-...) — set in Render dashboard
+        sync: false   # Google AI Studio (Gemini) key (AIza...) — set in Render dashboard
       - key: LLM_MODEL
-        value: "qwen/qwen3-coder:free"
+        value: "models/gemini-2.5-flash"
       - key: LLM_TEMPERATURE
         value: "0.0"
       - key: LLM_MAX_TOKENS
