@@ -35,7 +35,7 @@ from app.coordinator.tools.sql_executor import _enforce_limit
 class TestEnforceLimit:
     def test_simple_select_gets_outer_limit(self):
         out = _enforce_limit("SELECT * FROM sale", 500)
-        assert out == "SELECT * FROM (SELECT * FROM sale) LIMIT 500"
+        assert out == "SELECT * FROM (\nSELECT * FROM sale\n) AS _capped LIMIT 500"
 
     def test_inner_cte_limit_does_not_skip_outer_cap(self):
         # The pre-fix regex matched the inner LIMIT and returned the SQL
@@ -46,12 +46,12 @@ class TestEnforceLimit:
         )
         out = _enforce_limit(sql, 500)
         assert out.startswith("SELECT * FROM (")
-        assert out.endswith(") LIMIT 500")
+        assert out.endswith(") AS _capped LIMIT 500")
 
     def test_subquery_limit_does_not_skip_outer_cap(self):
         sql = "SELECT * FROM (SELECT * FROM sale LIMIT 5) sub"
         out = _enforce_limit(sql, 500)
-        assert out == "SELECT * FROM (SELECT * FROM (SELECT * FROM sale LIMIT 5) sub) LIMIT 500"
+        assert out == "SELECT * FROM (\nSELECT * FROM (SELECT * FROM sale LIMIT 5) sub\n) AS _capped LIMIT 500"
 
     def test_trailing_semicolon_stripped(self):
         out = _enforce_limit("SELECT 1;", 100)
