@@ -10,7 +10,9 @@ explicit with row counts so the LLM never analyses the wrong table.
 """
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 from typing import Any
 
 from app.coordinator.tools.base import Tool, ToolContext, ToolOutcome
@@ -21,6 +23,47 @@ from app.infrastructure import (
     quoted,
 )
 from app.schema_mapping import ResolvedSchema, resolve_schema
+
+
+# --- Per-tenant schema cache + single-flight lock ---------------------------
+# Computing the schema summary does ~15s of DB introspection (per-table row
+# counts, date ranges, relationship hints). Under concurrency every caller
+# recomputing it at once exhausts the connection pool and deadlocks. We cache
+# the computed payload per (tenant, include_user_tables) key and serialise
+# concurrent callers on a per-key asyncio.Lock so only the FIRST caller hits
+# the DB; the rest await the lock holding NO connection, then read the fresh
+# cache and return instantly.
+#
+# The cache key MUST include the tenant: serving one tenant's schema to
+# another would be a cross-tenant data leak.
+_SCHEMA_CACHE: dict[str, tuple[float, dict]] = {}  # key -> (monotonic_ts, payload)
+_SCHEMA_LOCKS: dict[str, asyncio.Lock] = {}
+_SCHEMA_TTL = 300.0  # seconds
+
+
+def _schema_lock(key: str) -> asyncio.Lock:
+    """Return the per-key single-flight lock, creating it on first use.
+
+    A bare module-level dict + asyncio.Lock() is safe on Python 3.12: the
+    lock binds lazily to the running loop on first acquire, and setdefault is
+    atomic with respect to the single-threaded event loop.
+    """
+    return _SCHEMA_LOCKS.setdefault(key, asyncio.Lock())
+
+
+def invalidate_schema_cache(tenant_id: str | None = None) -> None:
+    """Clear cached schema payloads.
+
+    With ``tenant_id=None`` clears the entire cache. Otherwise clears only
+    entries whose key belongs to that tenant (key format ``"{tenant}::{...}"``).
+    Defined for future use (e.g. after an ingest) — not wired anywhere yet.
+    """
+    if tenant_id is None:
+        _SCHEMA_CACHE.clear()
+        return
+    prefix = f"{tenant_id}::"
+    for k in [k for k in _SCHEMA_CACHE if k.startswith(prefix)]:
+        _SCHEMA_CACHE.pop(k, None)
 
 
 async def _table_row_count(db: Any, name: str) -> int:
@@ -563,6 +606,43 @@ class SchemaTool(Tool):
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolOutcome:
         include_user = bool(args.get("include_user_tables", True))
+
+        # Cache key MUST include the tenant — otherwise one tenant's schema
+        # could be served to another (a cross-tenant data leak).
+        from app.db_engine import current_tenant_var
+        tenant = current_tenant_var.get()
+        key = f"{tenant}::{include_user}"
+
+        lock = _schema_lock(key)
+        async with lock:
+            cached = _SCHEMA_CACHE.get(key)
+            if cached is not None and time.monotonic() - cached[0] < _SCHEMA_TTL:
+                # Fresh cache hit — rebuild the exact same ToolOutcome without
+                # touching the DB. The other concurrent callers land here after
+                # the first one finishes computing, so they return instantly.
+                payload = cached[1]
+                return ToolOutcome(
+                    ok=True,
+                    output={
+                        "summary": payload["text"],
+                        "system_tables": payload["system"],
+                        "user_tables": payload["user_tables"],
+                    },
+                    state_updates={
+                        "schema_summary": payload["text"],
+                        "resolved_schema": payload["resolved"],
+                    },
+                )
+
+            return await self._compute(include_user, key)
+
+    async def _compute(self, include_user: bool, key: str) -> ToolOutcome:
+        """Run the expensive DB introspection and cache the result.
+
+        Called while holding the per-key lock, so at most one caller per key
+        executes this at a time. On success the payload is stored in
+        ``_SCHEMA_CACHE``; failures are NOT cached.
+        """
         system = _system_schema()
         user_tables: list[dict[str, Any]] = []
         if include_user:
@@ -633,6 +713,16 @@ class SchemaTool(Tool):
             + rel_block
             + _data_quality_warnings(user_tables)
             + _metric_hints(user_tables, resolved)
+        )
+        # Cache enough to reconstruct the exact same ToolOutcome on a hit.
+        _SCHEMA_CACHE[key] = (
+            time.monotonic(),
+            {
+                "text": text,
+                "system": system,
+                "user_tables": user_tables,
+                "resolved": resolved,
+            },
         )
         return ToolOutcome(
             ok=True,

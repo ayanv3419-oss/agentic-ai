@@ -10,6 +10,7 @@ appended so the model skips its <think>...</think> reasoning block.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -28,6 +29,21 @@ NO_THINK = "/no_think"
 # Error kinds that mean "the provider failed, not our request" — safe to
 # retry the identical call on the fallback provider.
 _RETRYABLE = {"upstream", "network"}
+
+# Process-wide cap on concurrent outbound provider calls. Under load (7
+# users × 8-16 sequential LLM calls each) an uncapped client floods the
+# provider and trips its rate limiter. Acquired PER ATTEMPT around the
+# actual network call only — backoff sleeps happen outside the semaphore
+# so a sleeping retry never holds a slot.
+_LLM_SEMAPHORE = asyncio.Semaphore(4)
+
+# Same-provider retry policy for transient (429 / 5xx / network) failures:
+# the first call plus this many retries, with exponential backoff sleeps
+# between attempts. Only after these are exhausted do we fall back to the
+# secondary provider (handled by complete / complete_with_tools).
+_MAX_RETRIES = 2
+_BACKOFF_SCHEDULE = (0.5, 1.5)  # seconds before retry 1, retry 2
+_RETRY_AFTER_CAP = 10.0          # never honor a Retry-After longer than this
 
 # Provider HTTP status codes that mean the REQUEST was bad, not the
 # provider — retrying (here or on the fallback) fails identically, so
@@ -227,6 +243,48 @@ def _classify_api_error(exc: APIError) -> str:
     return "upstream"
 
 
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Best-effort extraction of a Retry-After hint from a provider error.
+
+    Looks at the error's HTTP response headers for ``Retry-After`` (delta
+    seconds form only; HTTP-date form is ignored). Returns the delay in
+    seconds capped at ``_RETRY_AFTER_CAP``, or ``None`` when absent/unparsable.
+    """
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    try:
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+    except (AttributeError, TypeError):
+        return None
+    if not raw:
+        return None
+    try:
+        secs = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if secs < 0:
+        return None
+    return min(secs, _RETRY_AFTER_CAP)
+
+
+async def _sleep_before_retry(attempt: int, exc: Exception | None) -> None:
+    """Sleep before same-provider retry ``attempt`` (1-based).
+
+    Honors a Retry-After header when the provider supplied one, otherwise
+    falls back to the exponential backoff schedule. The semaphore is NOT
+    held while we sleep — callers acquire it per attempt around the network
+    call only."""
+    idx = min(attempt - 1, len(_BACKOFF_SCHEDULE) - 1)
+    delay = _BACKOFF_SCHEDULE[idx]
+    if exc is not None:
+        hinted = _retry_after_seconds(exc)
+        if hinted is not None:
+            delay = hinted
+    await asyncio.sleep(delay)
+
+
 # ---------------------------------------------------------------------------
 # LLMClient - wraps AsyncOpenAI pointed at Ollama
 # ---------------------------------------------------------------------------
@@ -355,23 +413,49 @@ class LLMClient:
             kwargs["response_format"] = {"type": "json_object"}
         if _model_needs_thinking_flag(self.model):
             kwargs["extra_body"] = {"enable_thinking": False}
-        try:
-            resp = await self._client.chat.completions.create(**kwargs)
-        except APIConnectionError as e:
-            return _err_response(
-                f"Cannot reach LLM at {self.base_url}: {e}",
-                "network",
+
+        resp = None
+        err: LLMResponse | None = None
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES + 1):
+            if attempt > 0:
+                await _sleep_before_retry(attempt, last_exc)
+            last_exc = None
+            try:
+                # Acquire PER ATTEMPT so backoff sleeps above don't hold a slot.
+                async with _LLM_SEMAPHORE:
+                    resp = await self._client.chat.completions.create(**kwargs)
+                err = None
+                break
+            except APIConnectionError as e:
+                last_exc = e
+                err = _err_response(
+                    f"Cannot reach LLM at {self.base_url}: {e}",
+                    "network",
+                )
+            except APITimeoutError as e:
+                last_exc = e
+                err = _err_response(f"LLM request timed out at {self.base_url}: {e}", "network")
+            except APIError as e:
+                last_exc = e
+                err = _err_response(
+                    f"LLM API error from {self.base_url} ({self.model}): {e}",
+                    _classify_api_error(e),
+                )
+            except Exception as e:
+                _log.exception("llm.complete unexpected failure")
+                return _err_response(f"{type(e).__name__}: {e}", "unknown")
+            # Only transient (429 / 5xx / network) errors are retried here;
+            # 4xx client/auth errors fail identically on retry → bail now.
+            if err.error_kind not in _RETRYABLE or attempt == _MAX_RETRIES:
+                break
+            _log.warning(
+                "LLM call to %s failed (%s), retrying %d/%d: %s",
+                self.model, err.error_kind, attempt + 1, _MAX_RETRIES,
+                (err.error or "")[:200],
             )
-        except APITimeoutError as e:
-            return _err_response(f"LLM request timed out at {self.base_url}: {e}", "network")
-        except APIError as e:
-            return _err_response(
-                f"LLM API error from {self.base_url} ({self.model}): {e}",
-                _classify_api_error(e),
-            )
-        except Exception as e:
-            _log.exception("llm.complete unexpected failure")
-            return _err_response(f"{type(e).__name__}: {e}", "unknown")
+        if err is not None:
+            return err
 
         try:
             choice = resp.choices[0]
@@ -453,27 +537,53 @@ class LLMClient:
             kwargs["tool_choice"] = "auto"
         if _model_needs_thinking_flag(self.model):
             kwargs["extra_body"] = {"enable_thinking": False}
-        try:
-            resp = await self._client.chat.completions.create(**kwargs)
-        except APIConnectionError as e:
-            return _err_tool_response(
-                f"Cannot reach LLM at {self.base_url}: {e}",
-                "network",
+
+        resp = None
+        err: LLMToolResponse | None = None
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES + 1):
+            if attempt > 0:
+                await _sleep_before_retry(attempt, last_exc)
+            last_exc = None
+            try:
+                # Acquire PER ATTEMPT so backoff sleeps above don't hold a slot.
+                async with _LLM_SEMAPHORE:
+                    resp = await self._client.chat.completions.create(**kwargs)
+                err = None
+                break
+            except APIConnectionError as e:
+                last_exc = e
+                err = _err_tool_response(
+                    f"Cannot reach LLM at {self.base_url}: {e}",
+                    "network",
+                )
+            except APITimeoutError as e:
+                last_exc = e
+                err = _err_tool_response(f"LLM request timed out at {self.base_url}: {e}", "network")
+            except APIError as e:
+                last_exc = e
+                # Surface the real provider error — status code, body, etc.
+                detail = str(e)
+                status = getattr(e, "status_code", None) or getattr(e, "code", None)
+                body = getattr(e, "body", None) or getattr(e, "response", None)
+                err = _err_tool_response(
+                    f"LLM API error from {self.base_url} (model={self.model}, status={status}): {detail} body={str(body)[:300]}",
+                    _classify_api_error(e),
+                )
+            except Exception as e:
+                _log.exception("llm.complete_with_tools unexpected failure")
+                return _err_tool_response(f"{type(e).__name__}: {e}", "unknown")
+            # Only transient (429 / 5xx / network) errors are retried here;
+            # 4xx client/auth errors fail identically on retry → bail now.
+            if err.error_kind not in _RETRYABLE or attempt == _MAX_RETRIES:
+                break
+            _log.warning(
+                "LLM tool call to %s failed (%s), retrying %d/%d: %s",
+                self.model, err.error_kind, attempt + 1, _MAX_RETRIES,
+                (err.error or "")[:200],
             )
-        except APITimeoutError as e:
-            return _err_tool_response(f"LLM request timed out at {self.base_url}: {e}", "network")
-        except APIError as e:
-            # Surface the real provider error — status code, body, etc.
-            detail = str(e)
-            status = getattr(e, "status_code", None) or getattr(e, "code", None)
-            body = getattr(e, "body", None) or getattr(e, "response", None)
-            return _err_tool_response(
-                f"LLM API error from {self.base_url} (model={self.model}, status={status}): {detail} body={str(body)[:300]}",
-                _classify_api_error(e),
-            )
-        except Exception as e:
-            _log.exception("llm.complete_with_tools unexpected failure")
-            return _err_tool_response(f"{type(e).__name__}: {e}", "unknown")
+        if err is not None:
+            return err
 
         try:
             choice = resp.choices[0]

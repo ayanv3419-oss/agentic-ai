@@ -26,6 +26,7 @@ small so it's predictable.
 """
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import logging
 import os
@@ -101,51 +102,60 @@ def engine_kind() -> str:
 # ---------------------------------------------------------------------------
 
 _pool: Any = None  # asyncpg.Pool
+_pool_lock: "asyncio.Lock | None" = None  # lazily created; guards pool creation
 
 
 async def get_pool() -> Any:
     """Lazy-create the asyncpg pool. Supabase requires SSL; asyncpg detects
     `sslmode=require` in the URL, but we also default to require if not
     specified."""
-    global _pool
+    global _pool, _pool_lock
     if _pool is not None:
         return _pool
-    import asyncpg  # local import — only loaded when Postgres is in use
+    # Double-checked locking: serialize concurrent first-callers so a startup
+    # burst can't race to create duplicate pools. The lock is created lazily so
+    # it binds to the running event loop.
+    if _pool_lock is None:
+        _pool_lock = asyncio.Lock()
+    async with _pool_lock:
+        if _pool is not None:
+            return _pool
+        import asyncpg  # local import — only loaded when Postgres is in use
 
-    url = database_url()
-    if not url:
-        raise RuntimeError("DATABASE_URL not set; cannot create Postgres pool")
+        url = database_url()
+        if not url:
+            raise RuntimeError("DATABASE_URL not set; cannot create Postgres pool")
 
-    # Supabase pooler URLs sometimes use `postgres://` (deprecated by
-    # SQLAlchemy but accepted by asyncpg). Normalize for clarity.
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
+        # Supabase pooler URLs sometimes use `postgres://` (deprecated by
+        # SQLAlchemy but accepted by asyncpg). Normalize for clarity.
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://"):]
 
-    # Default ssl=require for Supabase. Caller can override by appending
-    # ?sslmode=disable to the URL.
-    ssl_arg: Any = "require"
-    if "sslmode=" in url:
-        ssl_arg = None  # let asyncpg parse the URL's sslmode
+        # Default ssl=require for Supabase. Caller can override by appending
+        # ?sslmode=disable to the URL.
+        ssl_arg: Any = "require"
+        if "sslmode=" in url:
+            ssl_arg = None  # let asyncpg parse the URL's sslmode
 
-    # Supabase Supavisor pooler in transaction mode (port 6543) does NOT
-    # support prepared statements. Session mode (port 5432) and direct
-    # connections do. Disable asyncpg's statement cache only when needed.
-    is_tx_pooler = ":6543/" in url
-    statement_cache_size = 0 if is_tx_pooler else 100
+        # Supabase Supavisor pooler in transaction mode (port 6543) does NOT
+        # support prepared statements. Session mode (port 5432) and direct
+        # connections do. Disable asyncpg's statement cache only when needed.
+        is_tx_pooler = ":6543/" in url
+        statement_cache_size = 0 if is_tx_pooler else 100
 
-    _pool = await asyncpg.create_pool(
-        dsn=url,
-        min_size=1,
-        max_size=5,
-        command_timeout=30,
-        ssl=ssl_arg,
-        statement_cache_size=statement_cache_size,
-    )
-    log.info(
-        "asyncpg pool created (min=1 max=5, tx_pooler=%s, stmt_cache=%d)",
-        is_tx_pooler, statement_cache_size,
-    )
-    return _pool
+        _pool = await asyncpg.create_pool(
+            dsn=url,
+            min_size=2,
+            max_size=20,
+            command_timeout=30,
+            ssl=ssl_arg,
+            statement_cache_size=statement_cache_size,
+        )
+        log.info(
+            "asyncpg pool created (min=2 max=20, tx_pooler=%s, stmt_cache=%d)",
+            is_tx_pooler, statement_cache_size,
+        )
+        return _pool
 
 
 async def close_pool() -> None:
@@ -381,7 +391,11 @@ async def pg_connection() -> AsyncIterator[_PgConnection]:
     byte-for-byte identical to the pre-multitenant behavior.
     """
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    # Bounded acquire: under pool exhaustion (e.g. many concurrent users) fail
+    # fast with a clean asyncpg timeout instead of hanging forever. The timeout
+    # applies to BOTH the "public" default path and the per-tenant path below,
+    # since both acquire from this same connection.
+    async with pool.acquire(timeout=15) as conn:
         schema = tenant_schema(current_tenant_var.get())
         if schema == "public":
             # Default tenant: leave the search_path untouched — byte-for-byte the

@@ -91,6 +91,20 @@ def _valid_iso(d: Any) -> bool:
             and d[4] == "-" and d[7] == "-")
 
 
+def _norm_max_date(value: Any) -> str | None:
+    """Normalize a scanned MAX() value to a 'YYYY-MM-DD' string (or None).
+
+    Postgres (asyncpg) returns date/datetime objects from real DATE/
+    TIMESTAMP columns; SQLite returns text. Coerce both to an ISO date
+    prefix so the downstream _valid_iso check works dialect-agnostically.
+    """
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()[:10]
+    return str(value)[:10]
+
+
 async def _scan_max_date() -> str | None:
     """Live DB scan — never cache outside this module.
 
@@ -109,17 +123,17 @@ async def _scan_max_date() -> str | None:
     iter_tables = [] if _is_pg_for_legacy() else ALLOWED_TABLES
     for table in iter_tables:
         try:
-            # LIKE pattern works on both SQLite and Postgres (vs GLOB
-            # which is SQLite-only).
+            # MAX() works on date/timestamp AND text columns, so no LIKE
+            # predicate (Postgres real DATE/TIMESTAMP columns can't use
+            # LIKE: "operator does not exist: timestamp ~~ unknown").
             row = await fetch_one(
                 f'SELECT MAX("Date") AS max_d FROM {quoted(table)} '
-                f'WHERE "Date" IS NOT NULL '
-                f'  AND "Date" LIKE \'____-__-__\''
+                f'WHERE "Date" IS NOT NULL'
             )
         except Exception:
             _log.warning("time_engine: scan of %s failed", table, exc_info=True)
             continue
-        d = row.get("max_d") if row else None
+        d = _norm_max_date(row.get("max_d") if row else None)
         if _valid_iso(d):
             candidates.append(d)
 
@@ -163,11 +177,11 @@ async def _scan_max_date() -> str | None:
             try:
                 row = await fetch_one(
                     f'SELECT MAX({quoted(col)}) AS max_d FROM {quoted(name)} '
-                    f'WHERE {quoted(col)} LIKE \'____-__-__\''
+                    f'WHERE {quoted(col)} IS NOT NULL'
                 )
             except Exception:
                 continue
-            d = row.get("max_d") if row else None
+            d = _norm_max_date(row.get("max_d") if row else None)
             if _valid_iso(d):
                 candidates.append(d)
 

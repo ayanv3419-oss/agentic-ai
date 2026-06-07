@@ -19,6 +19,7 @@ Hard separation from the legacy sales/purchase pipeline:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -913,7 +914,7 @@ async def ingest_sheet_pg(
     """
     from app.db_engine import pg_connection
 
-    wb = load_workbook(filename=str(wb_path), read_only=True, data_only=True)
+    wb = await asyncio.to_thread(load_workbook, filename=str(wb_path), read_only=True, data_only=True)
     try:
         if sheet_name not in wb.sheetnames:
             raise DynamicIngestError(f"sheet not found: {sheet_name!r}")
@@ -1068,7 +1069,7 @@ async def ingest_workbook_pg(
     progress_cb: "ProgressCb | None" = None,
 ) -> dict[str, Any]:
     """Async Postgres workbook ingest. Mirrors ingest_workbook_sync."""
-    wb = load_workbook(filename=str(wb_path), read_only=True, data_only=True)
+    wb = await asyncio.to_thread(load_workbook, filename=str(wb_path), read_only=True, data_only=True)
     try:
         sheet_names = list(wb.sheetnames)
     finally:

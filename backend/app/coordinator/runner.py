@@ -12,6 +12,7 @@ core_system.py can wire to it with minimal change. Owns:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -75,7 +76,7 @@ async def run_query_turn(
             conversation_id=state.conversation_id,
             tenant_id=state.tenant_id,
         )
-        cached = get_cached(cache_key)
+        cached = await asyncio.to_thread(get_cached, cache_key)
         if cached and isinstance(cached, dict) and cached.get("final_answer"):
             await emit("cache.hit", {
                 "stored_at": cached.get("stored_at"),
@@ -101,6 +102,7 @@ async def run_query_turn(
                     question=state.question,
                     answer=cached.get("final_answer", ""),
                     route=cached.get("route"),
+                    tenant_id=state.tenant_id,
                 )
             except Exception:
                 pass
@@ -150,7 +152,7 @@ async def run_query_turn(
         # Cache only clean answers.
         if not state.errors and state.final_answer:
             try:
-                put_cached(cache_key, {
+                await asyncio.to_thread(put_cached, cache_key, {
                     "final_answer": state.final_answer,
                     "mode": "agentic",
                     "iteration_count": state.iteration,
@@ -166,6 +168,7 @@ async def run_query_turn(
                 question=state.question,
                 answer=state.final_answer,
                 route=state.route,
+                tenant_id=state.tenant_id,
             )
         except Exception:
             pass

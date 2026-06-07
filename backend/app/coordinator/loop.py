@@ -145,7 +145,7 @@ def _initial_messages(state: TurnState) -> list[dict[str, Any]]:
     msgs: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
-    context = render_context(state.conversation_id)
+    context = render_context(state.conversation_id, tenant_id=state.tenant_id)
     if context:
         msgs.append({
             "role": "system",
