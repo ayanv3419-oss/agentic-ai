@@ -391,8 +391,10 @@ async def auth_me(request: Request) -> dict:
         from app import identity
         principal = identity.verify_token(auth_hdr[7:].strip())
         if principal is not None:
+            # Drive connection is now PER-TENANT: report status for THIS
+            # principal's tenant only.
             try:
-                connected = await asyncio.to_thread(google_drive.is_connected)
+                connected = await google_drive.is_connected(principal.tenant_id)
             except Exception:
                 log.warning("drive is_connected check failed", exc_info=True)
                 connected = False
@@ -401,50 +403,66 @@ async def auth_me(request: Request) -> dict:
                 "email": principal.email,
                 "tenant_id": principal.tenant_id,
                 "authenticated": connected,
+                "drive_connected": connected,
                 "google_configured": google_drive.is_configured(),
             }
 
-    try:
-        connected = await asyncio.to_thread(google_drive.is_connected)
-    except Exception:
-        log.warning("drive is_connected check failed", exc_info=True)
-        connected = False
+    # No (valid) principal — there is no tenant to scope a token to, so Drive
+    # is reported as not connected. (The callback is the only public Drive
+    # surface, and it carries its tenant in the signed state.)
     return {
-        "authenticated": connected,
+        "authenticated": False,
+        "drive_connected": False,
         "google_configured": google_drive.is_configured(),
     }
 
 
 @api_router.post("/auth/logout")
-async def auth_logout() -> dict:
-    """Disconnect Google Drive — revoke + delete the local OAuth token."""
+async def auth_logout(
+    principal: Principal = Depends(require_principal),
+) -> dict:
+    """Disconnect Google Drive — revoke + delete THIS tenant's OAuth token."""
     try:
-        await asyncio.to_thread(google_drive.revoke_credentials)
+        await google_drive.revoke_credentials(principal.tenant_id)
     except Exception:
         log.warning("drive revoke failed", exc_info=True)
     return {"ok": True}
 
 
 @api_router.get("/auth/google/login")
-async def google_login():
-    """Redirect the browser to Google's OAuth consent screen."""
+async def google_login(
+    principal: Principal = Depends(require_principal),
+):
+    """Start the Google OAuth flow for the CURRENT tenant.
+
+    Returns JSON ``{auth_url}`` (not a redirect): the frontend kicks this off
+    with an authenticated fetch — a plain ``<a href>`` carries no Authorization
+    header, so we couldn't know which tenant to bind the token to. The browser
+    then navigates to ``auth_url``. The signed ``state`` carries the tenant_id
+    so the public callback can recover it.
+    """
     if not google_drive.is_configured():
         return _drive_not_configured()
     try:
-        url, _state = google_drive.get_authorization_url()
+        url, _state = google_drive.get_authorization_url(principal.tenant_id)
     except Exception as e:
         log.exception("drive: building auth url failed")
         return JSONResponse(status_code=500, content=envelope(
             "Could not start Google sign-in",
             detail=f"{type(e).__name__}: {e}", kind="internal",
         ))
-    return RedirectResponse(url)
+    return {"auth_url": url}
 
 
 @api_router.get("/auth/google/callback")
 async def google_callback(request: Request):
-    """OAuth callback — exchange the code for credentials, then bounce the
-    browser back to the frontend Upload page."""
+    """OAuth callback (PUBLIC — Google calls it with no bearer token).
+
+    Exchanges the code for credentials, trusting the signed ``state`` to tell
+    us which tenant the token belongs to (``exchange_code`` verifies the HMAC
+    and extracts the tenant_id), saves it per-tenant, then bounces the browser
+    back to the frontend Upload page. On any state/verify/exchange failure we
+    redirect with ``?drive=error`` rather than leak a stack trace."""
     if not google_drive.is_configured():
         return _drive_not_configured()
     code = request.query_params.get("code")
@@ -453,20 +471,24 @@ async def google_callback(request: Request):
     if error or not code:
         return RedirectResponse(f"{settings.frontend_url}/?drive=error")
     try:
-        await asyncio.to_thread(google_drive.exchange_code, code, state)
-    except Exception as e:
+        await google_drive.exchange_code(code, state)
+    except Exception:
+        # Covers a tampered/invalid signed state (ValueError) and any
+        # token-exchange failure — both are a failed connect to the user.
         log.exception("drive: token exchange failed")
         return RedirectResponse(f"{settings.frontend_url}/?drive=error")
     return RedirectResponse(f"{settings.frontend_url}/?drive=connected")
 
 
 @api_router.get("/drive/status")
-async def drive_status():
-    """List the user's ingestible Drive files for the frontend file picker."""
+async def drive_status(
+    principal: Principal = Depends(require_principal),
+):
+    """List the ingestible Drive files of the CURRENT tenant for the picker."""
     if not google_drive.is_configured():
         return {"connected": False, "configured": False, "files": []}
     try:
-        creds = await asyncio.to_thread(google_drive.load_credentials)
+        creds = await google_drive.load_credentials(principal.tenant_id)
     except Exception:
         creds = None
     if creds is None:
@@ -523,7 +545,7 @@ async def drive_sync(
             kind="validation",
         ))
 
-    creds = await asyncio.to_thread(google_drive.load_credentials)
+    creds = await google_drive.load_credentials(principal.tenant_id)
     if creds is None:
         return JSONResponse(status_code=401, content=envelope(
             "Google Drive not connected",

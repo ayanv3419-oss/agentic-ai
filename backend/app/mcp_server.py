@@ -16,15 +16,21 @@ package is not installed.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from fastmcp import FastMCP
 
 from app import google_drive
 from app.infrastructure import ALLOWED_TABLES
+from app.tenant_context import DEFAULT_TENANT_ID
 
 log = logging.getLogger("agentic_ai.mcp")
+
+# The MCP surface has no per-request tenant identity — it's an operator /
+# single-user integration where the user connected Drive once via the app's
+# Upload page. Bind it to the default ("public") tenant so its Drive tools keep
+# resolving that single connection now that credentials are tenant-keyed.
+_MCP_TENANT_ID = DEFAULT_TENANT_ID
 
 mcp: FastMCP = FastMCP("MetricAi Google Drive")
 
@@ -38,7 +44,7 @@ async def list_drive_files() -> dict:
     """
     if not google_drive.is_configured():
         return {"ok": False, "error": "Google Drive is not configured on the server."}
-    creds = await asyncio.to_thread(google_drive.load_credentials)
+    creds = await google_drive.load_credentials(_MCP_TENANT_ID)
     if creds is None:
         return {
             "ok": False,
@@ -81,7 +87,7 @@ async def ingest_drive_files(
     if not file_ids:
         return {"ok": False, "error": "file_ids must contain at least one Drive file id."}
 
-    creds = await asyncio.to_thread(google_drive.load_credentials)
+    creds = await google_drive.load_credentials(_MCP_TENANT_ID)
     if creds is None:
         return {
             "ok": False,
@@ -122,7 +128,7 @@ async def preview_file(file_id: str, rows: int = 20) -> dict:
     """
     if not google_drive.is_configured():
         return {"ok": False, "error": "Google Drive is not configured on the server."}
-    creds = await asyncio.to_thread(google_drive.load_credentials)
+    creds = await google_drive.load_credentials(_MCP_TENANT_ID)
     if creds is None:
         return {
             "ok": False,
@@ -154,7 +160,7 @@ async def infer_schema(file_id: str, sample_rows: int = 50) -> dict:
     """
     if not google_drive.is_configured():
         return {"ok": False, "error": "Google Drive is not configured on the server."}
-    creds = await asyncio.to_thread(google_drive.load_credentials)
+    creds = await google_drive.load_credentials(_MCP_TENANT_ID)
     if creds is None:
         return {
             "ok": False,
@@ -188,7 +194,7 @@ async def search_drive(query: str, limit: int = 25) -> dict:
         return {"ok": False, "error": "Google Drive is not configured on the server."}
     if not query or not query.strip():
         return {"ok": False, "error": "query must be a non-empty string"}
-    creds = await asyncio.to_thread(google_drive.load_credentials)
+    creds = await google_drive.load_credentials(_MCP_TENANT_ID)
     if creds is None:
         return {
             "ok": False,

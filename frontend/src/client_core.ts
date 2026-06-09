@@ -243,6 +243,8 @@ export interface AuthMe {
   name?: string
   picture?: string
   google_configured?: boolean
+  // Drive connection status for the CURRENT tenant (per-tenant token store).
+  drive_connected?: boolean
 }
 
 export interface DriveFile {
@@ -774,7 +776,17 @@ export async function refreshAfterChange(month?: string): Promise<void> {
 
 // Google upload/Drive helpers — only used by the Upload page's "Connect
 // Google Drive" card. These are independent of any app-startup login.
-export const googleLoginUrl = (): string => `${BASE_URL}/auth/google/login`
+
+// Start the per-tenant Google Drive OAuth flow. The backend route is now
+// auth-gated (it needs to know WHICH tenant to bind the token to), so we can't
+// use a plain `<a href>` — that navigation carries no Authorization header.
+// Instead we GET the route WITH the auth header, receive `{auth_url}` (whose
+// signed `state` carries our tenant), then full-page navigate the browser to
+// Google's consent screen.
+export async function startGoogleDriveConnect(): Promise<void> {
+  const { auth_url } = await apiGet<{ auth_url: string }>('/auth/google/login')
+  window.location.href = auth_url
+}
 
 export async function fetchAuthMe(): Promise<AuthMe> {
   return apiGet<AuthMe>('/auth/me')
