@@ -973,6 +973,10 @@ export function AiAssistant() {
   const handleSend = async () => {
     const text = input.trim()
     if (!text || isStreaming) return
+    // Claim the streaming lock immediately after the guard so a second
+    // Enter/submit fired before the awaits below can't slip through and
+    // start a concurrent stream.
+    setStreaming(true)
 
     // Sending ends any in-progress dictation.
     speech.stop()
@@ -997,7 +1001,6 @@ export function AiAssistant() {
     appendMessage(userMsg)
     appendMessage(assistantMsg)
     setInput('')
-    setStreaming(true)
 
     const ctrl = new AbortController()
     abortRef.current = ctrl

@@ -498,6 +498,36 @@ export async function streamQuery(
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let buf = ''
+  // Parse one SSE block ("event:"/"data:" lines) and emit it. Shared by the
+  // read loop and the post-loop flush so a final event arriving without a
+  // trailing blank line isn't silently dropped.
+  const emitBlock = (block: string) => {
+    if (!block.trim()) return
+    let event = 'message'
+    let data = ''
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      else if (line.startsWith('data:')) {
+        // SSE spec: strip one leading space, join multi-line data fields with \n.
+        // The old `+= .trim()` silently glued JSON tokens together when a
+        // payload happened to contain a newline.
+        data += (data ? '\n' : '') + line.slice(5).replace(/^ /, '')
+      }
+    }
+    if (!data) return
+    try {
+      const parsed = JSON.parse(data)
+      // Stamp serverDataVersion from any SSE payload that carries it
+      // (turn.end + final from the backend's emit boundary). Powers the
+      // Dashboard auto-refetch and the chat "data updated" banner.
+      if (parsed && typeof parsed === 'object' && 'data_version' in parsed) {
+        useAppStore.getState().observeServerDataVersion(parsed.data_version)
+      }
+      onEvent({ event, data: parsed })
+    } catch {
+      onEvent({ event, data })
+    }
+  }
   // The finally block releases the underlying ReadableStream lock so the
   // network connection can be reclaimed when the user navigates away
   // mid-stream. Previously the reader was leaked: the AbortController
@@ -510,34 +540,11 @@ export async function streamQuery(
       buf += decoder.decode(value, { stream: true })
       const blocks = buf.split('\n\n')
       buf = blocks.pop() ?? ''
-      for (const block of blocks) {
-        if (!block.trim()) continue
-        let event = 'message'
-        let data = ''
-        for (const line of block.split('\n')) {
-          if (line.startsWith('event:')) event = line.slice(6).trim()
-          else if (line.startsWith('data:')) {
-            // SSE spec: strip one leading space, join multi-line data fields with \n.
-            // The old `+= .trim()` silently glued JSON tokens together when a
-            // payload happened to contain a newline.
-            data += (data ? '\n' : '') + line.slice(5).replace(/^ /, '')
-          }
-        }
-        if (!data) continue
-        try {
-          const parsed = JSON.parse(data)
-          // Stamp serverDataVersion from any SSE payload that carries it
-          // (turn.end + final from the backend's emit boundary). Powers the
-          // Dashboard auto-refetch and the chat "data updated" banner.
-          if (parsed && typeof parsed === 'object' && 'data_version' in parsed) {
-            useAppStore.getState().observeServerDataVersion(parsed.data_version)
-          }
-          onEvent({ event, data: parsed })
-        } catch {
-          onEvent({ event, data })
-        }
-      }
+      for (const block of blocks) emitBlock(block)
     }
+    // Stream closed: flush any trailing event the server sent without a
+    // final "\n\n" delimiter so its data isn't lost.
+    if (buf.trim()) emitBlock(buf)
   } finally {
     try { await reader.cancel() } catch { /* already done / aborted */ }
   }
