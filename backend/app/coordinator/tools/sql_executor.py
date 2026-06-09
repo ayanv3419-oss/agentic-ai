@@ -153,17 +153,48 @@ def _spec_kind(
     return None
 
 
-def _spec_title(question: str | None, y_label: str, x_label: str) -> str:
-    """A short, human chart title. Prefer the user's own question (trimmed);
-    fall back to "<measure> by <dimension>". Never fabricates data."""
-    q = (question or "").strip()
-    if q:
-        q = q.rstrip("?.! ").strip()
-        if q:
-            # Capitalise first letter without touching the rest.
-            return q[0].upper() + q[1:]
-    measure = (y_label or "value").replace("_", " ")
-    dim = (x_label or "category").replace("_", " ")
+_AGG_FUNC_RE = re.compile(
+    r"^\s*(?:sum|avg|count|min|max|total)\s*\(\s*(.+?)\s*\)\s*$", re.I
+)
+_GRAN_ADJ = {"monthly": "Monthly", "weekly": "Weekly",
+             "daily": "Daily", "yearly": "Yearly"}
+
+
+def _humanize_col(col: str | None) -> str:
+    """Turn a raw SQL column / alias into a clean human label for a chart
+    title. 'net_sales' -> 'Net Sales', 'SUM(profit)' -> 'Profit',
+    't.margin_pct' -> 'Margin %'. Returns '' when there's nothing usable."""
+    c = (col or "").strip()
+    m = _AGG_FUNC_RE.match(c)
+    if m:
+        c = m.group(1).strip()
+    c = c.strip('"').strip("'")
+    if "." in c:
+        c = c.split(".")[-1].strip('"').strip("'")
+    c = re.sub(r"\bpct\b", "%", c.replace("_", " ").strip(), flags=re.I)
+    if not c:
+        return ""
+    return " ".join(w if w == "%" else w[:1].upper() + w[1:] for w in c.split())
+
+
+def _spec_title(
+    y_col: str | None, x_col: str | None, kind: str, granularity: str | None
+) -> str:
+    """A short, professional chart title built from the actual measure and
+    dimension COLUMNS - never the user's raw question (which is often a long,
+    rambling sentence and looks unprofessional as a chart heading). Never
+    fabricates data.
+        trend ('line') -> "Monthly Profit" / "Profit Over Time"
+        ranking ('bar')-> "Profit by Brand"
+        pie            -> "Profit Share by Category"
+    """
+    measure = _humanize_col(y_col) or "Value"
+    dim = _humanize_col(x_col) or "Category"
+    if kind == "line":
+        adj = _GRAN_ADJ.get((granularity or "").lower())
+        return f"{adj} {measure}" if adj else f"{measure} Over Time"
+    if kind == "pie":
+        return f"{measure} Share by {dim}"
     return f"{measure} by {dim}"
 
 
@@ -253,6 +284,8 @@ def _attach_spec(
     y_label: str,
     x_label: str,
     question: str | None,
+    y_col: str | None = None,
+    granularity: str | None = None,
 ) -> dict[str, Any]:
     """Enrich an existing SalesChart dict IN-PLACE with the frontend-agnostic
     chart spec fields required on the `final` answer payload:
@@ -276,7 +309,7 @@ def _attach_spec(
     chart["chart_type"] = kind
     chart["x_label"] = x_label
     chart["y_label"] = y_label
-    chart["title"] = _spec_title(question, y_label, x_label)
+    chart["title"] = _spec_title(y_col or y_label, x_label, kind, granularity)
     chart["points"] = [
         {"label": str(p.get("name")), "value": _num(p.get("value"))}
         for p in points
@@ -367,7 +400,7 @@ def _build_chart_payload(
             return _attach_spec(
                 _chart,
                 [{"name": x_val, "value": _num(rows[0].get(y_col))}],
-                _yl, x_col, question,
+                _yl, x_col, question, y_col, gran,
             )
         return {
             "kind": "summary",
@@ -423,7 +456,7 @@ def _build_chart_payload(
             ],
             "y_label": y_label,
         }
-        return _attach_spec(_chart, points, y_label, x_col, question)
+        return _attach_spec(_chart, points, y_label, x_col, question, y_col, gran)
 
     _chart = {
         "kind": "ranking",
@@ -436,7 +469,7 @@ def _build_chart_payload(
         ],
         "y_label": y_label,
     }
-    return _attach_spec(_chart, points, y_label, x_col, question)
+    return _attach_spec(_chart, points, y_label, x_col, question, y_col, gran)
 
 
 class SqlExecutorTool(Tool):
