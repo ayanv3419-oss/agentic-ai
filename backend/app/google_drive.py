@@ -11,23 +11,37 @@ Design notes
 * The Google client libraries are imported lazily inside functions so the
   backend still boots when the packages are not installed and the feature
   is simply unused.
-* OAuth credentials are persisted as a single JSON file at
-  `settings.google_token_path` — right for a single-user local-first app.
+* OAuth credentials are persisted PER-TENANT in the ``drive_tokens`` table
+  (public schema, one row per ``tenant_id``) so each self-serve account links
+  its OWN Google Drive — no shared global token file. The table self-provisions
+  on first save and uses ``get_connection()`` so it works on Postgres AND
+  SQLite, exactly like the ``uploads`` / ``conversations`` first-party tables
+  (isolated by a ``tenant_id`` column, NOT by search_path).
+* The OAuth ``state`` is a self-contained, HMAC-signed token carrying the
+  tenant_id (``<b64u(tenant_id)>.<hmac_sha256(secret, that)>``), signed with the
+  same ``settings.auth_token_secret`` as the bearer tokens via ``app.auth._sign``.
+  This survives process restarts and is multi-user-safe — it replaces the old
+  fragile module-global ``_pending_state`` and lets the PUBLIC OAuth callback
+  trust which tenant a freshly-minted token belongs to, with no server-side
+  session store.
 * Blocking Google client calls are wrapped in `asyncio.to_thread` by the
-  async helpers; the sync helpers (`load_credentials`, `save_credentials`,
-  `is_connected`, `revoke_credentials`) are cheap and left for callers to
-  thread if they care.
+  async helpers; the credential helpers (`load_credentials`, `save_credentials`,
+  `is_connected`, `revoke_credentials`) are async because they touch the DB via
+  ``get_connection`` — callers ``await`` them directly (no ``to_thread``).
 """
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from app.infrastructure import settings, uploads_dir
+from app.auth import _b64u_decode, _b64u_encode, _sign
+from app.infrastructure import get_connection, settings, uploads_dir
 
 # Google sometimes returns a superset of the requested scopes (openid, etc.);
 # without this oauthlib raises on the scope mismatch during token exchange.
@@ -42,9 +56,6 @@ _MIME_CSV = "text/csv"
 _MIME_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _MIME_GSHEET = "application/vnd.google-apps.spreadsheet"
 INGESTIBLE_MIME_TYPES = (_MIME_CSV, _MIME_XLSX, _MIME_GSHEET)
-
-# CSRF state from the most recent /auth/google/login, validated on callback.
-_pending_state: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -79,114 +90,233 @@ def _build_flow(state: str | None = None):
 
 
 # ---------------------------------------------------------------------------
+# Signed OAuth state — carries the tenant_id through the (public) callback
+# ---------------------------------------------------------------------------
+# The state is ``<b64u(tenant_id)>.<sig>`` where ``sig = HMAC-SHA256(
+# settings.auth_token_secret, b64u(tenant_id))`` — the same primitive and
+# secret as the bearer tokens (app.auth / app.identity). It is self-contained
+# (no server-side session), so it survives process restarts and is safe with
+# many concurrent users, and the PUBLIC callback can verify it came from us and
+# recover WHICH tenant the token is for. Unlike the bearer token it carries no
+# expiry: the consent round-trip is short-lived and Google bounds it anyway, and
+# a leaked state buys an attacker nothing without also controlling our redirect.
+
+def sign_oauth_state(tenant_id: str) -> str:
+    """Return a signed, self-contained OAuth ``state`` encoding ``tenant_id``."""
+    tid_b64 = _b64u_encode((tenant_id or "").encode("utf-8"))
+    sig = _sign(tid_b64, settings.auth_token_secret)
+    return f"{tid_b64}.{sig}"
+
+
+def verify_oauth_state(state: str | None) -> str:
+    """Verify a signed OAuth ``state`` and return the embedded ``tenant_id``.
+
+    Raises :class:`ValueError` on a missing, malformed, or tampered state
+    (constant-time signature compare) — the caller turns that into a CSRF
+    abort. Never trusts the payload before the signature checks out.
+    """
+    if not state or "." not in state:
+        raise ValueError("OAuth state missing or malformed — aborting.")
+    try:
+        tid_b64, sig = state.rsplit(".", 1)
+    except ValueError as exc:
+        raise ValueError("OAuth state missing or malformed — aborting.") from exc
+    expected = _sign(tid_b64, settings.auth_token_secret)
+    # Constant-time compare — a timing side-channel leaks the secret over
+    # enough samples (mirrors identity.verify_token).
+    if not hmac.compare_digest(expected, sig):
+        raise ValueError("OAuth state signature invalid — possible CSRF, aborting.")
+    try:
+        tenant_id = _b64u_decode(tid_b64).decode("utf-8")
+    except Exception as exc:
+        raise ValueError("OAuth state payload undecodable — aborting.") from exc
+    if not tenant_id:
+        raise ValueError("OAuth state carries no tenant — aborting.")
+    return tenant_id
+
+
+# ---------------------------------------------------------------------------
 # OAuth flow
 # ---------------------------------------------------------------------------
 
-def get_authorization_url() -> tuple[str, str]:
-    """Build the Google consent-screen URL. Returns (url, state)."""
-    global _pending_state
-    flow = _build_flow()
-    url, state = flow.authorization_url(
+def get_authorization_url(tenant_id: str) -> tuple[str, str]:
+    """Build the Google consent-screen URL for ``tenant_id``.
+
+    The ``state`` is a signed token carrying ``tenant_id`` (see
+    :func:`sign_oauth_state`), so the public callback can recover and trust the
+    tenant without any module-global / session state. Returns ``(url, state)``.
+    """
+    state = sign_oauth_state(tenant_id)
+    flow = _build_flow(state=state)
+    url, returned_state = flow.authorization_url(
         access_type="offline",       # get a refresh token
         include_granted_scopes="true",
         prompt="consent",            # force refresh token even on re-auth
+        state=state,                 # pin OUR signed state (don't let Flow regenerate)
     )
-    _pending_state = state
-    return url, state
+    return url, returned_state
 
 
-def exchange_code(code: str, state: str | None = None):
+async def exchange_code(code: str, state: str | None = None) -> str:
     """Exchange the OAuth callback `code` for credentials and persist them.
 
-    Raises ValueError when `state` does not match the value handed out by
-    the most recent `get_authorization_url()` call (CSRF protection).
+    Verifies the HMAC signature on ``state`` and extracts the ``tenant_id`` it
+    carries (raises :class:`ValueError` on a missing/tampered state — CSRF
+    protection). Exchanges ``code`` for credentials and saves them for THAT
+    tenant. Returns the resolved ``tenant_id``.
     """
-    global _pending_state
-    if state is not None and _pending_state is not None and state != _pending_state:
-        raise ValueError("OAuth state mismatch — possible CSRF, aborting.")
-    flow = _build_flow(state=state or _pending_state)
-    flow.fetch_token(code=code)
-    _pending_state = None
+    tenant_id = verify_oauth_state(state)
+    flow = _build_flow(state=state)
+    # fetch_token is blocking network I/O — run it off the event loop.
+    await asyncio.to_thread(flow.fetch_token, code=code)
     creds = flow.credentials
-    save_credentials(creds)
-    return creds
+    await save_credentials(tenant_id, creds)
+    return tenant_id
 
 
 # ---------------------------------------------------------------------------
-# Credential persistence
+# Credential persistence — per-tenant `drive_tokens` table
 # ---------------------------------------------------------------------------
+# One row per tenant in the PUBLIC schema, isolated by the tenant_id PRIMARY
+# KEY (NOT by search_path) exactly like uploads/conversations/tenant_schema_maps.
+# Self-provisions on first save with CREATE TABLE IF NOT EXISTS so no migration
+# is required, and goes through get_connection() so the same all-TEXT DDL works
+# on SQLite AND Postgres.
 
-def _token_path() -> Path:
-    return Path(settings.google_token_path)
+_DRIVE_TOKENS_DDL = (
+    "CREATE TABLE IF NOT EXISTS drive_tokens (\n"
+    "    tenant_id        TEXT PRIMARY KEY,\n"
+    "    credentials_json TEXT NOT NULL,\n"
+    "    updated_at       TEXT NOT NULL\n"
+    ")"
+)
 
 
-def save_credentials(creds) -> None:
-    p = _token_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(creds.to_json(), encoding="utf-8")
-    log.info("Google Drive credentials saved to %s", p)
+def _now_iso() -> str:
+    """ISO-8601 UTC, second precision — same idiom as the uploads table."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def load_credentials():
-    """Load persisted credentials, refreshing them if expired.
+async def _ensure_drive_tokens_table(db) -> None:
+    await db.execute(_DRIVE_TOKENS_DDL)
 
-    Returns the `Credentials` object, or None when there is no token file
-    or it can no longer be refreshed (user must re-connect).
+
+async def save_credentials(tenant_id: str, creds) -> None:
+    """Upsert ``creds`` (as JSON) for ``tenant_id`` in the drive_tokens table.
+
+    Uses ON CONFLICT(tenant_id) DO UPDATE, which works on SQLite >=3.24 and
+    Postgres natively — matching the existing cross-dialect upserts (see
+    ``record_upload`` in infrastructure.py).
     """
-    p = _token_path()
-    if not p.exists():
+    creds_json = creds.to_json()
+    updated_at = _now_iso()
+    async with get_connection() as db:
+        await _ensure_drive_tokens_table(db)
+        await db.execute(
+            """INSERT INTO drive_tokens (tenant_id, credentials_json, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT (tenant_id) DO UPDATE SET
+                 credentials_json = EXCLUDED.credentials_json,
+                 updated_at = EXCLUDED.updated_at""",
+            (tenant_id, creds_json, updated_at),
+        )
+        await db.commit()
+    log.info("Google Drive credentials saved for tenant=%s", tenant_id)
+
+
+async def _read_credentials_json(tenant_id: str) -> str | None:
+    """Return the stored credentials JSON for ``tenant_id``, or None.
+
+    Tolerates a missing table (no tenant has connected yet) so callers can
+    treat "not connected" and "table not created" identically.
+    """
+    try:
+        async with get_connection() as db:
+            await _ensure_drive_tokens_table(db)
+            cur = await db.execute(
+                "SELECT credentials_json FROM drive_tokens WHERE tenant_id = ?",
+                (tenant_id,),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+    except Exception:
+        log.warning("could not read drive_tokens for tenant=%s", tenant_id, exc_info=True)
+        return None
+    if not rows:
+        return None
+    return dict(rows[0]).get("credentials_json")
+
+
+async def load_credentials(tenant_id: str):
+    """Load ``tenant_id``'s persisted credentials, refreshing them if expired.
+
+    Returns the `Credentials` object, or None when there is no row for the
+    tenant or it can no longer be refreshed (user must re-connect). On a
+    successful refresh the new token is re-saved for the tenant.
+    """
+    creds_json = await _read_credentials_json(tenant_id)
+    if not creds_json:
         return None
     try:
+        import json
+
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import Request
 
-        creds = Credentials.from_authorized_user_file(str(p), DRIVE_SCOPES)
+        info = json.loads(creds_json)
+        creds = Credentials.from_authorized_user_info(info, DRIVE_SCOPES)
     except Exception:
-        log.warning("could not parse Google token file %s", p, exc_info=True)
+        log.warning("could not parse Google token for tenant=%s", tenant_id, exc_info=True)
         return None
 
     if creds and creds.expired and creds.refresh_token:
         try:
-            creds.refresh(Request())
-            save_credentials(creds)
+            await asyncio.to_thread(creds.refresh, Request())
+            await save_credentials(tenant_id, creds)
         except Exception:
-            log.warning("Google token refresh failed — re-connect required", exc_info=True)
+            log.warning("Google token refresh failed for tenant=%s — re-connect required",
+                        tenant_id, exc_info=True)
             return None
     if not creds or not creds.valid:
         return None
     return creds
 
 
-def is_connected() -> bool:
-    """True when a usable (or refreshable) Drive credential is on disk."""
-    return load_credentials() is not None
+async def is_connected(tenant_id: str) -> bool:
+    """True when ``tenant_id`` has a usable (or refreshable) Drive credential."""
+    return await load_credentials(tenant_id) is not None
 
 
-def revoke_credentials() -> None:
-    """Delete the local token file. Best-effort remote revoke too."""
+async def revoke_credentials(tenant_id: str) -> None:
+    """Best-effort remote revoke + delete ``tenant_id``'s drive_tokens row."""
     creds = None
     try:
-        creds = load_credentials()
+        creds = await load_credentials(tenant_id)
     except Exception:
         pass
     if creds is not None:
         try:
             import requests
 
-            requests.post(
-                "https://oauth2.googleapis.com/revoke",
-                params={"token": creds.token},
-                headers={"content-type": "application/x-www-form-urlencoded"},
-                timeout=5,
+            await asyncio.to_thread(
+                lambda: requests.post(
+                    "https://oauth2.googleapis.com/revoke",
+                    params={"token": creds.token},
+                    headers={"content-type": "application/x-www-form-urlencoded"},
+                    timeout=5,
+                )
             )
         except Exception:
             log.info("remote token revoke failed (continuing with local delete)")
-    p = _token_path()
     try:
-        if p.exists():
-            p.unlink()
+        async with get_connection() as db:
+            await _ensure_drive_tokens_table(db)
+            await db.execute(
+                "DELETE FROM drive_tokens WHERE tenant_id = ?", (tenant_id,)
+            )
+            await db.commit()
     except Exception:
-        log.warning("could not delete token file %s", p, exc_info=True)
+        log.warning("could not delete drive_tokens row for tenant=%s", tenant_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------

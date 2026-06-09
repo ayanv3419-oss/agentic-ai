@@ -85,7 +85,7 @@ import {
   fetchDriveStatus,
   fetchUploadsList,
   getUploadStatus,
-  googleLoginUrl,
+  startGoogleDriveConnect,
   logout,
   proposeSchema,
   streamAIQuery,
@@ -2543,13 +2543,25 @@ export function UploadData() {
                   GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in backend/.env.
                 </p>
               ) : (
-                <a
-                  href={googleLoginUrl()}
+                <button
+                  type="button"
+                  onClick={() => {
+                    // Per-tenant OAuth: ask the (auth-gated) backend for the
+                    // consent URL with our bearer token, then navigate to it.
+                    setDriveError(null)
+                    void startGoogleDriveConnect().catch((e) =>
+                      setDriveError(
+                        e instanceof Error
+                          ? e.message
+                          : 'Could not start Google sign-in.',
+                      ),
+                    )
+                  }}
                   className="w-full flex items-center justify-center gap-3 bg-white text-zinc-900 hover:bg-zinc-100 font-medium rounded-lg px-4 py-2.5 text-sm transition-colors"
                 >
                   <GoogleGlyph className="w-4 h-4" />
                   <span>Continue with Google</span>
-                </a>
+                </button>
               )}
             </>
           ) : (
