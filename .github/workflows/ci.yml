@@ -1,12 +1,13 @@
 name: CI
 
 # Runs every push + every PR. Two jobs:
-#   - backend-tests: v1 regression suites (14) + v2 reflective-orchestrator
-#                    suites (5) + boot smoke
+#   - backend-tests: boot smoke + the pytest suite under backend/tests/
 #   - frontend-build: tsc --noEmit + vite build
 #
-# Tests are plain Python scripts (no pytest dep) so the workflow stays
-# simple. Drop a new test path into either matrix step and CI picks it up.
+# Tests are standard pytest. Add a new test_*.py under backend/tests/ and
+# CI picks it up automatically. The suite runs on SQLite (FINANCIAL_DB_PATH)
+# and does not require a Postgres DATABASE_URL — the Postgres-required guard
+# lives in the app's lifespan startup, which the unit tests never trigger.
 
 on:
   push:
@@ -31,92 +32,26 @@ jobs:
       - name: Install backend deps
         run: pip install -r backend/requirements.txt
 
-      - name: Boot smoke (FastAPI app imports cleanly + new routes present)
+      - name: Boot smoke (FastAPI app imports cleanly + core routes present)
         env:
           FINANCIAL_DB_PATH: /tmp/_ci_boot.db
           PYTHONPATH: backend
         run: |
           python -c "
           from app.core_system import app
-          print(f'FastAPI routes: {len(app.routes)}')
           paths = {r.path for r in app.routes if hasattr(r, 'path')}
           assert '/auth/login' in paths, 'auth/login route missing'
           assert '/query_stream' in paths, 'query_stream route missing'
           assert '/health' in paths, 'health route missing'
-          print('boot smoke OK')
+          print(f'boot smoke OK - {len(app.routes)} routes')
           "
 
-      - name: Run v1 regression suites
+      - name: Run backend test suite (pytest)
         env:
-          FINANCIAL_DB_PATH: /tmp/_ci_v1_test.db
+          FINANCIAL_DB_PATH: /tmp/_ci_test.db
           PYTHONPATH: backend
         working-directory: backend
-        run: |
-          set -e
-          for t in \
-            test_intent_router \
-            test_dashboard_pie \
-            test_analytics_intent \
-            test_business_intelligence \
-            test_costs_and_advanced \
-            test_dedup \
-            test_enrichment \
-            test_errors \
-            test_hierarchy_v2 \
-            test_mock_backfill \
-            test_persistence_lifecycle \
-            test_presentation_layer \
-            test_restriction \
-            test_time_engine
-          do
-            echo "::group::tests.$t"
-            python -m "tests.$t"
-            echo "::endgroup::"
-          done
-
-      - name: Seed v2 test DB (schema + KPI catalog + hierarchy defaults)
-        env:
-          FINANCIAL_DB_PATH: /tmp/_ci_v2_test.db
-          PYTHONPATH: backend
-        working-directory: backend
-        # v2 tests don't go through core_system._startup. compute_kpi
-        # (used by test_p2 + test_p4) needs the kpi_registry table to
-        # exist. This step mirrors the startup boot sequence onto the
-        # fresh CI DB. Idempotent.
-        run: |
-          python -m app.orchestrator_v2.tests._db_bootstrap
-
-      - name: Run v2 reflective-orchestrator suites
-        env:
-          FINANCIAL_DB_PATH: /tmp/_ci_v2_test.db
-          PYTHONPATH: backend
-        working-directory: backend
-        # Note: NO `set -e` here — we want every suite to run so the
-        # logs show exactly which one fails instead of bailing at the
-        # first. ``failed`` is accumulated and the step exits non-zero
-        # at the end if any suite returned non-zero.
-        run: |
-          failed=0
-          for t in \
-            test_p1_capability_layer \
-            test_p2_pipeline \
-            test_p3_validators \
-            test_p4_reflection \
-            test_p5_memory \
-            test_p6_drive_capabilities
-          do
-            echo "::group::app.orchestrator_v2.tests.$t"
-            if python -m "app.orchestrator_v2.tests.$t"; then
-              echo "::endgroup::"
-              echo "[PASS] $t"
-            else
-              code=$?
-              echo "::endgroup::"
-              echo "::error title=v2 test failure::${t} exited with code ${code}"
-              failed=1
-            fi
-          done
-          exit $failed
+        run: python -m pytest tests/ -q
 
   frontend-build:
     runs-on: ubuntu-latest
