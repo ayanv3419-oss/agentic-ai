@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import calendar
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from app.coordinator.tools.base import Tool, ToolContext, ToolOutcome
@@ -163,9 +163,10 @@ async def _dataset_today() -> date:
             return _dt.strptime(latest[:10], "%Y-%m-%d").date()
     except Exception:
         pass
-    # Fall back to today's calendar date.
-    from datetime import datetime as _dt
-    return _dt.now().date()
+    # Fall back to today's calendar date in UTC. Render (and most prod
+    # hosts) run with the server clock in UTC; a naive datetime.now() would
+    # use server-local time and could anchor windows to the wrong day.
+    return datetime.now(timezone.utc).date()
 
 
 class TimeKPITool(Tool):

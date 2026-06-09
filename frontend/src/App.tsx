@@ -476,6 +476,28 @@ function LoginGate({ onSuccess }: { onSuccess: () => void }) {
 }
 
 
+// Shown for the brief window between first paint and the /health probe
+// resolving, when there's no stored token. Avoids flashing the full (authed)
+// shell on AUTH-enabled deployments before the gate decision is known. Matches
+// the app's dark theme; intentionally minimal so it's invisible on a fast
+// probe and unobtrusive on a slow one.
+function AuthProbePending() {
+  return (
+    <div
+      className="h-screen w-screen flex items-center justify-center bg-zinc-950 text-zinc-100"
+      role="status"
+      aria-live="polite"
+    >
+      <div className="flex flex-col items-center gap-3">
+        <div className="w-10 h-10 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center animate-pulse">
+          <Logo className="w-5 h-5 text-emerald-400" />
+        </div>
+        <span className="text-xs text-zinc-500">Loading…</span>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   // Land in the chat by default (was 'dashboard'). The splash overlay below
   // covers the first paint and fades into this view.
@@ -558,6 +580,17 @@ export default function App() {
         }}
       />
     )
+  }
+
+  // Auth-gate flash guard: while we have no token AND the /health probe hasn't
+  // resolved yet (authEnabled === null), we don't yet know whether the gate or
+  // the full shell should show. Render a lightweight loading screen instead of
+  // the shell so AUTH-on deployments don't briefly flash authed content before
+  // the probe flips authEnabled to true. A returning user (token present) skips
+  // this entirely and renders the shell immediately. Once the probe resolves to
+  // false this falls through to the shell; to true the LoginGate above renders.
+  if (authEnabled === null && !authToken) {
+    return <AuthProbePending />
   }
 
   return (

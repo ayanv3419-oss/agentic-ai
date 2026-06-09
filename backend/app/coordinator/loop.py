@@ -200,6 +200,56 @@ def _assistant_with_tool_calls(content: str, raw_calls: list) -> dict[str, Any]:
     }
 
 
+def _handle_cap_exhaustion(state: TurnState, cap_name: str) -> TurnState:
+    """The loop hit an iteration / tool-call cap before insightFmt produced
+    an answer. Make the dead-end observable instead of letting runner.py fall
+    back to a canned "couldn't complete" string with an EMPTY errors list
+    (which reports a non-answer as a clean, cacheable success).
+
+    Always record a specific error. When usable data was already retrieved
+    (rows or a chart payload) but the answer step was skipped, ALSO synthesize
+    a minimal, factual final_answer so the user at least sees that data was
+    fetched — without fabricating any analysis. runner.py composes with this:
+    it uses state.final_answer as the answer and attaches state.chart_payload,
+    and the recorded error keeps the turn out of the response cache.
+    """
+    if state.final_answer:
+        # insightFmt (or an earlier branch) already produced an answer; the
+        # cap merely stopped further work. Nothing to recover.
+        return state
+
+    has_data = bool(state.rows) or state.chart_payload is not None
+    if has_data:
+        _log.warning(
+            "%s reached with data but no final answer for turn=%s "
+            "(rows=%d, chart=%s)",
+            cap_name, state.turn_id, state.row_count,
+            state.chart_payload is not None,
+        )
+        state = state.with_error(
+            f"cap_exhausted_with_data: {cap_name} reached before insightFmt; "
+            f"{state.row_count} row(s) were retrieved but the answer step was "
+            f"skipped"
+        )
+        # Factual, no analysis: state what we have, not what it means.
+        summary = (
+            f"I retrieved the data ({state.row_count} row(s)) but ran out of "
+            f"steps before composing the analysis. The results are shown"
+            + (" in the chart below." if state.chart_payload is not None else ".")
+            + " Please ask again to get the full explanation."
+        )
+        state = state.apply(final_answer=summary)
+    else:
+        _log.info(
+            "%s reached with no usable data for turn=%s", cap_name, state.turn_id,
+        )
+        state = state.with_error(
+            f"cap_exhausted_no_data: {cap_name} reached before any answer or "
+            f"data was produced"
+        )
+    return state
+
+
 async def run_loop(
     state: TurnState,
     *,
@@ -215,9 +265,11 @@ async def run_loop(
     while True:
         if state.cost.iterations >= MAX_ITERATIONS:
             _log.info("iteration cap reached for turn=%s", state.turn_id)
+            state = _handle_cap_exhaustion(state, f"iteration cap ({MAX_ITERATIONS})")
             break
         if state.iteration >= MAX_TOOL_CALLS:
             _log.info("tool-call cap reached for turn=%s", state.turn_id)
+            state = _handle_cap_exhaustion(state, f"tool-call cap ({MAX_TOOL_CALLS})")
             break
         if state.finished and state.final_answer:
             break
@@ -259,6 +311,21 @@ async def run_loop(
         if not resp.tool_calls:
             if not state.final_answer and resp.content:
                 state = state.apply(final_answer=resp.content.strip())
+            elif not state.final_answer and not resp.content:
+                # Truly empty round: the LLM emitted neither a tool call nor
+                # any content, and insightFmt never produced an answer. Left
+                # alone this becomes a silent dead-end — runner.py falls back
+                # to a canned "couldn't complete" string with an EMPTY errors
+                # list, so the wire reports a clean success. Record the
+                # dead-end so it's observable/loggable and uncacheable.
+                _log.warning(
+                    "empty LLM round (no tool calls, no content) for turn=%s",
+                    state.turn_id,
+                )
+                state = state.with_error(
+                    "empty_llm_round: model returned no tool calls and no "
+                    "content; no answer was produced"
+                )
             break
 
         # Add assistant message + dispatch every tool call in the batch.

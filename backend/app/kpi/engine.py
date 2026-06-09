@@ -440,8 +440,17 @@ async def execute_kpi(kpi: KpiRow) -> KpiResult:
 
     # 4. Shape the scalar `value` when applicable
     if not rows:
-        result.value = 0 if kpi.output_type in ("count", "currency", "ratio", "percent") else None
-        result.warnings.append("No rows returned — dataset may be empty.")
+        # A genuine count of zero matching rows IS zero; but a currency /
+        # ratio / percent / avg with no matching rows is "no data", not a
+        # real zero — defaulting those to 0 makes an empty result look like
+        # real "zero revenue". Only `count` defaults to 0; everything else
+        # gets value=None plus an explicit no-data warning.
+        if kpi.output_type == "count":
+            result.value = 0
+            result.warnings.append("No rows returned — dataset may be empty.")
+        else:
+            result.value = None
+            result.warnings.append("No matching data for this metric.")
         return result
 
     first = rows[0]

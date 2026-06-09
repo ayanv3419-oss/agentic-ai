@@ -282,6 +282,27 @@ def _collect_matches(concept: Concept, tables: list[dict]) -> dict[str, ColumnRe
     return matches
 
 
+def _tables_for_key(concept: Concept, key: str, tables: list[dict]) -> list[str]:
+    """Distinct table names where ``key`` (an already-matched synonym) occurs.
+
+    Used to detect a *silent* multi-table synonym collision: when the same
+    column name (e.g. ``category``) appears in more than one table, Phase 1
+    keeps only the first and would otherwise resolve with no record that the
+    choice was arbitrary. This lets the caller flag that collision while
+    keeping the (first-occurrence) resolution intact.
+    """
+    found: list[str] = []
+    for t in tables:
+        tname = t["table"]
+        if tname in found:
+            continue
+        for col in t.get("columns", []):
+            if _col_key(str(col.get("name", ""))) == key:
+                found.append(tname)
+                break
+    return found
+
+
 def _collect_all_table_matches(concept: Concept, tables: list[dict]) -> list[ColumnRef]:
     """Collect EVERY synonym match across EVERY table (no deduplication).
 
@@ -317,7 +338,11 @@ def _resolve_one(
         and the competing column names are returned for an ambiguity report.
 
     The same column name appearing in several tables counts once (a
-    denormalised key like ``sku_id``), bound to its first occurrence.
+    denormalised key like ``sku_id``), bound to its first occurrence. When
+    that first-occurrence pick is for a *non-key* concept, the collision is
+    not silent: ``resolve_schema`` additionally records it via the ambiguity
+    channel (the resolution is kept, but reported as multi-table) so the
+    arbitrary table choice surfaces instead of being hidden.
 
     Column names are normalised before matching (spaces/hyphens → underscores,
     lowercased) so "Product Name", "product-name", and "product_name" all hit
@@ -443,6 +468,24 @@ def resolve_schema(tables: list[dict]) -> ResolvedSchema:
         res, amb = _resolve_one(concept, tables)
         if res is not None:
             resolved[concept.name] = res
+            # Flag a silent multi-table synonym collision. A *synonym* match
+            # (not a canonical one) whose column name also appears in another
+            # table was resolved to its first occurrence arbitrarily — picking
+            # the wrong table can silently change the number. Keep the
+            # resolution, but ALSO record the colliding tables via the
+            # ambiguity channel so the choice is surfaced, not hidden.
+            #
+            # Keys are excluded: a denormalised join key (sku_id, item_code)
+            # legitimately appears in several tables by design — that is the
+            # intended dedup, not an ambiguity. Phase 2 may later override a
+            # synonym pick with a deliberate primary-table co-location and
+            # pops this flag, which is correct: that choice is no longer
+            # arbitrary.
+            if res.match == "synonym" and concept.kind != "key":
+                key = _col_key(res.column.column)
+                where = _tables_for_key(concept, key, tables)
+                if len(where) > 1:
+                    ambiguous[concept.name] = tuple(sorted(where))
         elif amb:
             ambiguous[concept.name] = amb
 

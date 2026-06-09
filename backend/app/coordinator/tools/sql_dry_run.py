@@ -4,7 +4,10 @@ SqlDryRun - validate a SELECT statement without executing it.
 Checks:
   * Only one statement (no semicolon-separated multi-statement payloads).
   * Starts with SELECT or WITH (no INSERT/UPDATE/DELETE/DROP/etc.).
-  * No dangerous keywords anywhere.
+  * No dangerous keywords anywhere (incl. MERGE/COPY/CALL/DO and
+    SELECT ... INTO materialization).
+  * No references to system/metadata catalogs (information_schema,
+    pg_catalog / pg_*, sqlite_master / sqlite_*).
   * SQLite parser accepts it (via EXPLAIN).
 
 Used by the Coordinator before SqlExecutor so bad SQL is caught with no
@@ -21,7 +24,33 @@ from app.infrastructure import get_connection
 
 _DANGEROUS = re.compile(
     r"\b(insert|update|delete|drop|alter|create|truncate|attach|detach|"
-    r"pragma|vacuum|reindex|replace)\b",
+    r"pragma|vacuum|reindex|replace|merge|copy|call|do)\b",
+    re.IGNORECASE,
+)
+
+# System / metadata catalogs. A read-only analytics SELECT never needs these;
+# referencing them is a schema-introspection / data-exfiltration signal. Matched
+# on word boundaries, case-insensitively. NOTE: this deliberately does NOT block
+# arbitrary `schema.table` qualifiers (that would hit legit `alias.column`) — it
+# only blocks the known system-metadata names. Legit tenant tables are u_*.
+#   - information_schema       (ANSI catalog, both engines)
+#   - pg_catalog / pg_*        (Postgres system catalogs, e.g. pg_class, pg_user)
+#   - sqlite_master / sqlite_* (SQLite system tables)
+_SYSTEM_SCHEMA = re.compile(
+    r"\b(information_schema|pg_catalog|pg_[a-z_]+|sqlite_master|sqlite_[a-z_]+)\b",
+    re.IGNORECASE,
+)
+
+# `SELECT ... INTO <target>` materializes a new table (Postgres `SELECT INTO`)
+# or writes a file (`INTO OUTFILE` / `INTO DUMPFILE`) — a write side-effect, not
+# a read. _validate_shape only reaches this check once the statement is already
+# confirmed to start with SELECT/WITH, so any `INTO` followed by a table/file
+# target here is the dangerous materializing form. Scoped to `INTO` + an
+# OUTFILE/DUMPFILE keyword or a (optionally quoted) identifier so it does not
+# fire on the legitimate-but-rare absence of such a target.
+_SELECT_INTO = re.compile(
+    r"\binto\b\s+(?:outfile\b|dumpfile\b|temp\b|temporary\b|unlogged\b|"
+    r'"|`|[a-z_])',
     re.IGNORECASE,
 )
 
@@ -48,6 +77,14 @@ def _validate_shape(sql: str) -> str | None:
     m = _DANGEROUS.search(stripped)
     if m:
         return f"Disallowed keyword: {m.group(0).upper()}"
+    sysm = _SYSTEM_SCHEMA.search(stripped)
+    if sysm:
+        return (
+            "References to system/metadata catalogs are not allowed: "
+            f"{sysm.group(0)}"
+        )
+    if _SELECT_INTO.search(stripped):
+        return "SELECT ... INTO (table/file materialization) is not allowed"
     return None
 
 

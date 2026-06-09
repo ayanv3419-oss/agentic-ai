@@ -235,8 +235,8 @@ def _drive_not_configured() -> JSONResponse:
 # instead of a 404. Credentials are env-overridable; defaults match what
 # the frontend ships with so a fresh deploy works without env edits.
 
-_APP_LOGIN_USER = os.environ.get("APP_LOGIN_USER", "Mansuri").strip()
-_APP_LOGIN_PASSWORD = os.environ.get("APP_LOGIN_PASSWORD", "182012")
+_APP_LOGIN_USER = os.environ.get("APP_LOGIN_USER", "").strip()
+_APP_LOGIN_PASSWORD = os.environ.get("APP_LOGIN_PASSWORD", "")
 
 
 class LoginRequest(BaseModel):
@@ -319,8 +319,7 @@ async def auth_login(req: LoginRequest, request: Request) -> dict:
     """
     App-level login endpoint. Accepts ``{username, password}`` (also
     accepts ``{user, pass}`` as aliases for tolerance). Validates against
-    ``APP_LOGIN_USER`` / ``APP_LOGIN_PASSWORD`` env vars (defaults:
-    ``Mansuri`` / ``182012``).
+    the ``users`` table via ``identity.authenticate`` (self-serve accounts).
 
     On success returns ``{ok, username, token}``. The token is a short
     opaque string the frontend may forward as ``Authorization: Bearer``
@@ -563,6 +562,11 @@ async def kpi_list(
     enabled_only: bool = True,
     principal: Principal = Depends(require_principal),
 ):
+    # DATA-PATH route: list_kpis reads the registry resolved via the
+    # search_path. Bind the query tenant so it targets the tenant's OWN schema
+    # (require_principal no longer drives search_path).
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(principal.tenant_id)
     rows = await list_kpis(category=category, enabled_only=enabled_only)
     return {
         "count": len(rows),
@@ -591,6 +595,11 @@ async def kpi_match_route(
     principal: Principal = Depends(require_principal),
 ):
     """Resolve a natural-language question to a registered KPI."""
+    # DATA-PATH route: match_kpi reads the registry resolved via the
+    # search_path. Bind the query tenant so it targets the tenant's OWN schema
+    # (require_principal no longer drives search_path).
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(principal.tenant_id)
     m = await match_kpi(question)
     if m is None:
         return {"matched": False, "question": question}
@@ -610,6 +619,11 @@ async def kpi_get(
     kpi_id: str,
     principal: Principal = Depends(require_principal),
 ):
+    # DATA-PATH route: get_kpi reads the registry resolved via the search_path.
+    # Bind the query tenant so it targets the tenant's OWN schema
+    # (require_principal no longer drives search_path).
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(principal.tenant_id)
     kpi = await get_kpi(kpi_id)
     if kpi is None:
         return JSONResponse(status_code=404, content=envelope(

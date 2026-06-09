@@ -60,8 +60,14 @@ export function useSpeechInput(
     if (!rec) return
     try {
       rec.stop()
+      // Success path: leave the ref alone — onend fires asynchronously and
+      // clears it (and flips listening off) there.
     } catch {
-      /* already stopped */
+      // stop() threw (already stopped / bad state). onend may never fire, so
+      // clear the ref ourselves — otherwise start()'s `if (recognitionRef.current)`
+      // guard would wedge the mic permanently, unable to begin a new session.
+      recognitionRef.current = null
+      setListening(false)
     }
   }, [])
 

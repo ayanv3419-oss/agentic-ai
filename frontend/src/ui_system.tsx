@@ -23,7 +23,7 @@
  * that's shared across pages — chart axis helpers, the API client, the global
  * store — lives in `charts.ts` / `api.ts`.
  */
-import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react'
+import { useEffect, useId, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react'
 import {
   AlertTriangle,
   BarChart2,
@@ -393,13 +393,24 @@ export function Dashboard() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // Ignore-stale guard. Rapid month-filter changes, the serverDataVersion
+  // auto-reload, the focus refetch and the Refresh button all call load();
+  // their fetches can resolve out of order, so a slow earlier response could
+  // otherwise overwrite a newer one. Each call captures a sequence number and
+  // only applies its result if it is still the most recent load in flight.
+  const loadSeqRef = useRef(0)
+
   const load = async (month: string) => {
+    const seq = ++loadSeqRef.current
     setLoading(true)
     setError(null)
     try {
       // Empty string means "all time" — fetchDashboard treats undefined as no filter.
-      setData(await fetchDashboard(month || undefined))
+      const result = await fetchDashboard(month || undefined)
+      if (seq !== loadSeqRef.current) return // a newer load superseded this one
+      setData(result)
     } catch (e) {
+      if (seq !== loadSeqRef.current) return // stale failure — keep newer state
       if (e instanceof ApiError) {
         const detail = (e.detail as { detail?: string } | undefined)?.detail
         setError(detail ?? e.message)
@@ -410,7 +421,9 @@ export function Dashboard() {
       }
       setData(null)
     } finally {
-      setLoading(false)
+      // Only the latest load controls the spinner so a stale resolve can't
+      // flip loading off while a newer request is still running.
+      if (seq === loadSeqRef.current) setLoading(false)
     }
   }
 
@@ -448,6 +461,10 @@ export function Dashboard() {
   )
   const periodLabel = filters.month ? formatMonth(filters.month) : 'All time'
   const activePick = activeQuickPick(filters.month)
+  // Unique gradient id for the Revenue Trend area fill (parallels the chat
+  // chart). Keeps the <linearGradient> id collision-free even if the dashboard
+  // ever renders alongside another instance.
+  const trendGradientId = `trend-fill-${useId()}`
 
   return (
     <div className="animate-fade-in">
@@ -640,7 +657,7 @@ export function Dashboard() {
               margin={{ top: 12, right: 12, left: 0, bottom: 4 }}
             >
               <defs>
-                <linearGradient id="trend-fill" x1="0" y1="0" x2="0" y2="1">
+                <linearGradient id={trendGradientId} x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0%" stopColor={PALETTE.primary} stopOpacity={0.35} />
                   <stop offset="100%" stopColor={PALETTE.primary} stopOpacity={0} />
                 </linearGradient>
@@ -680,7 +697,7 @@ export function Dashboard() {
                 formatter={(v: number) => [formatCurrency(v), 'Revenue']}
                 labelFormatter={(l: string) => formatBucketTooltip(l, granularity)}
               />
-              <Area type="monotone" dataKey="sales" stroke={PALETTE.primary} strokeWidth={2.5} fill="url(#trend-fill)" />
+              <Area type="monotone" dataKey="sales" stroke={PALETTE.primary} strokeWidth={2.5} fill={`url(#${trendGradientId})`} />
             </AreaChart>
           </ResponsiveContainer>
         </div>
@@ -1677,13 +1694,33 @@ function isChatChartPayload(
   return Array.isArray((chart as ChatChartPayload).points)
 }
 
+// Small inline note shown in place of a chart when the backend sent a chart
+// object that carries no plottable data (empty/malformed payload). Without
+// this the chart branch rendered nothing, leaving the user with no indication
+// that a chart was attempted — the spinner/answer just appeared chart-less.
+function ChartUnavailable({ title }: { title?: string }) {
+  return (
+    <div className="rounded-2xl rounded-tl-md bg-zinc-900/60 border border-zinc-800 px-4 py-3">
+      {title && (
+        <div className="mb-1 text-sm font-medium tracking-tight text-zinc-100">
+          {title}
+        </div>
+      )}
+      <div className="flex items-center gap-2 text-xs text-zinc-500">
+        <BarChart2 className="w-3.5 h-3.5 shrink-0 text-zinc-600" />
+        <span>Chart unavailable — no data to display.</span>
+      </div>
+    </div>
+  )
+}
+
 // W5 chat chart. Renders the agent-supplied {kind, title, x_label, y_label,
 // points[]} as a compact, dark-themed recharts figure: line→LineChart,
-// bar→BarChart, pie→PieChart. Returns null when there are no points so an
-// empty chart object never paints an empty card.
+// bar→BarChart, pie→PieChart. When there are no points it shows a small
+// "Chart unavailable" note (rather than nothing) so an empty payload is visible.
 function PointsChart({ chart }: { chart: ChatChartPayload }) {
   const points = chart.points ?? []
-  if (points.length === 0) return null
+  if (points.length === 0) return <ChartUnavailable title={chart.title} />
 
   const kind = chart.chart_type
   // Long category labels (party names, products) only fit when rotated; short
@@ -1855,7 +1892,7 @@ function ChatChart({ chart }: { chart: SalesChart }) {
     && series.length === 0
     && items.length === 0
     && !comparison
-  ) return null
+  ) return <ChartUnavailable />
 
   return (
     <div className="rounded-2xl rounded-tl-md bg-zinc-900/60 border border-zinc-800 px-4 py-3">
@@ -1900,6 +1937,12 @@ function seriesToItems(
 }
 
 function TimeSeriesChart({ chart }: { chart: SalesChart }) {
+  // Unique per-instance gradient id. Multiple chat answers can each render a
+  // TimeSeriesChart at once; a hardcoded id="chat-fill" produced duplicate DOM
+  // ids across instances. useId() keeps each <linearGradient> + its url(#…)
+  // reference unique. Must run before any early return (Rules of Hooks).
+  const gradientId = `chat-fill-${useId()}`
+  const fillUrl = `url(#${gradientId})`
   const series = chart.series ?? []
   // Validate the backend-supplied granularity — "auto" or unknown values
   // fall through to inferGranularity so the x-axis always shows correct labels.
@@ -1932,7 +1975,7 @@ function TimeSeriesChart({ chart }: { chart: SalesChart }) {
       <ResponsiveContainer>
         <AreaChart data={series} margin={{ top: 4, right: 6, left: 0, bottom: 4 }}>
           <defs>
-            <linearGradient id="chat-fill" x1="0" y1="0" x2="0" y2="1">
+            <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="#10b981" stopOpacity={0.35} />
               <stop offset="100%" stopColor="#10b981" stopOpacity={0} />
             </linearGradient>
@@ -1977,7 +2020,7 @@ function TimeSeriesChart({ chart }: { chart: SalesChart }) {
                   d.predicted ? null : d.sales}
                 stroke="#10b981"
                 strokeWidth={2}
-                fill="url(#chat-fill)"
+                fill={fillUrl}
                 isAnimationActive={false}
                 connectNulls={false}
               />
@@ -1988,7 +2031,7 @@ function TimeSeriesChart({ chart }: { chart: SalesChart }) {
                 stroke="#10b981"
                 strokeDasharray="4 3"
                 strokeWidth={2}
-                fill="url(#chat-fill)"
+                fill={fillUrl}
                 fillOpacity={0.3}
                 isAnimationActive={false}
                 connectNulls={false}
@@ -2000,7 +2043,7 @@ function TimeSeriesChart({ chart }: { chart: SalesChart }) {
               dataKey="sales"
               stroke="#10b981"
               strokeWidth={2}
-              fill="url(#chat-fill)"
+              fill={fillUrl}
             />
           )}
         </AreaChart>
@@ -2202,8 +2245,15 @@ export function UploadData() {
   // when the job finishes — preventing a setState-after-unmount leak.
   const [uploadProgress, setUploadProgress] = useState<UploadJobStatus | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  // Tracks whether the component is still mounted. clearInterval stops *future*
+  // ticks, but a poll IIFE already awaiting getUploadStatus when the user
+  // navigates away would still call setState on resolve — a no-op-after-unmount
+  // warning + leak. The poll body checks this ref before every state write.
+  const mountedRef = useRef(true)
   useEffect(() => {
+    mountedRef.current = true
     return () => {
+      mountedRef.current = false
       if (pollRef.current !== null) clearInterval(pollRef.current)
     }
   }, [])
@@ -2368,7 +2418,10 @@ export function UploadData() {
     if (inputRef.current) inputRef.current.value = ''
     refreshUploadsList()
     try {
-      setSchemaProposal(await proposeSchema())
+      const proposal = await proposeSchema()
+      // proposeSchema can resolve after unmount (esp. via the async poll path);
+      // don't surface the confirm panel on a torn-down component.
+      if (mountedRef.current) setSchemaProposal(proposal)
     } catch (proposeErr) {
       // eslint-disable-next-line no-console
       console.warn('[schema] propose failed; skipping confirm step', proposeErr)
@@ -2390,6 +2443,9 @@ export function UploadData() {
       void (async () => {
         try {
           const status = await getUploadStatus(jobId)
+          // The await above can resolve after the user navigated away; bail so
+          // we never setState (or run finishIngest's setState) post-unmount.
+          if (!mountedRef.current) { stop(); return }
           setUploadProgress(status)
           if (status.status === 'done') {
             stop()
@@ -2411,6 +2467,7 @@ export function UploadData() {
           }
         } catch (e) {
           stop()
+          if (!mountedRef.current) return
           setUploadProgress(null)
           setBusy(false)
           setError(describeError(e, 'Lost contact while processing the upload.'))

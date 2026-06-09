@@ -103,6 +103,44 @@ Respond with valid JSON only, exactly this shape:
 {"sql": "SELECT ...", "rationale": "<one short sentence>"}"""
 
 
+# Date/time-function guidance is DIALECT-SPECIFIC. The base _SYSTEM prompt
+# above shows SQLite syntax (strftime / DATE() / julianday) in rules 3, 6 and
+# 11. That syntax is INVALID on Postgres (prod), so when the runtime engine is
+# Postgres we append an authoritative override block that (a) tells the model
+# to target Postgres and (b) maps each SQLite date idiom to its Postgres-native
+# equivalent, instructing it to use these INSTEAD OF the strftime/DATE/julianday
+# examples shown above. The SQLite branch keeps the base prompt unchanged.
+_SQLITE_DATE_GUIDANCE = """
+ENGINE = SQLite. The date/time syntax in the rules above (strftime, DATE(),
+julianday) is correct for this engine — use it as written."""
+
+_POSTGRES_DATE_GUIDANCE = """
+ENGINE = PostgreSQL. IMPORTANT — OVERRIDE: the example date functions in the
+rules above (strftime(...), DATE(...), julianday(...)) are SQLite-only and are
+INVALID on PostgreSQL. You MUST use these PostgreSQL-native equivalents instead:
+  - Month bucket:  to_char("<date_col>"::timestamptz, 'YYYY-MM') AS month
+  - Week bucket:   to_char("<date_col>"::timestamptz, 'IYYY-IW') AS week
+  - Day bucket:    to_char("<date_col>"::timestamptz, 'YYYY-MM-DD') AS day
+                   (or date_trunc('day', "<date_col>"::timestamptz))
+  - Year bucket:   to_char("<date_col>"::timestamptz, 'YYYY') AS year
+  - "today":       CURRENT_DATE
+  - relative windows: use INTERVAL, e.g.
+                   "<date_col>"::timestamptz >= CURRENT_DATE - INTERVAL '30 days'
+  - period truncation: date_trunc('month'|'week'|'day', "<date_col>"::timestamptz)
+Do NOT emit strftime, DATE(...) or julianday(...) anywhere in the SQL. Use the
+EXACT date column name from the schema in place of <date_col>."""
+
+
+def _system_prompt() -> str:
+    """The sqlWriter system prompt with engine-aware date-syntax guidance
+    appended. Reads the runtime engine via app.db_engine.is_postgres() so prod
+    (Postgres) gets Postgres-native date functions and local/SQLite keeps the
+    strftime/DATE/julianday guidance."""
+    from app.db_engine import is_postgres
+    guidance = _POSTGRES_DATE_GUIDANCE if is_postgres() else _SQLITE_DATE_GUIDANCE
+    return _SYSTEM + "\n" + guidance
+
+
 def _build_user_prompt(ctx: ToolContext, args: dict[str, Any]) -> str:
     state = ctx.state
     parts: list[str] = []
@@ -355,11 +393,11 @@ class SqlWriterAgent(Tool):
         user = _build_user_prompt(ctx, args)
         resp = await llm.complete(
             [
-                {"role": "system", "content": _SYSTEM},
+                {"role": "system", "content": _system_prompt()},
                 {"role": "user", "content": user},
             ],
             temperature=0.0,
-            max_tokens=600,
+            max_tokens=1000,
             force_json=True,
         )
         if resp.error:

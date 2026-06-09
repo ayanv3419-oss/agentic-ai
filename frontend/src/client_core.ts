@@ -388,18 +388,56 @@ function buildHeaders(extra?: HeadersInit): Headers {
   return h
 }
 
+// Best-effort extraction of an error body. Tries JSON first (the backend's
+// normal { detail } shape); on parse failure falls back to raw text so a
+// non-JSON error (proxy 502 HTML, plain-text gateway message) still surfaces
+// a human-readable detail instead of leaving the message blank. Returns
+// undefined only when the body is empty/unreadable.
+async function readErrorBody(res: Response): Promise<unknown> {
+  // The body stream can only be read once, so clone before the JSON attempt
+  // so the text() fallback still has something to read.
+  const clone = res.clone()
+  try {
+    return await res.json()
+  } catch {
+    try {
+      const text = (await clone.text()).trim()
+      return text || undefined
+    } catch {
+      return undefined
+    }
+  }
+}
+
+// Clear the stored auth token on a 401 so App.tsx's reactive LoginGate
+// re-renders immediately (it watches auth.token). Shared by handle() and
+// streamQuery so both backend entry points trigger the gate without waiting
+// for the next manual action.
+function handleUnauthorized(status: number): void {
+  if (status !== 401) return
+  try { useAppStore.getState().setAuthToken(null, null) } catch { /* store may not be ready */ }
+}
+
 async function handle<T>(res: Response, label: string): Promise<T> {
   if (!res.ok) {
-    const detail = await res.json().catch(() => undefined)
+    const detail = await readErrorBody(res)
     // eslint-disable-next-line no-console
     console.error(`[api] ${label} → HTTP ${res.status}`, detail)
     // Fix 2: clear stored auth token on 401 so LoginGate reappears
-    if (res.status === 401) {
-      try { useAppStore.getState().setAuthToken(null, null) } catch { /* store may not be ready */ }
-    }
-    throw new ApiError(`${label} ${res.status}`, res.status, detail)
+    handleUnauthorized(res.status)
+    throw new ApiError(errorMessage(label, res.status, detail), res.status, detail)
   }
   return (await res.json()) as T
+}
+
+// Build the ApiError message: prefer the backend's { detail } string (or a
+// plain-text body) so the surfaced message is human-readable; fall back to
+// "<label> <status>" when no usable detail is present.
+function errorMessage(label: string, status: number, detail: unknown): string {
+  if (typeof detail === 'string' && detail.trim()) return detail.trim()
+  const d = (detail as { detail?: unknown } | undefined)?.detail
+  if (typeof d === 'string' && d.trim()) return d.trim()
+  return `${label} ${status}`
 }
 
 // Inject the Authorization: Bearer header on every backend request when
@@ -489,10 +527,17 @@ export async function streamQuery(
     signal,
   }))
   if (!res.ok || !res.body) {
-    const detail = await res.json().catch(() => undefined)
+    const detail = await readErrorBody(res)
     // eslint-disable-next-line no-console
     console.error(`[api] POST /query_stream → HTTP ${res.status}`, detail)
-    throw new ApiError(`POST /query_stream ${res.status}`, res.status, detail)
+    // Clear the token on 401 so the LoginGate re-renders immediately, matching
+    // handle()'s behaviour for the non-streaming endpoints.
+    handleUnauthorized(res.status)
+    throw new ApiError(
+      errorMessage('POST /query_stream', res.status, detail),
+      res.status,
+      detail,
+    )
   }
 
   const reader = res.body.getReader()
@@ -579,9 +624,10 @@ export async function loginWith(
     body: JSON.stringify({ username, password }),
   })
   if (!res.ok) {
-    const detail = await res.json().catch(() => undefined)
+    const detail = await readErrorBody(res)
     throw new ApiError(
       (detail as { detail?: string } | undefined)?.detail
+        ?? (typeof detail === 'string' && detail.trim() ? detail.trim() : undefined)
         ?? `Login failed (HTTP ${res.status})`,
       res.status,
       detail,
@@ -607,9 +653,10 @@ export async function signupWith(email: string, password: string): Promise<void>
     body: JSON.stringify({ email, password }),
   })
   if (!res.ok) {
-    const detail = await res.json().catch(() => undefined)
+    const detail = await readErrorBody(res)
     throw new ApiError(
       (detail as { detail?: string } | undefined)?.detail
+        ?? (typeof detail === 'string' && detail.trim() ? detail.trim() : undefined)
         ?? `Sign up failed (HTTP ${res.status})`,
       res.status,
       detail,
@@ -628,17 +675,25 @@ export function clearAuth(): void {
 }
 
 // Probe /health for the backend's AUTH_ENABLED flag. Called once on app
-// boot so the LoginGate knows whether to render. Never throws — silently
-// leaves authEnabled as null on network error.
+// boot so the LoginGate knows whether to render. Never throws. On a network
+// error or non-200 we default authEnabled to `false` (not null) so the app
+// falls through to the shell rather than hanging on the boot loading screen
+// when the backend is unreachable — degrading gracefully, matching the prior
+// "treat unknown as not-enabled" behaviour. Returns null only to signal the
+// caller the probe itself failed (the store flag is still set to false).
 export async function probeAuthEnabled(): Promise<boolean | null> {
   try {
     const res = await safeFetch(`${BASE_URL}/health`)
-    if (!res.ok) return null
+    if (!res.ok) {
+      useAppStore.getState().setAuthEnabled(false)
+      return null
+    }
     const json = await res.json().catch(() => ({})) as { auth_enabled?: boolean }
     const flag = typeof json.auth_enabled === 'boolean' ? json.auth_enabled : false
     useAppStore.getState().setAuthEnabled(flag)
     return flag
   } catch {
+    useAppStore.getState().setAuthEnabled(false)
     return null
   }
 }
@@ -831,7 +886,9 @@ async function streamQueryWithRetry(
       if (err instanceof DOMException && err.name === 'AbortError') {
         throw err
       }
-      if (err instanceof ApiError && err.status && err.status < 500) {
+      // Non-retriable 4xx fail fast — except 429 (rate limit), which is
+      // transient, so it falls through to the backoff/retry path like a 5xx.
+      if (err instanceof ApiError && err.status && err.status < 500 && err.status !== 429) {
         throw err
       }
       attempt += 1

@@ -811,18 +811,32 @@ def ingest_sheet(
         finally:
             con.close()
 
-        # Persist registry entry
+        # Persist registry entry. The table + data are already committed
+        # above, so a registry write failure must NOT lose the data: swallow
+        # it with a logged warning rather than letting it propagate (which
+        # would leave the table on disk but invisible to the registry until a
+        # restart with no error trail). reconcile_registry() re-adds any
+        # committed u_* table missing from the JSON registry on next startup,
+        # so the data stays discoverable either way.
         columns_meta = [
             {"name": name, "type": sqltype}
             for name, sqltype in zip(col_names, col_types)
         ]
-        register_table(
-            table,
-            columns=columns_meta,
-            source_sheet=sheet_name,
-            source_file=source_file_name,
-            row_count=rows_inserted,
-        )
+        try:
+            register_table(
+                table,
+                columns=columns_meta,
+                source_sheet=sheet_name,
+                source_file=source_file_name,
+                row_count=rows_inserted,
+            )
+        except Exception:
+            log.warning(
+                "dynamic_ingest: register_table failed for table=%r; data is "
+                "committed and reconcile_registry will recover it on next "
+                "startup",
+                table, exc_info=True,
+            )
 
         log.info(
             "dynamic_ingest: sheet=%r → table=%r rows=%d cols=%d dropped=%s skipped=%d",
@@ -1012,13 +1026,28 @@ async def ingest_sheet_pg(
             {"name": name, "type": sqltype}
             for name, sqltype in zip(col_names, col_types)
         ]
-        register_table(
-            table,
-            columns=columns_meta,
-            source_sheet=sheet_name,
-            source_file=source_file_name,
-            row_count=rows_inserted,
-        )
+        # The table + data are already committed above; a registry write
+        # failure must not lose them. Swallow it with a logged warning rather
+        # than propagating (which would leave the table in Postgres but absent
+        # from the JSON registry with no error trail). On Postgres the Schema
+        # tool queries information_schema live every turn, so the data stays
+        # discoverable to the agentic loop even when the registry entry is
+        # missing.
+        try:
+            register_table(
+                table,
+                columns=columns_meta,
+                source_sheet=sheet_name,
+                source_file=source_file_name,
+                row_count=rows_inserted,
+            )
+        except Exception:
+            log.warning(
+                "dynamic_ingest_pg: register_table failed for table=%r; data "
+                "is committed and the Schema tool reads information_schema "
+                "live, so it stays discoverable",
+                table, exc_info=True,
+            )
 
         # Profile every column so the resolver can prefer cleaner columns
         # when concept synonyms tie, and the Schema tool can surface data

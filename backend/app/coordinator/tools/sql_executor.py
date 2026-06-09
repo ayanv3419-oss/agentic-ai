@@ -475,11 +475,28 @@ class SqlExecutorTool(Tool):
         if shape_err is not None:
             return ToolOutcome(ok=False, error=shape_err)
         final_sql = _enforce_limit(sql, max_rows)
+        # Resource safety: on Postgres, bound each user query with a server-side
+        # statement_timeout so a runaway/heavy SELECT can't pin a pooled
+        # connection (the pool has only a 30s client-side command_timeout and is
+        # shared across tenants). SET LOCAL is transaction-scoped, so we run the
+        # query inside a transaction: for the public tenant this opens a real
+        # transaction (asyncpg is otherwise autocommit, where SET LOCAL would not
+        # persist); for a non-public tenant pg_connection() already opened one,
+        # so this nests as a savepoint and the timeout applies to the enclosing
+        # transaction. The SQLite path is unchanged (SET LOCAL is invalid there).
+        from app.db_engine import is_postgres
         try:
             async with get_connection() as db:
-                cur = await db.execute(final_sql)
-                rows = await cur.fetchall()
-                await cur.close()
+                if is_postgres():
+                    async with db.transaction():
+                        await db.execute("SET LOCAL statement_timeout = '10000'")
+                        cur = await db.execute(final_sql)
+                        rows = await cur.fetchall()
+                        await cur.close()
+                else:
+                    cur = await db.execute(final_sql)
+                    rows = await cur.fetchall()
+                    await cur.close()
         except Exception as e:
             return ToolOutcome(ok=False, error=f"sql execution failed: {e}")
 

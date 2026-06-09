@@ -169,17 +169,73 @@ class Settings(BaseSettings):
 
     # Default token secret value — must be overridden when auth is on.
     _AUTH_DEFAULT_SECRET = "dev-auth-secret-CHANGE-ME"
+    # Minimum acceptable AUTH_TOKEN_SECRET length (chars) when auth is on. A
+    # short signer is brute-forceable; 32 chars is the conventional floor for a
+    # token-signing secret (≈256 bits if random).
+    _AUTH_SECRET_MIN_LEN = 32
+
+    def _on_postgres(self) -> bool:
+        """True when this deployment is backed by Postgres — the multi-tenant /
+        production substrate — as signalled by a ``DATABASE_URL`` *in the
+        process environment*.
+
+        This is the same notion as ``app.db_engine.is_postgres()`` and uses the
+        same prefix test, but with two deliberate differences that make it both
+        SAFE and CORRECT for a constructor-time security guard:
+
+        * It does NOT call ``db_engine.is_postgres()``. That function's fallback
+          calls ``get_settings()`` — the very ``@lru_cache``d call still
+          executing this constructor (cache entry not yet populated) — so
+          invoking it from ``__init__`` recurses. We import it below purely to
+          anchor intent for readers; the actual check is inlined.
+        * It reads ``os.environ['DATABASE_URL']`` ONLY and intentionally skips
+          the ``.env``-file fallback that ``db_engine.database_url()`` adds.
+          Rationale: production (Render) injects ``DATABASE_URL`` as a real
+          environment variable (render.yaml: ``sync: false`` dashboard secret),
+          so the env var is the authoritative "this is prod/multi-tenant"
+          signal. The unit suite forces SQLite by clearing
+          ``os.environ['DATABASE_URL']`` at import; keying off the env var alone
+          guarantees the guard can NEVER trip the SQLite test suite (or a local
+          dev box) merely because ``backend/.env`` happens to hold a Postgres
+          URL for convenience. ``self.database_url`` is therefore not consulted
+          here.
+        """
+        from app.db_engine import is_postgres  # noqa: F401  (intent anchor; see docstring)
+        url = os.environ.get("DATABASE_URL", "").strip()
+        return url.startswith("postgres://") or url.startswith("postgresql://")
 
     def _validate_auth(self) -> None:
         """Refuse to start with insecure auth configuration.
 
-        Triggered only when ``auth_enabled=True``. We require AUTH_TOKEN_SECRET
-        to be non-empty and to differ from the in-source sentinel — this catches
-        the "AUTH_ENABLED=true but I forgot to set the secret" deploy bug that
-        would otherwise sign tokens with a publicly known string. User accounts
-        are self-serve via ``POST /auth/signup`` (no separate admin login), so
-        ADMIN_USERNAME/ADMIN_PASSWORD are not required.
+        Two classes of check:
+
+        1. STARTUP GUARD (Postgres + auth off) — Postgres is the multi-tenant /
+           prod substrate, so running it with ``AUTH_ENABLED=false`` leaves the
+           entire data plane public. We refuse to boot in that combination. This
+           fires ONLY when ``_on_postgres()`` is true, so local SQLite single-
+           user dev and the (SQLite-backed) unit suite are unaffected.
+
+        2. AUTH-ON config (only when ``auth_enabled=True``) — AUTH_TOKEN_SECRET
+           must be non-empty, must differ from the in-source sentinel, and must
+           be at least ``_AUTH_SECRET_MIN_LEN`` chars. This catches the
+           "AUTH_ENABLED=true but I forgot to set a real/strong secret" deploy
+           bug that would otherwise sign tokens with a guessable string. User
+           accounts are self-serve via ``POST /auth/signup`` (no separate admin
+           login), so ADMIN_USERNAME/ADMIN_PASSWORD are not required.
         """
+        # --- Startup guard: Postgres (prod/multi-tenant) demands auth ON -----
+        # Gated on Postgres ONLY. SQLite (local dev / unit tests) is never
+        # touched: they keep the historical no-auth single-user behaviour.
+        if self._on_postgres() and not self.auth_enabled:
+            raise RuntimeError(
+                "Refusing to start: DATABASE_URL points at Postgres (the "
+                "multi-tenant / production data plane) but AUTH_ENABLED is "
+                "false, which would leave every tenant's data publicly "
+                "accessible. Set AUTH_ENABLED=true (and a strong "
+                "AUTH_TOKEN_SECRET) on this deployment, or point DATABASE_URL "
+                "at a local SQLite database for single-user development."
+            )
+
         if not self.auth_enabled:
             return
         problems: list[str] = []
@@ -187,6 +243,14 @@ class Settings(BaseSettings):
             problems.append(
                 "AUTH_TOKEN_SECRET is unset or still the in-source default — "
                 "set it to a strong random string."
+            )
+        elif len(self.auth_token_secret) < self._AUTH_SECRET_MIN_LEN:
+            problems.append(
+                f"AUTH_TOKEN_SECRET is too short "
+                f"({len(self.auth_token_secret)} chars) — use at least "
+                f"{self._AUTH_SECRET_MIN_LEN} characters of strong random "
+                "entropy (e.g. `python -c \"import secrets; "
+                "print(secrets.token_urlsafe(48))\"`)."
             )
         if problems:
             raise RuntimeError(
