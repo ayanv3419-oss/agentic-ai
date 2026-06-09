@@ -178,16 +178,16 @@ class MetricSqlBuilder:
             return None
         rev, qty, cost, prod, sku = refs
         direction, limit = self._clean_order(direction, limit)
-        revenue = f"SUM(s.{rev.column})"
-        cogs = f"SUM(s.{qty.column} * i.{cost.column})"
+        revenue = f'SUM(s."{rev.column}")'
+        cogs = f'SUM(s."{qty.column}" * i."{cost.column}")'
         return (
-            f"SELECT s.{prod.column}, "
+            f'SELECT s."{prod.column}", '
             f"ROUND({revenue}, 2) AS total_net_sales, "
             f"ROUND({cogs}, 2) AS total_cogs, "
             f"ROUND(({revenue} - {cogs}) * 100.0 / {revenue}, 2) AS margin_pct "
             f'FROM "{rev.table}" s JOIN "{cost.table}" i '
-            f"ON s.{sku.column} = i.{sku.column} "
-            f"GROUP BY s.{prod.column} HAVING {revenue} > 0 "
+            f'ON s."{sku.column}" = i."{sku.column}" '
+            f'GROUP BY s."{prod.column}" HAVING {revenue} > 0 '
             f"ORDER BY margin_pct {direction} LIMIT {limit}"
         )
 
@@ -203,16 +203,16 @@ class MetricSqlBuilder:
             return None
         rev, qty, cost, prod, sku = refs
         direction, limit = self._clean_order(direction, limit)
-        revenue = f"SUM(s.{rev.column})"
-        cogs = f"SUM(s.{qty.column} * i.{cost.column})"
+        revenue = f'SUM(s."{rev.column}")'
+        cogs = f'SUM(s."{qty.column}" * i."{cost.column}")'
         return (
-            f"SELECT s.{prod.column}, "
+            f'SELECT s."{prod.column}", '
             f"ROUND({revenue}, 2) AS total_net_sales, "
             f"ROUND({cogs}, 2) AS total_cogs, "
             f"ROUND({revenue} - {cogs}, 2) AS profit_amount "
             f'FROM "{rev.table}" s JOIN "{cost.table}" i '
-            f"ON s.{sku.column} = i.{sku.column} "
-            f"GROUP BY s.{prod.column} "
+            f'ON s."{sku.column}" = i."{sku.column}" '
+            f'GROUP BY s."{prod.column}" '
             f"ORDER BY profit_amount {direction} LIMIT {limit}"
         )
 

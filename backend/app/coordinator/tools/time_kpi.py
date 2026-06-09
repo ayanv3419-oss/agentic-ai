@@ -123,6 +123,11 @@ def _window_for(token: str, anchor: date, m: re.Match | None = None) -> tuple[da
         return anchor - timedelta(weeks=n) + timedelta(days=1), anchor
     if token == "last_n_months" and m:
         n = max(1, int(m.group(1)))
+        # "last 1 month" must mean the same as "last month" — the PREVIOUS
+        # calendar month, not the anchor's own month. Reuse the last_month
+        # computation for n <= 1 so the two phrasings agree.
+        if n <= 1:
+            return _window_for("last_month", anchor)
         # Inclusive window: the anchor's month counts as one of the N, so
         # we step back N-1 months from it. Stepping back N would yield an
         # N+1-month span (e.g. "last 7 months" anchored to May 2026 would

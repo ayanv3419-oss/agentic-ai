@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from app.db_engine import is_postgres
 from app.infrastructure import (
     ALLOWED_TABLES,
     SCHEMA_COLUMNS,
@@ -60,6 +61,42 @@ async def _list_user_table_columns() -> list[dict[str, Any]]:
     """
     out: list[dict[str, Any]] = []
     async with get_connection() as db:
+        if is_postgres():
+            # Postgres: list u_* tables + columns from information_schema.
+            cur = await db.execute(
+                "SELECT table_name AS name FROM information_schema.tables "
+                "WHERE table_schema = current_schema() "
+                "AND table_name LIKE 'u\\_%' ESCAPE '\\' "
+                "ORDER BY table_name"
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            for r in rows:
+                name = dict(r).get("name") or ""
+                if not name:
+                    continue
+                cur2 = await db.execute(
+                    "SELECT column_name AS name, data_type AS type "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = ? "
+                    "ORDER BY ordinal_position",
+                    (name,),
+                )
+                cols = await cur2.fetchall()
+                await cur2.close()
+                out.append({
+                    "table": name,
+                    "columns": [
+                        {
+                            "name": dict(c)["name"],
+                            "type": (dict(c)["type"] or "TEXT").upper(),
+                        }
+                        for c in cols
+                    ],
+                })
+            return out
+
+        # SQLite path
         cur = await db.execute(
             "SELECT name FROM sqlite_master "
             "WHERE type='table' AND name LIKE 'u\\_%' ESCAPE '\\' "
@@ -281,12 +318,6 @@ def _validate_sql_safety(sql: str) -> str | None:
     for kw in bad_keywords:
         if kw in padded:
             return f"SQL template contains disallowed keyword: {kw.strip()!r}"
-    # Whitelist tables — the only tables we permit
-    refs = {tbl for tbl in ALLOWED_TABLES if tbl in padded}
-    if not refs:
-        # Some templates use sub-queries / synthetic columns — that's OK as
-        # long as no disallowed table is referenced.
-        return None
     return None
 
 
@@ -341,8 +372,7 @@ async def execute_kpi(kpi: KpiRow) -> KpiResult:
     #    SQLite raise 'no such column'.
     if kpi.tier == "legacy" and await _legacy_tables_empty():
         result.error = (
-            f"KPI '{kpi.id}' is a legacy KPI targeting the empty "
-            "sales/purchase tables. Re-point or skip."
+            "This metric needs sales data that hasn't been uploaded yet."
         )
         return result
 

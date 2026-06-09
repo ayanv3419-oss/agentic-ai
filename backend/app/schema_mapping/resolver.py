@@ -383,6 +383,15 @@ def _margin_computable(
 
 _CONF_COLOCATION = 0.85   # higher than synonym, lower than canonical
 
+#: Cost / inventory-side concepts that must NEVER be co-located onto the
+#: primary sales table by Phase 2.  They belong to the inventory sheet; if a
+#: sales sheet happens to carry a cost-ish column (e.g. ``cost_price``),
+#: dragging ``unit_cost`` here would collapse the margin join to a self-join
+#: and silently disable every margin / profit KPI (see ``_margin_computable``).
+_COLOCATION_EXCLUDED: frozenset[str] = frozenset(
+    {"unit_cost", "stock_qty", "selling_price"}
+)
+
 
 def resolve_schema(tables: list[dict]) -> ResolvedSchema:
     """Resolve every canonical concept against the uploaded ``u_*`` tables.
@@ -447,6 +456,12 @@ def resolve_schema(tables: list[dict]) -> ResolvedSchema:
     if primary_table:
         for concept in _CATALOG.values():
             cname = concept.name
+            # Never co-locate cost / inventory-side concepts onto the sales
+            # table: a stray cost-ish column on a sales sheet would otherwise
+            # collapse the margin join to a self-join and silently disable
+            # every margin / profit KPI (see ``_margin_computable``).
+            if cname in _COLOCATION_EXCLUDED:
+                continue
             # Skip if already correctly resolved to the primary table.
             if (cname in resolved
                     and resolved[cname].column.table == primary_table):

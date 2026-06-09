@@ -118,14 +118,14 @@ class TestMetricSqlBuilder:
         sql = MetricSqlBuilder(resolve_schema(tables)).margin_ranking()
         assert sql is not None
         # margin % computed on SUM totals, never averaged per-row ratios
-        assert "SUM(s.net_sales)" in sql
-        assert "SUM(s.quantity * i.unit_cost)" in sql
-        assert "* 100.0 / SUM(s.net_sales)" in sql
+        assert 'SUM(s."net_sales")' in sql
+        assert 'SUM(s."quantity" * i."unit_cost")' in sql
+        assert '* 100.0 / SUM(s."net_sales")' in sql
         assert "AS margin_pct" in sql
         # sales joined to inventory on the resolved sku key
         assert 'FROM "u_sales_transactions" s' in sql
-        assert 'JOIN "u_inventory_master" i ON s.sku_id = i.sku_id' in sql
-        assert "GROUP BY s.final_product" in sql
+        assert 'JOIN "u_inventory_master" i ON s."sku_id" = i."sku_id"' in sql
+        assert 'GROUP BY s."final_product"' in sql
         assert "ORDER BY margin_pct DESC" in sql
         assert "LIMIT 10" in sql
 
@@ -172,12 +172,12 @@ class TestMetricSqlBuilder:
         sql = MetricSqlBuilder(resolve_schema(tables)).profit_ranking()
         assert sql is not None
         # profit AMOUNT = revenue minus COGS, on SUM totals
-        assert "SUM(s.net_sales) - SUM(s.quantity * i.unit_cost)" in sql
+        assert 'SUM(s."net_sales") - SUM(s."quantity" * i."unit_cost")' in sql
         assert "AS profit_amount" in sql
         assert "ORDER BY profit_amount DESC" in sql
         # no HAVING - loss-making products must still surface
         assert "HAVING" not in sql
-        assert 'JOIN "u_inventory_master" i ON s.sku_id = i.sku_id' in sql
+        assert 'JOIN "u_inventory_master" i ON s."sku_id" = i."sku_id"' in sql
 
     def test_profit_ranking_returns_none_when_cost_unresolved(self):
         tables = [
