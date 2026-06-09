@@ -117,6 +117,11 @@ class TurnState(BaseModel):
 
     # SQL + data ---------------------------------------------------------
     sql_draft: str | None = None
+    # SQL that a passing SqlDryRun specifically approved this turn. Only
+    # SqlDryRun writes this (sqlWriter writes sql_draft too), so the
+    # bait-and-switch guard can compare against the validated SQL and not
+    # be defeated by a later sqlWriter overwrite of sql_draft.
+    sql_validated: str | None = None
     sql_final: str | None = None
     rows: list[dict[str, Any]] = Field(default_factory=list)
     row_count: int = 0

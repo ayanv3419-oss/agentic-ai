@@ -93,7 +93,7 @@ class SqlDryRunTool(Tool):
         return ToolOutcome(
             ok=True,
             output={"valid": True, "sql": sql},
-            state_updates={"sql_draft": sql},
+            state_updates={"sql_draft": sql, "sql_validated": sql},
         )
 
 

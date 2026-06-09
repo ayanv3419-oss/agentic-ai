@@ -484,8 +484,20 @@ async def drive_status():
 
 
 @api_router.post("/drive/sync")
-async def drive_sync(request: Request, body: DriveSyncRequest):
+async def drive_sync(
+    request: Request,
+    body: DriveSyncRequest,
+    principal: Principal = Depends(require_principal),
+):
     """Ingest the selected Drive files through the DataCleanAgent pipeline."""
+    # DATA-PATH route: ingest_drive_files writes u_* tables (and runs the shared
+    # post-ingest refresh) on THIS request task — the asyncio.to_thread calls in
+    # it only wrap blocking Google/file I/O, not the DB work — so binding the
+    # query tenant here scopes those writes to the tenant's OWN schema
+    # (require_principal no longer drives search_path; identity and data
+    # isolation are decoupled).
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(principal.tenant_id)
     rl = _rate_limit_check(_client_ip(request), bucket_namespace="drive", limit_per_minute=5)
     if rl is not None:
         return JSONResponse(status_code=429, content=rl)
@@ -622,9 +634,17 @@ async def kpi_get(
 
 
 @api_router.post("/kpi/{kpi_id}/calculate")
-async def kpi_calculate(kpi_id: str):
+async def kpi_calculate(
+    kpi_id: str,
+    principal: Principal = Depends(require_principal),
+):
     """Execute a KPI by id or display name. Returns a structured result —
     error population on the same payload (never throws to the client)."""
+    # DATA-PATH route: calculate_by_name reads the registry + the tenant's u_*
+    # data via the search_path. Bind the query tenant so it resolves against the
+    # tenant's OWN schema (require_principal no longer drives search_path).
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(principal.tenant_id)
     res = await calculate_by_name(kpi_id)
     if res.error:
         return JSONResponse(status_code=400, content=res.to_dict())
@@ -632,7 +652,15 @@ async def kpi_calculate(kpi_id: str):
 
 
 @api_router.post("/kpi/{kpi_id}/disable")
-async def kpi_disable_route(kpi_id: str):
+async def kpi_disable_route(
+    kpi_id: str,
+    principal: Principal = Depends(require_principal),
+):
+    # DATA-PATH route: kpi_disable updates the registry resolved via the
+    # search_path. Bind the query tenant so it targets the tenant's OWN schema
+    # (require_principal no longer drives search_path).
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(principal.tenant_id)
     ok = await kpi_disable(kpi_id)
     if not ok:
         return JSONResponse(status_code=404, content=envelope(
@@ -646,7 +674,15 @@ async def kpi_disable_route(kpi_id: str):
 
 
 @api_router.post("/kpi/{kpi_id}/enable")
-async def kpi_enable_route(kpi_id: str):
+async def kpi_enable_route(
+    kpi_id: str,
+    principal: Principal = Depends(require_principal),
+):
+    # DATA-PATH route: kpi_enable updates the registry resolved via the
+    # search_path. Bind the query tenant so it targets the tenant's OWN schema
+    # (require_principal no longer drives search_path).
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(principal.tenant_id)
     ok = await kpi_enable(kpi_id)
     if not ok:
         return JSONResponse(status_code=404, content=envelope(
@@ -658,9 +694,16 @@ async def kpi_enable_route(kpi_id: str):
 
 
 @api_router.post("/kpi/rebuild")
-async def kpi_rebuild():
+async def kpi_rebuild(
+    principal: Principal = Depends(require_principal),
+):
     """Force-reseed every KPI in the default catalog. User-added KPIs are
     left untouched."""
+    # DATA-PATH route: rebuild_catalog rewrites the registry resolved via the
+    # search_path. Bind the query tenant so it targets the tenant's OWN schema
+    # (require_principal no longer drives search_path).
+    from app.tenant_context import set_query_tenant
+    set_query_tenant(principal.tenant_id)
     n = await rebuild_catalog()
     return {"ok": True, "rewritten": n}
 
@@ -2446,7 +2489,7 @@ async def _auth_middleware(request: Request, call_next):
     if any(path == p or path.startswith(p + "/") or path == p for p in _AUTH_PUBLIC_PREFIXES):
         return await call_next(request)
     # Defer the actual check to the helper so the logic stays in one place.
-    from app.auth import verify_token
+    from app.identity import verify_token
     hdr = request.headers.get("Authorization") or ""
     token = hdr[7:].strip() if hdr.lower().startswith("bearer ") else ""
     if not token or verify_token(token) is None:

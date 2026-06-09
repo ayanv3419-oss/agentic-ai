@@ -137,7 +137,7 @@ def sql_dryrun_guard(state: TurnState, call: ToolCall) -> HookOutcome:
 
     # Check 2: does the SQL to execute match what was validated?
     sql_to_run = str(call.arguments.get("sql") or "").strip()
-    sql_validated = state.sql_draft or ""
+    sql_validated = state.sql_validated or ""
 
     # Block immediately when SqlExecutor is called with an empty sql argument;
     # there is nothing to execute and the dry-run guard cannot compare.
