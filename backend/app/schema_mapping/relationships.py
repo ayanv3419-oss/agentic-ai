@@ -312,6 +312,15 @@ async def load_relationships_pg() -> list[dict[str, Any]]:
     from app.db_engine import pg_connection
     out: list[dict[str, Any]] = []
     async with pg_connection() as db:
+        # Self-provision so a new tenant calling the Schema tool before their
+        # first upload doesn't raise "relation does not exist" (save/profiler
+        # already do this; load was the only path that didn't).
+        from app.infrastructure import _RELATIONSHIPS_DDL_PG
+        try:
+            await db.execute(_RELATIONSHIPS_DDL_PG)
+            await db.commit()
+        except Exception:
+            pass
         try:
             cur = await db.execute(
                 "SELECT from_table, from_column, to_table, to_column, "

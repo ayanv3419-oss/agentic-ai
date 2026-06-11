@@ -382,7 +382,10 @@ class LLMClient:
                 "LLM primary failed (%s) — failing over to %s. detail: %s",
                 resp.error_kind, self._fallback.model, (resp.error or "")[:300],
             )
-            return await self._fallback._complete_with_tools_once(
+            # Single-attempt: don't re-run the fallback's full retry schedule
+            # on top of the primary's retries (avoids up to 6 sequential calls
+            # and ~4s of backoff sleeps under load).
+            return await self._fallback._complete_with_tools_one_shot(
                 messages, tools=tools, temperature=temperature,
                 max_tokens=max_tokens,
             )
@@ -615,6 +618,76 @@ class LLMClient:
             )
         except (AttributeError, IndexError, ValueError, TypeError) as e:
             return _err_tool_response(f"Malformed LLM response from {self.base_url}: {e}", "parse")
+
+    async def _complete_with_tools_one_shot(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> LLMToolResponse:
+        """Single-attempt variant used for the fallback provider so we don't
+        run the fallback's full retry schedule on top of the primary's retries."""
+        msgs = [dict(m) for m in messages]
+        msgs = ensure_no_think(msgs, model=self.model)
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": msgs,
+            "temperature": self.temperature if temperature is None else temperature,
+            "max_tokens": _floor_max_tokens(
+                self.model, self.max_tokens if max_tokens is None else max_tokens),
+            "stream": False,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        if _model_needs_thinking_flag(self.model):
+            kwargs["extra_body"] = {"enable_thinking": False}
+        try:
+            async with _LLM_SEMAPHORE:
+                resp = await self._client.chat.completions.create(**kwargs)
+        except APIConnectionError as e:
+            return _err_tool_response(f"Cannot reach fallback LLM at {self.base_url}: {e}", "network")
+        except APITimeoutError as e:
+            return _err_tool_response(f"Fallback LLM timed out at {self.base_url}: {e}", "network")
+        except APIError as e:
+            status = getattr(e, "status_code", None) or getattr(e, "code", None)
+            return _err_tool_response(
+                f"Fallback LLM API error (model={self.model}, status={status}): {e}",
+                _classify_api_error(e),
+            )
+        except Exception as e:
+            return _err_tool_response(f"Fallback LLM unexpected: {type(e).__name__}: {e}", "unknown")
+        try:
+            choice = resp.choices[0]
+            msg = choice.message
+            usage = resp.usage
+            raw_calls = list(msg.tool_calls or [])
+            tool_calls: list[LLMToolCall] = []
+            for i, rc in enumerate(raw_calls):
+                fn = rc.function
+                raw_args = fn.arguments
+                try:
+                    parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                except (json.JSONDecodeError, TypeError):
+                    parsed_args = {}
+                tool_calls.append(LLMToolCall(
+                    id=str(getattr(rc, "id", None) or f"call_{i}"),
+                    name=str(fn.name or ""),
+                    arguments=parsed_args if isinstance(parsed_args, dict) else {},
+                ))
+            return LLMToolResponse(
+                content=strip_thinking(msg.content or ""),
+                tool_calls=tool_calls,
+                tokens_in=int(getattr(usage, "prompt_tokens", 0) or 0),
+                tokens_out=int(getattr(usage, "completion_tokens", 0) or 0),
+                finish_reason=choice.finish_reason,
+            )
+        except (AttributeError, IndexError, ValueError, TypeError) as e:
+            return _err_tool_response(
+                f"Malformed fallback LLM response from {self.base_url}: {e}", "parse"
+            )
 
 
 # ---------------------------------------------------------------------------

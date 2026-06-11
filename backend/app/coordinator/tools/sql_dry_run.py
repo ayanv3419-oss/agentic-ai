@@ -41,6 +41,20 @@ _SYSTEM_SCHEMA = re.compile(
     re.IGNORECASE,
 )
 
+# Explicit cross-schema qualifiers signal an attempt to escape the tenant's
+# search_path. Legitimate LLM-generated SQL never needs `public.anything` —
+# tenant data is always accessed unqualified under the tenant's own schema.
+_PUBLIC_QUALIFIER = re.compile(r"\bpublic\s*\.", re.IGNORECASE)
+
+# Sensitive internal tables that live in the public schema. Under a tenant
+# search_path these are still reachable via the public fallback, so we block
+# them by name as defence-in-depth.
+_INTERNAL_TABLES = re.compile(
+    r"\b(users|tenants|error_log|uploads|conversations|conversation_messages"
+    r"|auth_tokens|_relationships|_column_profile)\b",
+    re.IGNORECASE,
+)
+
 # `SELECT ... INTO <target>` materializes a new table (Postgres `SELECT INTO`)
 # or writes a file (`INTO OUTFILE` / `INTO DUMPFILE`) — a write side-effect, not
 # a read. _validate_shape only reaches this check once the statement is already
@@ -85,6 +99,11 @@ def _validate_shape(sql: str) -> str | None:
         )
     if _SELECT_INTO.search(stripped):
         return "SELECT ... INTO (table/file materialization) is not allowed"
+    if _PUBLIC_QUALIFIER.search(stripped):
+        return "Cross-schema qualifiers (public.) are not allowed in tenant queries"
+    itm = _INTERNAL_TABLES.search(stripped)
+    if itm:
+        return f"Access to internal table {itm.group(0)!r} is not allowed"
     return None
 
 

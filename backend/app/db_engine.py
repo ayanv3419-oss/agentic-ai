@@ -171,7 +171,26 @@ async def close_pool() -> None:
 
 _DATETIME_NOW_RE = re.compile(r"datetime\(\s*'now'\s*\)", re.IGNORECASE)
 _STRFTIME_RE = re.compile(r"strftime\(\s*'([^']+)'\s*,\s*([^)]+)\)", re.IGNORECASE)
-_JULIANDAY_RE = re.compile(r"julianday\(\s*([^)]+)\)", re.IGNORECASE)
+# The [^)]+ pattern breaks on nested calls like JULIANDAY(MAX(col)) because
+# it stops at the first ')'. We use a balanced-paren extractor instead.
+_JULIANDAY_OPEN_RE = re.compile(r"julianday\s*\(", re.IGNORECASE)
+
+
+def _extract_julianday_arg(sql: str, start: int) -> tuple[str, int] | None:
+    """Return (inner_expr, end_index) for the JULIANDAY( call whose opening
+    paren is at ``sql[start-1]`` (start is the index after the open paren).
+    Handles arbitrary nesting. Returns None if parens are unbalanced."""
+    depth = 1
+    i = start
+    while i < len(sql) and depth > 0:
+        if sql[i] == "(":
+            depth += 1
+        elif sql[i] == ")":
+            depth -= 1
+        i += 1
+    if depth != 0:
+        return None
+    return sql[start : i - 1], i
 _PRAGMA_RE = re.compile(r"^\s*PRAGMA\b.*$", re.IGNORECASE | re.MULTILINE)
 _AUTOINC_RE = re.compile(
     r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", re.IGNORECASE
@@ -203,12 +222,38 @@ def _translate_strftime(match: "re.Match[str]") -> str:
     return f"to_char(({col})::timestamptz, '{pg_fmt}')"
 
 
-def _translate_julianday(match: "re.Match[str]") -> str:
-    col = match.group(1)
-    # JULIANDAY returns a fractional day count. Subtracting two julianday()
-    # values gives days between them. We model JULIANDAY(X) as the unix
-    # epoch in days so the same subtraction semantics hold.
+def _translate_julianday_expr(col: str) -> str:
+    """Translate a single JULIANDAY argument into its Postgres equivalent."""
     return f"(EXTRACT(EPOCH FROM ({col})::timestamptz) / 86400.0)"
+
+
+def _translate_julianday_balanced(sql: str) -> str:
+    """Replace all JULIANDAY(...) calls using a balanced-paren scan so that
+    nested calls like JULIANDAY(MAX(col)) are captured correctly.
+
+    Matches from the regex iterator are skipped when they fall inside a range
+    already consumed by a prior match (handles expressions like
+    JULIANDAY(MAX(col)) where MAX contains parentheses but is not itself a
+    JULIANDAY call)."""
+    result: list[str] = []
+    i = 0
+    for m in _JULIANDAY_OPEN_RE.finditer(sql):
+        if m.start() < i:
+            # This match is inside a range we already consumed — skip it.
+            continue
+        result.append(sql[i : m.start()])
+        inner_start = m.end()
+        extracted = _extract_julianday_arg(sql, inner_start)
+        if extracted is None:
+            # Unbalanced — leave it verbatim; let Postgres surface the error.
+            result.append(m.group(0))
+            i = inner_start
+        else:
+            inner, end = extracted
+            result.append(_translate_julianday_expr(inner))
+            i = end
+    result.append(sql[i:])
+    return "".join(result)
 
 
 def _qmark_to_dollar(sql: str) -> str:
@@ -272,7 +317,7 @@ def translate_sql(sql: str) -> str:
     s = _AUTOINC_RE.sub("BIGSERIAL PRIMARY KEY", s)
     s = _DATETIME_NOW_RE.sub("NOW()", s)
     s = _STRFTIME_RE.sub(_translate_strftime, s)
-    s = _JULIANDAY_RE.sub(_translate_julianday, s)
+    s = _translate_julianday_balanced(s)
     s = _qmark_to_dollar(s)
     return s
 
@@ -286,16 +331,18 @@ class _PgCursor:
 
         rows = await cur.fetchall()
         row  = await cur.fetchone()
+        cur.rowcount
         await cur.close()
 
     asyncpg.Record supports `dict(record)`, `record['col']`, and
     `record.keys()` so existing `dict(row)` calls work unchanged.
     """
 
-    __slots__ = ("_rows",)
+    __slots__ = ("_rows", "rowcount")
 
-    def __init__(self, rows: list[Any]) -> None:
+    def __init__(self, rows: list[Any], rowcount: int = -1) -> None:
         self._rows = rows
+        self.rowcount = rowcount
 
     async def fetchall(self) -> list[Any]:
         return self._rows
@@ -330,8 +377,15 @@ class _PgConnection:
                 rows = await self._conn.fetch(translated, *args)
                 return _PgCursor(list(rows))
             else:
-                await self._conn.execute(translated, *args)
-                return _PgCursor([])
+                status = await self._conn.execute(translated, *args)
+                # asyncpg returns a status string like "DELETE 3" or "UPDATE 1".
+                # Parse it so callers can read cur.rowcount correctly.
+                rc = -1
+                if isinstance(status, str):
+                    parts = status.split()
+                    if len(parts) >= 2 and parts[-1].isdigit():
+                        rc = int(parts[-1])
+                return _PgCursor([], rowcount=rc)
         except Exception as e:
             # Re-raise with the translated SQL so debugging shows what
             # actually ran on Postgres.

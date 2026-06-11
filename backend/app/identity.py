@@ -84,6 +84,12 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# A pre-computed bcrypt hash used to equalize response timing when an email
+# is not found in `authenticate`. Without this, the early-return before any
+# bcrypt call leaks which emails have accounts via timing side-channel.
+_DUMMY_HASH: str = bcrypt.hashpw(b"dummy", bcrypt.gensalt()).decode("utf-8")
+
+
 def _hash_password(password: str) -> str:
     """bcrypt-hash ``password`` and return a utf-8 string safe to store."""
     digest = bcrypt.hashpw(password.encode("utf-8")[:_BCRYPT_MAX_BYTES],
@@ -149,11 +155,19 @@ async def signup(email: str, password: str) -> Principal:
         # inherits the shared "public" schema (self-serve isolation).
         tenant_id = uuid.uuid4().hex
 
-        await db.execute(
-            "INSERT INTO users (id, email, password_hash, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (user_id, norm, password_hash, created_at),
-        )
+        try:
+            await db.execute(
+                "INSERT INTO users (id, email, password_hash, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (user_id, norm, password_hash, created_at),
+            )
+        except Exception as _e:
+            # Catch unique-constraint violation (concurrent duplicate signup)
+            # and surface a clean EmailExists instead of a raw 500.
+            _msg = str(_e).lower()
+            if "unique" in _msg or "duplicate" in _msg or "already exists" in _msg:
+                raise EmailExists(norm) from _e
+            raise
         await db.execute(
             "INSERT INTO tenants (id, owner_user_id, name, created_at) "
             "VALUES (?, ?, ?, ?)",
@@ -197,6 +211,10 @@ async def authenticate(email: str, password: str) -> "Principal | None":
             rows = await cur.fetchall()
             await cur.close()
             if not rows:
+                # Run a dummy bcrypt comparison so the response time is
+                # indistinguishable from a wrong-password attempt, preventing
+                # user enumeration via timing.
+                _verify_password("dummy", _DUMMY_HASH)
                 return None
             user = dict(rows[0])
             if not _verify_password(password, user.get("password_hash") or ""):

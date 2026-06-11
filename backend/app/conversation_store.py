@@ -81,7 +81,7 @@ async def persist_turn(conversation_id: str | None, *, question: str, answer: st
         created_now = False
         async with get_connection() as db:
             cur = await db.execute(
-                "SELECT id FROM public.conversations WHERE id = ?",
+                "SELECT id FROM conversations WHERE id = ?",
                 (conversation_id,),
             )
             existing = await cur.fetchall()
@@ -89,7 +89,7 @@ async def persist_turn(conversation_id: str | None, *, question: str, answer: st
 
             if not existing:
                 await db.execute(
-                    "INSERT INTO public.conversations "
+                    "INSERT INTO conversations "
                     "(id, title, tenant_id, created_at, updated_at, message_count) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (conversation_id, _fallback_title(question), tenant,
@@ -98,19 +98,19 @@ async def persist_turn(conversation_id: str | None, *, question: str, answer: st
                 created_now = True
 
             await db.execute(
-                "INSERT INTO public.conversation_messages "
+                "INSERT INTO conversation_messages "
                 "(id, conversation_id, tenant_id, role, content, chart_json, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (_new_id(), conversation_id, tenant, "user", question, None, now),
             )
             await db.execute(
-                "INSERT INTO public.conversation_messages "
+                "INSERT INTO conversation_messages "
                 "(id, conversation_id, tenant_id, role, content, chart_json, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (_new_id(), conversation_id, tenant, "assistant", answer, chart_json, now),
             )
             await db.execute(
-                "UPDATE public.conversations "
+                "UPDATE conversations "
                 "SET updated_at = ?, message_count = message_count + 2 "
                 "WHERE id = ?",
                 (now, conversation_id),
@@ -141,7 +141,7 @@ async def list_conversations(*, limit: int = 50,
         async with get_connection() as db:
             cur = await db.execute(
                 "SELECT id, title, updated_at, message_count "
-                "FROM public.conversations "
+                "FROM conversations "
                 "WHERE tenant_id = ? "
                 "ORDER BY updated_at DESC "
                 "LIMIT ?",
@@ -175,7 +175,7 @@ async def get_conversation(conversation_id: str, *,
         async with get_connection() as db:
             cur = await db.execute(
                 "SELECT id, title, created_at, updated_at "
-                "FROM public.conversations WHERE id = ? AND tenant_id = ?",
+                "FROM conversations WHERE id = ? AND tenant_id = ?",
                 (conversation_id, tenant),
             )
             head_rows = await cur.fetchall()
@@ -186,7 +186,7 @@ async def get_conversation(conversation_id: str, *,
 
             cur = await db.execute(
                 "SELECT id, role, content, chart_json, created_at "
-                "FROM public.conversation_messages "
+                "FROM conversation_messages "
                 "WHERE conversation_id = ? AND tenant_id = ? "
                 "ORDER BY created_at ASC",
                 (conversation_id, tenant),
@@ -234,7 +234,7 @@ async def delete_conversation(conversation_id: str, *,
         tenant = tenant_id or "public"
         async with get_connection() as db:
             cur = await db.execute(
-                "SELECT id FROM public.conversations "
+                "SELECT id FROM conversations "
                 "WHERE id = ? AND tenant_id = ?",
                 (conversation_id, tenant),
             )
@@ -244,12 +244,12 @@ async def delete_conversation(conversation_id: str, *,
                 return False
 
             await db.execute(
-                "DELETE FROM public.conversation_messages "
+                "DELETE FROM conversation_messages "
                 "WHERE conversation_id = ? AND tenant_id = ?",
                 (conversation_id, tenant),
             )
             await db.execute(
-                "DELETE FROM public.conversations "
+                "DELETE FROM conversations "
                 "WHERE id = ? AND tenant_id = ?",
                 (conversation_id, tenant),
             )
@@ -299,7 +299,7 @@ async def _generate_title(conversation_id: str, question: str,
             return
         async with get_connection() as db:
             await db.execute(
-                "UPDATE public.conversations SET title = ? WHERE id = ?",
+                "UPDATE conversations SET title = ? WHERE id = ?",
                 (title, conversation_id),
             )
             await db.commit()

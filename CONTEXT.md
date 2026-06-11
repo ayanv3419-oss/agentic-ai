@@ -1,79 +1,79 @@
-# Metric AI — Domain Context
+# MetricAI — Domain Context
 
 > Read this before touching any code. Defines the vocabulary, module boundaries,
 > invariants, and known risks every agent and contributor must respect.
-> For deep architecture details see ARCHITECTURE.md.
-> For production risks see PRODUCTION_READINESS_REPORT.md.
 
 ---
 
 ## 1. What this system is
 
-**Metric AI** is a local-first, single-user, LLM-coordinated analytics platform for small businesses.
-Users upload CSV/XLSX financial records (sales + purchases), then ask natural-language questions.
-The system answers with grounded numeric results, narrative insight, and chart-ready aggregates — streamed live.
+**MetricAI** is a self-serve, multi-tenant SaaS analytics platform. Tenants upload
+CSV/XLSX financial records then ask natural-language questions. The system answers
+with grounded numeric results, narrative insight, and chart-ready aggregates —
+streamed live.
 
-Current maturity: **MVP / pre-production** (score 58/100). Not suitable for multi-tenant or high-traffic deployments without auth and Postgres.
+**Phase-3 architecture**: the LLM writes SQL directly against per-tenant `u_*`
+tables using a ReAct (tool-calling) loop. There is no KPI registry, no hierarchy
+engine, no enrichment layer — those packages have been deleted.
 
 ---
 
-## 2. Glossary — use these terms exactly
+## 2. Glossary
 
 | Term | Definition |
 |---|---|
 | **Turn** | One complete question → answer cycle, from `POST /query_stream` to `turn.end` SSE event |
-| **TurnState** | Frozen Pydantic model — single source of truth passed between tools. Never mutated; use `.apply(**updates)` |
-| **Agentic loop** | `AgenticLoop` — the LLM-orchestrated engine for the natural-language question path. The LLM picks a capability, inspects the result, and loops until satisfied, then writes the final answer. Replaced the fixed sub-agent pipelines (see ADR-0004) |
-| **Capability** | A coarse, LLM-callable wrapper the agentic loop chooses from: `resolve_time_window`, `resolve_entities`, `run_data_query`, `generate_narrative`. Each composes a deterministic sub-sequence of the 14 fine-grained tools |
-| **Sub-agent** | A named class for a UI-triggered deterministic flow — now only `DashboardAgent` (dashboard payload) and `DataCleanAgent` (upload ingest). The query path no longer uses sub-agents |
-| **Tool** | A single deterministic step. Extends `Tool` ABC, implements `async run(state, args) → ToolResult`. The 14 fine-grained tools are composed by capabilities; the LLM never picks them directly |
-| **ToolResult** | Return value of a tool: `{ok, output, state_updates, delta_metrics, error}` |
-| **Intent router** | `classify_query_kind()` — deterministic keyword+regex classifier. Outputs `data_query | chat | general_knowledge | missing_data` |
-| **KPI fast-path** | Before the agentic loop, the coordinator matches the question against the KPI registry. On a confident match, executes a pre-validated SQL template — no LLM |
-| **Deterministic pre-pass** | `RouteClassifier` + `IntentAnalyzer` run free before the loop; their output is a *non-binding hint* in the loop's opening context, not a routing decision |
-| **Batch** | A single file upload — tracked in the `uploads` table with a `batch_id` (UUID) |
-| **Dataset** | Either `sales` or `purchase` — two physically identical SQLite tables |
-| **Response cache** | SHA-256-keyed JSON store in `data/response_store.json`. Invalidated on any upload/disconnect |
-| **Cost guard** | Hard per-turn limits: iterations (default 8) and USD spend (default $1.00) |
-| **Capability token** | `INGESTION_PIN` / `READ_PIN` — the only way to access the `Database` tool |
-| **SSE event** | Server-Sent Event emitted during a turn: `tool.call`, `tool.result`, `cache.hit`, `final`, `turn.end` |
-| **PresentationEmitter** | Wrapper that strips internal fields (`sql_used`, `formula`, `stack_trace`, etc.) before events reach the browser |
-| **KPI** | A named metric (e.g. `total_sales`, `orders`) computed by the KPI engine without an LLM |
-| **Data version** | Monotonic counter bumped on every upload/disconnect — used by frontend to detect stale data |
+| **ReAct loop** | `AgenticCoordinator` — LLM picks from 11 fine-grained tools per iteration until satisfied, then writes the final answer |
+| **Tool** | Single deterministic step callable by the LLM. Extends `Tool` ABC in `coordinator/`. The LLM picks these directly (not via capability wrappers) |
+| **Schema tool** | First tool the LLM calls: inspects `information_schema` + `_relationships` to emit column/JOIN hints. Registered as `SchemaInspector` |
+| **sqlWriter** | LLM-facing tool that generates SQL via `MetricSqlBuilder` deterministic shortcuts for margin/profit, then falls back to raw LLM SQL |
+| **SqlDryRun** | EXPLAIN-based validator that rejects SQL before execution |
+| **SqlExecutor** | Runs validated SQL against Postgres; returns rows |
+| **Tenant** | Isolated user unit — each gets a dedicated Postgres schema `tenant_<id>` with `SET LOCAL search_path` per transaction |
+| **`u_*` tables** | Dynamic per-tenant tables created by ingest (`u_sales_transactions`, `u_inventory_master`, etc.). Schema is inferred from uploaded data |
+| **MetricSqlBuilder** | `schema_mapping/builder.py` — deterministic SQL shortcuts for margin/profit/ranking. Used live by `sql_writer.py`. NOT dead code |
+| **SSE event** | Server-Sent Event: `tool.call`, `tool.result`, `cache.hit`, `final`, `turn.end` |
+| **Data version** | Monotonic counter bumped on every upload — frontend uses this to detect stale data |
+| **Conversation** | Stored chat session in `conversations` / `conversation_messages` tables in the tenant's schema |
 | **ADR** | Architectural Decision Record in `docs/adr/NNNN-*.md` |
 
 ---
 
 ## 3. Module map
 
-### Backend — `backend/`
+### Backend — `backend/app/`
 
 | File / folder | Owns |
 |---|---|
-| `app/infrastructure.py` | Settings, SQLite schema, DB helpers, upload parsers, response cache, synonyms |
-| `app/analytics_engine.py` | TurnState, EventEmitter, CostGuard, LLM client, 14 tools + 4 capabilities, registry, AgenticLoop, Dashboard/DataClean sub-agents, Coordinator |
-| `app/core_system.py` | FastAPI app, all HTTP routes, CORS, rate limiter, startup, exception handlers |
-| `app/kpi/` | KPI registry (SQLite-backed), matcher, formula execution engine |
-| `app/hierarchy/` | Product + location tree management (v1 adjacency list + v2 6-level enterprise) |
-| `app/vector/` | Vector store, embeddings, semantic search — **installed but not yet wired into pipeline** |
-| `app/monitoring/` | Sentry config, tracing, request context |
-| `app/enrichment/` | Forecast (linear regression), inventory snapshot, cost master |
-| `app/database/` | Engine abstraction — SQLite default, asyncpg Postgres when `DATABASE_URL` is set |
-| `app/time_engine.py` | Dataset-relative date token resolution |
-| `app/dedup.py` | File-level SHA-256 deduplication |
-| `app/errors.py` | Typed error log (SQLite-backed, queryable via `/errors`) |
+| `core_system.py` | FastAPI app, all HTTP routes, CORS, rate limiter, startup lifespan, exception handlers |
+| `coordinator/` | ReAct loop (`AgenticCoordinator`), 11 tools, `llm.py` (Qwen + Gemini client), prompt builders |
+| `coordinator/sub_agents/sql_writer.py` | SQL generation; imports `MetricSqlBuilder` for margin/profit shortcuts |
+| `schema_mapping/builder.py` | `MetricSqlBuilder` — deterministic margin/profit/ranking SQL. **Keep — used live** |
+| `schema_mapping/relationships.py` | Cross-table JOIN-key graph, stored in `_relationships`. Self-provisions on first load |
+| `dynamic_ingest.py` | XLSX/CSV upload → per-tenant `u_*` tables. Type inference, date parsing, sheet dedup |
+| `infrastructure.py` | Settings, DB helpers, upload parser, response cache, synonyms, ALLOWED_TABLES |
+| `db_engine.py` | Engine abstraction — asyncpg Postgres + `translate_sql()` (SQLite→PG dialect translator) |
+| `identity.py` | HMAC Bearer tokens, bcrypt passwords, timing-safe auth, TOCTOU-safe signup |
+| `tenant_context.py` | `Principal` dataclass, `require_principal` FastAPI dependency, search_path binding |
+| `conversation_store.py` | Chat history CRUD against `conversations` / `conversation_messages` |
+| `time_engine.py` | Dataset-relative date token resolution (`dataset_today`, `dataset_month`, etc.) |
+| `dedup.py` | File-level SHA-256 deduplication |
+| `errors.py` | Typed error log, async fire-and-forget write to Postgres |
+| `vector/` | Vector store + embeddings — installed, not yet wired into the query pipeline |
+| `database/` | `engine_kind()`, `engine_status()` helpers |
 
 **Import direction (never reverse):**
 ```
-core_system → analytics_engine → infrastructure
-core_system → kpi / hierarchy / vector / monitoring / enrichment / database / time_engine / dedup / errors
+core_system → coordinator → infrastructure / db_engine / schema_mapping
+core_system → dynamic_ingest / identity / tenant_context / conversation_store
+core_system → time_engine / dedup / errors / vector / database
 ```
 
 ### Frontend — `frontend/src/`
 
 | File | Owns |
 |---|---|
-| `App.tsx` | Layout shell, login gate (cosmetic only — not real auth), view switcher, error boundaries |
+| `App.tsx` | Layout shell, auth gate, view switcher, error boundaries |
 | `ui_system.tsx` | All pages: Dashboard, AiAssistant, UploadData, ShopInfo |
 | `client_core.ts` | TypeScript types, API client (REST + SSE), Zustand global store |
 | `index.css` | Tailwind directives + theme tokens |
@@ -82,48 +82,60 @@ core_system → kpi / hierarchy / vector / monitoring / enrichment / database / 
 
 ## 4. Key invariants — never break these
 
-1. **TurnState is immutable.** Never `state.field = value`. Always `state = state.apply(field=value)`.
-2. **Database tool is the only SQL path.** All SQLite access from the pipeline must go through the `Database` tool with `READ_PIN` or `INGESTION_PIN`. No direct `fetch_all()` calls from tools.
-3. **The LLM orchestrates capabilities; capabilities are deterministic inside.** On the query path the LLM picks capabilities dynamically (the agentic loop). But each capability composes a *fixed* sub-sequence of the 14 tools, and the LLM never picks those 14 directly. The cheap front door (response cache, KPI fast-path) and the `RouteClassifier`/`IntentAnalyzer` pre-pass stay fully deterministic. See ADR-0004.
+1. **Postgres is required.** The startup lifespan (`core_system.py`) calls `require_postgres()` at boot; no SQLite fallback in production. Local tests use SQLite via `conftest.py`.
+2. **Schema-per-tenant.** Every DB operation inside a request runs inside `SET LOCAL search_path = tenant_<id>, public`. Never access cross-tenant data or use fully-qualified table names from per-tenant code.
+3. **`u_*` tables only.** The LLM must only query tables in the tenant's own schema. `SqlExecutor` enforces this via `ALLOWED_TABLES` denylist.
 4. **No cross-request state leakage.** Each turn uses a fresh LLM call scoped to that request. Never store per-request state in shared module-level variables.
-5. **Cache invalidation is total.** Any upload or disconnect calls `invalidate_all()` — no partial invalidation.
-6. **Import direction is downward.** `core_system → analytics_engine → infrastructure`. No reverse imports.
-7. **PresentationEmitter wraps all user-facing SSE.** Never emit raw internal events directly to the browser.
+5. **Cache invalidation is total.** Any upload calls `invalidate_all()` — no partial invalidation.
+6. **`MetricSqlBuilder` is live.** `schema_mapping/builder.py` is imported in `sql_writer.py:335`. Do not delete it.
+7. **Timing-safe auth.** `identity.py:authenticate()` always runs a bcrypt comparison even on email-not-found paths (uses `_DUMMY_HASH`).
+8. **`conversation_store.py` uses unqualified table names.** The search_path set by `require_principal` routes conversation reads/writes to the correct tenant schema automatically.
 
 ---
 
-## 5. Known critical issues (from audit)
+## 5. Data flow — a single question
 
-| ID | Issue | Severity |
+```
+POST /query_stream  →  require_principal (sets search_path)
+  →  classify_query_kind()  [deterministic keyword/regex]
+  →  AgenticCoordinator.run_turn()
+       loop:
+         LLM picks tool from {SchemaInspector, sqlWriter, SqlDryRun, SqlExecutor, ...}
+         tool runs deterministically
+         result fed back to LLM context
+       LLM emits final answer  →  SSE stream to browser
+```
+
+---
+
+## 6. LLM providers
+
+| Environment | Primary | Fallback |
 |---|---|---|
-| C1 | Frontend credentials hardcoded in `App.tsx` (user: Mansuri, pass: 182012) | CRITICAL |
-| C2 | Backend has no authentication — all routes are public | CRITICAL |
-| C3 | LLM-generated SQL executed with keyword-denylist only (no parameterization) | HIGH |
-| C4 | Response cache unbounded flat JSON file (no TTL, no eviction) | HIGH |
-| C5 | `analytics_engine.py` is a 57 KB monolith | HIGH |
-| C6 | Margin/profit logic and the 22 re-pointed KPIs assume a fixed workbook schema (`u_sales_transactions`/`u_inventory_master` with `net_sales`, `quantity`, `sku_id`, `unit_cost`, `final_product`). Other schemas degrade gracefully — the LLM is told margin is unavailable and KPIs return a capability message — but cannot compute these metrics. | MEDIUM |
+| Local dev | Ollama (`localhost:11434`) — `qwen3:1.7b` or similar ≤4B Q4 | None |
+| Production (Render) | Qwen (Alibaba) via `LLM_BASE_URL` | Gemini via `FALLBACK_LLM_BASE_URL` |
 
-See `PRODUCTION_READINESS_REPORT.md` for full list and remediation plan.
+Config: `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` env vars — any OpenAI-compatible endpoint.
+
+Fallback logic: primary LLM failure triggers `_complete_with_tools_one_shot()` on the fallback (single attempt, no retry cascade).
 
 ---
 
-## 6. LLM provider
+## 7. Multi-tenant + auth (prod)
 
-- **Local dev:** Ollama (`http://localhost:11434/v1`) — model `qwen3:1.7b` (CPU, no GPU required)
-- **Production (Render):** Together.ai (`https://api.together.xyz/v1`) — model `Qwen/Qwen3-8B`
-- **Config:** `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` env vars — any OpenAI-compatible endpoint works
-- **Used for:** AgenticLoop orchestration (native tool calling — the LLM picks capabilities), SqlPlanner, InsightEngine, chat/knowledge responder
-- **Not used for:** the deterministic pre-pass (`RouteClassifier`/`IntentAnalyzer`), `classify_query_kind`, KPI calculation, dashboard aggregates, forecasting (linear regression), the response cache + KPI fast-path
-- **Fallback:** None — if the LLM endpoint is down, the agentic loop returns a turn-level error (the cache + KPI fast-path still serve what they can)
+- `AUTH_ENABLED=true` in production
+- All routes except `/health`, `/auth/*`, `/docs`, `/openapi.json`, `/redoc` require `Authorization: Bearer <token>`
+- HMAC-signed tokens; bcrypt passwords
+- Schema-per-tenant isolation: `tenant_<uuid>` Postgres schema per user
+- `_AUTH_PUBLIC_PREFIXES` in `core_system.py` controls the public surface
 
 ---
 
-## 7. Scores (audit 2025-05-15)
+## 8. Known remaining gaps
 
-| Dimension | Score |
-|---|---|
-| System Maturity | 58 / 100 |
-| Production Readiness | 42 / 100 |
-| Scalability | 35 / 100 |
-| Security | 30 / 100 |
-| AI Orchestration Quality | 68 / 100 |
+| ID | Issue | Status |
+|---|---|---|
+| C3 | LLM SQL executed with denylist only — no full parameterization | Open |
+| C6 | `MetricSqlBuilder` assumes `u_sales_transactions`/`u_inventory_master` schema — other schemas get LLM-only path | Open |
+| schema-portability | GH issues #1-#6 — Concept Resolver + Metric SQL Builder epic | In progress |
+| two-tenant isolation | Per-tenant `_column_profile` table still not verified in prod | Open |

@@ -135,16 +135,40 @@ def log_error(
     payload_json = _jsonify(request_payload)
     context_json = _jsonify(context)
 
-    # On Postgres, skip the raw-sqlite3 write (it would open a local file
-    # instead of hitting Supabase). The error is still surfaced via the
-    # Python logger below. Queryable history via /errors is unavailable on
-    # Postgres tonight; re-port over the weekend.
     from app.db_engine import is_postgres as _is_pg
     if _is_pg():
-        _log.warning(
-            "error_log skipped on Postgres: id=%s severity=%s module=%s type=%s msg=%s",
-            error_id, sev, module or "system", error_type, msg[:300],
-        )
+        # Postgres path — write via the asyncpg shim so errors are queryable
+        # in prod. Run in a fire-and-forget task so log_error stays sync.
+        import asyncio as _asyncio
+        from app.infrastructure import get_connection as _get_conn
+
+        async def _pg_write() -> None:
+            try:
+                async with _get_conn() as db:
+                    await db.execute(
+                        "INSERT INTO error_log "
+                        "(error_id, severity, module, error_type, message, "
+                        " endpoint, method, user_facing, suggested_fix, source, "
+                        " stack_trace, request_payload, context) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            error_id, sev, module or "system", error_type, msg[:8000],
+                            endpoint, method, 1 if user_facing else 0,
+                            fix, source, stack, payload_json, context_json,
+                        ),
+                    )
+                    await db.commit()
+            except Exception:
+                _log.warning(
+                    "error_log Postgres write failed: id=%s sev=%s msg=%s",
+                    error_id, sev, msg[:200], exc_info=True,
+                )
+
+        try:
+            loop = _asyncio.get_running_loop()
+            loop.create_task(_pg_write())
+        except RuntimeError:
+            pass  # no running loop (test context) — skip silently
         return error_id
 
     try:

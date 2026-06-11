@@ -67,7 +67,7 @@ _RESERVED_TABLE_NAMES: frozenset[str] = frozenset({
 # Header detection thresholds.
 _MIN_STRING_CELLS_FOR_HEADER = 3
 _MAX_HEADER_SCAN_ROWS = 20
-_TYPE_INFER_SAMPLE = 200
+_TYPE_INFER_SAMPLE = 2000
 
 _PREFIX = "u_"
 _REGISTRY_LOCK = Lock()
@@ -216,17 +216,60 @@ _DATE_PATTERNS: tuple[re.Pattern, ...] = (
 )
 
 
-def _parse_date_str(s: str) -> str | None:
-    """Return ISO-8601 YYYY-MM-DD or None."""
+def _parse_date_str(s: str, prefer_mdy: bool = False) -> str | None:
+    """Return ISO-8601 YYYY-MM-DD or None.
+
+    For ambiguous slash-separated dates (both DD/MM and MM/DD would parse),
+    ``prefer_mdy=True`` tries MM/DD/YYYY first (US style); otherwise DD/MM/YYYY
+    is tried first (ISO world default). Pass ``prefer_mdy`` based on a
+    per-column sample from ``_infer_date_order``.
+    """
     s = s.strip()
     if not s:
         return None
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+    # ISO and hyphen forms are unambiguous — try first.
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    # Slash form (DD/MM or MM/DD) — order depends on column heuristic.
+    slash_fmts = (
+        ("%m/%d/%Y", "%d/%m/%Y") if prefer_mdy else ("%d/%m/%Y", "%m/%d/%Y")
+    )
+    for fmt in slash_fmts:
         try:
             return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
     return None
+
+
+def _infer_date_order(samples: list[Any]) -> bool:
+    """Return True if MM/DD/YYYY is more likely than DD/MM/YYYY for this column.
+
+    Looks for values where the first token is >12 (unambiguously a day,
+    ruling out MM/DD) vs. the second token being >12 (unambiguously a month
+    overflow, ruling out DD/MM). If more samples suggest MM/DD, return True.
+    """
+    mdy_votes = 0
+    dmy_votes = 0
+    for v in samples:
+        if v is None:
+            continue
+        sv = str(v).strip()
+        parts = sv.split("/")
+        if len(parts) != 3:
+            continue
+        try:
+            a, b = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if a > 12:
+            dmy_votes += 1  # first token can only be a day → DD/MM
+        elif b > 12:
+            mdy_votes += 1  # second token can only be a day → MM/DD
+    return mdy_votes > dmy_votes
 
 
 def _to_number_str(value: Any) -> Any:
@@ -239,7 +282,7 @@ def _to_number_str(value: Any) -> Any:
     return value
 
 
-def _coerce(value: Any, sql_type: str) -> Any:
+def _coerce(value: Any, sql_type: str, prefer_mdy: bool = False) -> Any:
     """Convert a python value into something SQLite-friendly for the
     inferred column type."""
     if value is None:
@@ -252,7 +295,7 @@ def _coerce(value: Any, sql_type: str) -> Any:
     if sql_type == "TEXT":
         if isinstance(value, str):
             s = value.strip()
-            iso = _parse_date_str(s)
+            iso = _parse_date_str(s, prefer_mdy=prefer_mdy)
             return iso if iso is not None else s
         return str(value)
     if sql_type == "INTEGER":
@@ -610,7 +653,7 @@ def _refine_pg_type(name: str, sql_type: str, samples: list[Any]) -> str:
     return "TEXT"
 
 
-def _coerce_pg(value: Any, pg_type: str) -> Any:
+def _coerce_pg(value: Any, pg_type: str, prefer_mdy: bool = False) -> Any:
     """Convert a raw Excel cell into something asyncpg accepts for ``pg_type``.
 
     DATE → datetime.date or None.
@@ -646,7 +689,7 @@ def _coerce_pg(value: Any, pg_type: str) -> Any:
         s = str(value).strip()
         if not s:
             return None
-        iso = _parse_date_str(s)
+        iso = _parse_date_str(s, prefer_mdy=prefer_mdy)
         if iso is None:
             return None
         return _date_cls.fromisoformat(iso)
@@ -668,7 +711,7 @@ def _coerce_pg(value: Any, pg_type: str) -> Any:
                 return datetime.strptime(s, fmt)
             except ValueError:
                 continue
-        iso = _parse_date_str(s)
+        iso = _parse_date_str(s, prefer_mdy=prefer_mdy)
         if iso is not None:
             return datetime.strptime(iso, "%Y-%m-%d")
         return None
@@ -703,6 +746,7 @@ def ingest_sheet(
     sheet_name: str,
     source_file_name: str,
     batch_id: str,
+    table_name: str | None = None,
 ) -> dict[str, Any]:
     """Drop + create + insert one sheet into ``u_<sheet_name>``.
 
@@ -766,12 +810,14 @@ def ingest_sheet(
 
         # Infer types from first N rows per column
         col_types: list[str] = []
+        mdy_flags: list[bool] = []
         sample = data_rows[:_TYPE_INFER_SAMPLE]
         for i in range(n_cols):
             samples = [row[i] for row in sample]
             col_types.append(_infer_column_type(samples))
+            mdy_flags.append(_infer_date_order(samples))
 
-        table = sheet_to_table_name(sheet_name)
+        table = table_name or sheet_to_table_name(sheet_name)
 
         # DROP + CREATE in raw sqlite3 (sync; simpler than aiosqlite here)
         con = sqlite3.connect(str(db_path()))
@@ -801,7 +847,7 @@ def ingest_sheet(
             skipped = 0
             for row in data_rows:
                 try:
-                    coerced = [_coerce(row[i], col_types[i]) for i in range(n_cols)]
+                    coerced = [_coerce(row[i], col_types[i], mdy_flags[i]) for i in range(n_cols)]
                     payload.append((batch_id, sheet_name, *coerced))
                 except Exception:
                     skipped += 1
@@ -887,6 +933,21 @@ def ingest_workbook_sync(
     total = len(sheet_names)
     _emit_progress(progress_cb, 0, total, "Reading workbook")
 
+    # Pre-compute de-collided table names so two sheets whose names map to the
+    # same u_<slug> (e.g. "Sales 2024" and "Sales-2024" both → u_sales_2024)
+    # get unique names (u_sales_2024, u_sales_2024_2) instead of the second
+    # sheet silently DROP+overwriting the first.
+    seen_tables: dict[str, int] = {}
+    sheet_table_map: dict[str, str] = {}
+    for sn in sheet_names:
+        base = sheet_to_table_name(sn)
+        if base in seen_tables:
+            seen_tables[base] += 1
+            sheet_table_map[sn] = f"{base}_{seen_tables[base]}"
+        else:
+            seen_tables[base] = 1
+            sheet_table_map[sn] = base
+
     ingested: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
     for done, sheet in enumerate(sheet_names, start=1):
@@ -896,6 +957,7 @@ def ingest_workbook_sync(
                 sheet_name=sheet,
                 source_file_name=source_file_name,
                 batch_id=batch_id,
+                table_name=sheet_table_map[sheet],
             )
             ingested.append(summary)
         except DynamicIngestError as e:
@@ -922,6 +984,7 @@ async def ingest_sheet_pg(
     sheet_name: str,
     source_file_name: str,
     batch_id: str,
+    table_name: str | None = None,
 ) -> dict[str, Any]:
     """Postgres counterpart of ``ingest_sheet``. Same XLSX parsing + type
     inference; differs only in the storage path (asyncpg via the shim).
@@ -978,20 +1041,22 @@ async def ingest_sheet_pg(
         # refinement that upgrades dates and money to native DATE / NUMERIC.
         col_types: list[str] = []
         pg_types: list[str] = []
+        mdy_flags: list[bool] = []
         sample = data_rows[:_TYPE_INFER_SAMPLE]
         for i in range(n_cols):
             samples = [row[i] for row in sample]
             sql_t = _infer_column_type(samples)
             col_types.append(sql_t)
             pg_types.append(_refine_pg_type(col_names[i], sql_t, samples))
+            mdy_flags.append(_infer_date_order(samples))
 
-        table = sheet_to_table_name(sheet_name)
+        table = table_name or sheet_to_table_name(sheet_name)
 
         skipped = 0
         payload: list[tuple[Any, ...]] = []
         for row in data_rows:
             try:
-                coerced = [_coerce_pg(row[i], pg_types[i]) for i in range(n_cols)]
+                coerced = [_coerce_pg(row[i], pg_types[i], mdy_flags[i]) for i in range(n_cols)]
                 payload.append((batch_id, sheet_name, *coerced))
             except Exception:
                 skipped += 1
@@ -1110,6 +1175,17 @@ async def ingest_workbook_pg(
     total = len(sheet_names)
     _emit_progress(progress_cb, 0, total, "Reading workbook")
 
+    seen_tables: dict[str, int] = {}
+    sheet_table_map: dict[str, str] = {}
+    for sn in sheet_names:
+        base = sheet_to_table_name(sn)
+        if base in seen_tables:
+            seen_tables[base] += 1
+            sheet_table_map[sn] = f"{base}_{seen_tables[base]}"
+        else:
+            seen_tables[base] = 1
+            sheet_table_map[sn] = base
+
     ingested: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
     for done, sheet in enumerate(sheet_names, start=1):
@@ -1119,6 +1195,7 @@ async def ingest_workbook_pg(
                 sheet_name=sheet,
                 source_file_name=source_file_name,
                 batch_id=batch_id,
+                table_name=sheet_table_map[sheet],
             )
             ingested.append(summary)
         except DynamicIngestError as e:

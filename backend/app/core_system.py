@@ -46,49 +46,9 @@ from app.dynamic_ingest import (
     reconcile_registry,
 )
 from app.database import engine_kind, engine_status
-from app.kpi import (
-    calculate_by_name,
-    disable_kpi as kpi_disable,
-    enable_kpi as kpi_enable,
-    execute_kpi,
-    get_kpi,
-    init_kpi_table,
-    list_kpis,
-    match_kpi,
-    rebuild_catalog,
-    seed_default_catalog,
-)
 from app.time_engine import (
     invalidate_cache as invalidate_time_cache,
     resolve_dataset_date_tokens,
-)
-from app.hierarchy import (
-    V2_LEVELS,
-    create_branch,
-    list_branches,
-    list_location_hierarchy,
-    list_product_hierarchy,
-    list_product_master,
-    list_sku_master,
-    list_v2_tree,
-    seed_default_business,
-    sync_product_master_from_data,
-    sync_product_sku_master,
-    v2_drilldown,
-)
-from app.enrichment import (
-    backfill_missing_product_names,
-    backfill_quantities,
-    cost_master_snapshot,
-    forecast_summary,
-    inventory_snapshot,
-    list_forecast_for_sku,
-    list_inventory,
-    list_product_costs,
-    mock_backfill_stats,
-    refresh_forecast,
-    refresh_inventory,
-    refresh_product_costs,
 )
 from app.infrastructure import (
     ALLOWED_TABLES,
@@ -571,392 +531,6 @@ async def drive_sync(
     }
 
 
-# ---------------------------------------------------------------------------
-# KPI Registry API
-# Centralized formula engine — see app/kpi/*. The AI fast-path in
-# run_query_turn also reads this registry; these routes give the dashboard
-# and external tooling a direct interface.
-# ---------------------------------------------------------------------------
-
-@api_router.get("/kpi")
-async def kpi_list(
-    category: str | None = None,
-    enabled_only: bool = True,
-    principal: Principal = Depends(require_principal),
-):
-    # DATA-PATH route: list_kpis reads the registry resolved via the
-    # search_path. Bind the query tenant so it targets the tenant's OWN schema
-    # (require_principal no longer drives search_path).
-    from app.tenant_context import set_query_tenant
-    set_query_tenant(principal.tenant_id)
-    rows = await list_kpis(category=category, enabled_only=enabled_only)
-    return {
-        "count": len(rows),
-        "kpis": [
-            {
-                "id":                 r.id,
-                "kpi_name":           r.kpi_name,
-                "kpi_category":       r.kpi_category,
-                "description":        r.description,
-                "formula_expression": r.formula_expression,
-                "required_columns":   r.required_columns,
-                "aggregation_type":   r.aggregation_type,
-                "output_type":        r.output_type,
-                "chart_supported":    r.chart_supported,
-                "aliases":            r.aliases,
-                "enabled":            r.enabled,
-            }
-            for r in rows
-        ],
-    }
-
-
-@api_router.get("/kpi/match")
-async def kpi_match_route(
-    question: str,
-    principal: Principal = Depends(require_principal),
-):
-    """Resolve a natural-language question to a registered KPI."""
-    # DATA-PATH route: match_kpi reads the registry resolved via the
-    # search_path. Bind the query tenant so it targets the tenant's OWN schema
-    # (require_principal no longer drives search_path).
-    from app.tenant_context import set_query_tenant
-    set_query_tenant(principal.tenant_id)
-    m = await match_kpi(question)
-    if m is None:
-        return {"matched": False, "question": question}
-    return {
-        "matched":         True,
-        "question":        question,
-        "kpi_id":          m.kpi.id,
-        "kpi_name":        m.kpi.kpi_name,
-        "confidence":      m.confidence,
-        "matched_alias":   m.matched_alias,
-        "reason":          m.reason,
-    }
-
-
-@api_router.get("/kpi/{kpi_id}")
-async def kpi_get(
-    kpi_id: str,
-    principal: Principal = Depends(require_principal),
-):
-    # DATA-PATH route: get_kpi reads the registry resolved via the search_path.
-    # Bind the query tenant so it targets the tenant's OWN schema
-    # (require_principal no longer drives search_path).
-    from app.tenant_context import set_query_tenant
-    set_query_tenant(principal.tenant_id)
-    kpi = await get_kpi(kpi_id)
-    if kpi is None:
-        return JSONResponse(status_code=404, content=envelope(
-            "KPI not found", detail=f"unknown id/name: {kpi_id!r}", kind="validation",
-        ))
-    return {
-        "id":                 kpi.id,
-        "kpi_name":           kpi.kpi_name,
-        "kpi_category":       kpi.kpi_category,
-        "description":        kpi.description,
-        "formula_expression": kpi.formula_expression,
-        "required_columns":   kpi.required_columns,
-        "sql_template":       kpi.sql_template,
-        "aggregation_type":   kpi.aggregation_type,
-        "output_type":        kpi.output_type,
-        "chart_supported":    kpi.chart_supported,
-        "aliases":            kpi.aliases,
-        "enabled":            kpi.enabled,
-        "created_at":         kpi.created_at,
-        "updated_at":         kpi.updated_at,
-    }
-
-
-@api_router.post("/kpi/{kpi_id}/calculate")
-async def kpi_calculate(
-    kpi_id: str,
-    principal: Principal = Depends(require_principal),
-):
-    """Execute a KPI by id or display name. Returns a structured result —
-    error population on the same payload (never throws to the client)."""
-    # DATA-PATH route: calculate_by_name reads the registry + the tenant's u_*
-    # data via the search_path. Bind the query tenant so it resolves against the
-    # tenant's OWN schema (require_principal no longer drives search_path).
-    from app.tenant_context import set_query_tenant
-    set_query_tenant(principal.tenant_id)
-    res = await calculate_by_name(kpi_id)
-    if res.error:
-        return JSONResponse(status_code=400, content=res.to_dict())
-    return res.to_dict()
-
-
-@api_router.post("/kpi/{kpi_id}/disable")
-async def kpi_disable_route(
-    kpi_id: str,
-    principal: Principal = Depends(require_principal),
-):
-    # DATA-PATH route: kpi_disable updates the registry resolved via the
-    # search_path. Bind the query tenant so it targets the tenant's OWN schema
-    # (require_principal no longer drives search_path).
-    from app.tenant_context import set_query_tenant
-    set_query_tenant(principal.tenant_id)
-    ok = await kpi_disable(kpi_id)
-    if not ok:
-        return JSONResponse(status_code=404, content=envelope(
-            "KPI not found", detail=f"unknown id: {kpi_id!r}", kind="validation",
-        ))
-    # KPI definition changed -> any cached chat answer that resolved this
-    # KPI is now stale. Bump version + drop the response cache.
-    bump_data_version()
-    invalidate_all()
-    return {"ok": True, "kpi_id": kpi_id, "enabled": False}
-
-
-@api_router.post("/kpi/{kpi_id}/enable")
-async def kpi_enable_route(
-    kpi_id: str,
-    principal: Principal = Depends(require_principal),
-):
-    # DATA-PATH route: kpi_enable updates the registry resolved via the
-    # search_path. Bind the query tenant so it targets the tenant's OWN schema
-    # (require_principal no longer drives search_path).
-    from app.tenant_context import set_query_tenant
-    set_query_tenant(principal.tenant_id)
-    ok = await kpi_enable(kpi_id)
-    if not ok:
-        return JSONResponse(status_code=404, content=envelope(
-            "KPI not found", detail=f"unknown id: {kpi_id!r}", kind="validation",
-        ))
-    bump_data_version()
-    invalidate_all()
-    return {"ok": True, "kpi_id": kpi_id, "enabled": True}
-
-
-@api_router.post("/kpi/rebuild")
-async def kpi_rebuild(
-    principal: Principal = Depends(require_principal),
-):
-    """Force-reseed every KPI in the default catalog. User-added KPIs are
-    left untouched."""
-    # DATA-PATH route: rebuild_catalog rewrites the registry resolved via the
-    # search_path. Bind the query tenant so it targets the tenant's OWN schema
-    # (require_principal no longer drives search_path).
-    from app.tenant_context import set_query_tenant
-    set_query_tenant(principal.tenant_id)
-    n = await rebuild_catalog()
-    return {"ok": True, "rewritten": n}
-
-
-# ---------------------------------------------------------------------------
-# Hierarchy API — product + location inspection and branch management
-# ---------------------------------------------------------------------------
-
-@api_router.get("/hierarchy/products")
-async def hierarchy_products():
-    """Return the product hierarchy tree + the product → hierarchy mapping
-    table. Both are populated from the currently uploaded data only."""
-    return {
-        "hierarchy": await list_product_hierarchy(),
-        "products":  await list_product_master(),
-    }
-
-
-@api_router.post("/hierarchy/products/sync")
-async def hierarchy_products_sync():
-    """Rebuild product_master by scanning distinct Product Name values."""
-    stats = await sync_product_master_from_data()
-    # Hierarchy was rebuilt -> any cached drill-down / category answer
-    # is stale. Bump version + drop the response cache.
-    bump_data_version()
-    invalidate_all()
-    return {"ok": True, **stats}
-
-
-# ---------------------------------------------------------------------------
-# Enrichment API — Inventory + Forecast (derived from real sales)
-# ---------------------------------------------------------------------------
-
-@api_router.get("/enrichment/costs")
-async def enrichment_costs_list(limit: int = 500):
-    """View the per-product unit cost master (deterministic mock + user manual)."""
-    return {
-        "count": (await cost_master_snapshot()).get("total", 0),
-        "snapshot": await cost_master_snapshot(),
-        "items": await list_product_costs(limit=limit),
-    }
-
-
-@api_router.post("/enrichment/costs/refresh")
-async def enrichment_costs_refresh():
-    """Force-regenerate the synthetic cost master + quantity backfill.
-    User-supplied (source='manual') cost rows are preserved."""
-    cost_stats = await refresh_product_costs()
-    qty_stats  = await backfill_quantities()
-    # Cost / margin computations referenced by cached chat answers are
-    # now stale -> bump version + drop cache.
-    bump_data_version()
-    invalidate_all()
-    return {"ok": True, "costs": cost_stats, "quantities": qty_stats}
-
-
-@api_router.get("/enrichment/mock-stats")
-async def enrichment_mock_stats():
-    """How many sales/purchase rows have been mock-named vs real-named.
-    Useful for the user to audit how much of the analytics is backed by
-    real product attribution vs deterministic backfill."""
-    return await mock_backfill_stats()
-
-
-@api_router.post("/enrichment/backfill-products")
-async def enrichment_backfill():
-    """Manually trigger the mock-product-name backfill. Idempotent — rows
-    with a real product name are never touched. After backfill the
-    standard hierarchy + inventory + forecast sync chain runs so the new
-    names land in every downstream table immediately."""
-    fill_stats = await backfill_missing_product_names()
-    sync_stats = await sync_product_master_from_data()
-    v2_stats   = await sync_product_sku_master()
-    inv_stats  = await refresh_inventory()
-    fc_stats   = await refresh_forecast()
-    return {
-        "ok": True,
-        "filled":          fill_stats,
-        "hierarchy_v1":    sync_stats,
-        "hierarchy_v2":    v2_stats,
-        "inventory":       inv_stats,
-        "forecast":        fc_stats,
-    }
-
-
-@api_router.get("/inventory/snapshot")
-async def inventory_snapshot_route():
-    """Headline counts of inventory health (ok / low / overstocked / dead)."""
-    return await inventory_snapshot()
-
-
-@api_router.get("/inventory")
-async def inventory_list(status: str | None = None):
-    """Per-SKU inventory with status, on-hand qty, velocity, days of cover.
-    Optional `?status=low` filter."""
-    rows = await list_inventory(status=status)
-    return {"count": len(rows), "items": rows}
-
-
-@api_router.post("/inventory/refresh")
-async def inventory_refresh_route():
-    """Force-recompute the inventory snapshot from real sales velocity."""
-    result = await refresh_inventory()
-    # Inventory rows changed -> any cached inventory / "what's low?"
-    # answer is stale. Bump version + drop the response cache.
-    bump_data_version()
-    invalidate_all()
-    return {"ok": True, **result}
-
-
-@api_router.get("/forecast/summary")
-async def forecast_summary_route():
-    """Aggregated 7-day and 30-day revenue projection."""
-    return await forecast_summary()
-
-
-@api_router.get("/forecast/sku/{sku_code}")
-async def forecast_sku_route(sku_code: str):
-    """Per-SKU 14-day forecast."""
-    rows = await list_forecast_for_sku(sku_code)
-    return {"sku_code": sku_code, "horizon_days": len(rows), "forecast": rows}
-
-
-@api_router.post("/forecast/refresh")
-async def forecast_refresh_route():
-    """Force-recompute the 14-day per-SKU forecast."""
-    result = await refresh_forecast()
-    # Forecast rows changed -> any cached forecast answer is stale.
-    bump_data_version()
-    invalidate_all()
-    return {"ok": True, **result}
-
-
-@api_router.get("/hierarchy/v2/tree")
-async def hierarchy_v2_tree():
-    """The full 6-level synthetic enterprise hierarchy + SKU master.
-    Strictly additive — never overlaps with the v1 hierarchy endpoints."""
-    return {
-        "levels":   list(V2_LEVELS) + ["item"],
-        "tree":     await list_v2_tree(),
-        "skus":     await list_sku_master(),
-    }
-
-
-@api_router.post("/hierarchy/v2/sync")
-async def hierarchy_v2_sync():
-    """Rebuild product_sku_master + product_hierarchy_v2 from the current
-    sales/purchase rows. Idempotent: existing SKU codes stay stable."""
-    result = await sync_product_sku_master()
-    # Hierarchy v2 changed -> cached drill-down answers are stale.
-    bump_data_version()
-    invalidate_all()
-    return {"ok": True, **result}
-
-
-@api_router.get("/hierarchy/v2/drilldown")
-async def hierarchy_v2_drilldown_route(
-    level: str, parent_id: str | None = None,
-):
-    if level not in (*V2_LEVELS, "item"):
-        return JSONResponse(status_code=400, content=envelope(
-            "Invalid level",
-            detail=f"level must be one of {list(V2_LEVELS) + ['item']}",
-            kind="validation",
-        ))
-    if level == "item":
-        # Items live in product_sku_master keyed by parent type_id.
-        from app.infrastructure import fetch_all as _fa
-        if parent_id is None:
-            rows = await _fa(
-                "SELECT id, sku_code, product_name FROM product_sku_master "
-                "ORDER BY sku_code"
-            )
-        else:
-            rows = await _fa(
-                "SELECT id, sku_code, product_name FROM product_sku_master "
-                "WHERE type_id = ? ORDER BY sku_code",
-                (parent_id,),
-            )
-        return {"level": "item", "parent_id": parent_id, "items": rows}
-    return {
-        "level":     level,
-        "parent_id": parent_id,
-        "nodes":     await v2_drilldown(level, parent_id),
-    }
-
-
-@api_router.get("/hierarchy/locations")
-async def hierarchy_locations():
-    return {
-        "hierarchy": await list_location_hierarchy(),
-        "branches":  await list_branches(enabled_only=False),
-    }
-
-
-class CreateBranchRequest(BaseModel):
-    branch_name: str = Field(..., min_length=1, max_length=200)
-    city: str | None = Field(default=None, max_length=200)
-    address: str | None = Field(default=None, max_length=500)
-
-
-@api_router.post("/hierarchy/branches")
-async def hierarchy_branch_create(req: CreateBranchRequest):
-    try:
-        return await create_branch(req.branch_name, city=req.city, address=req.address)
-    except ValueError as e:
-        return JSONResponse(status_code=400, content=envelope(
-            "Branch validation failed", detail=str(e), kind="validation",
-        ))
-    except Exception as e:
-        log.exception("create_branch failed")
-        return JSONResponse(status_code=500, content=envelope(
-            "Branch creation failed",
-            detail=f"{type(e).__name__}: {e}",
-            kind="internal",
-        ))
-
 
 # ---------------------------------------------------------------------------
 # Time engine diagnostics
@@ -1090,6 +664,21 @@ async def errors_report(req: FrontendErrorReport):
 
 
 @api_router.get("/health")
+async def _health_data_rows() -> int:
+    """Return total row count across all dynamic (u_*) tables for the system.
+
+    On Postgres: sums row_count from list_dynamic_tables_for_tenant() which
+    queries information_schema live — gives real uploaded-data volume instead
+    of the old static-table zeros.
+    On SQLite: falls back to the legacy count_rows("sales") sum.
+    """
+    from app.db_engine import is_postgres
+    if is_postgres():
+        tables = await list_dynamic_tables_for_tenant()
+        return sum(int(t.get("row_count") or 0) for t in tables)
+    return await count_rows("sales") + await count_rows("purchase")
+
+
 async def health() -> dict:
     """Defensive health endpoint.
 
@@ -1137,8 +726,7 @@ async def health() -> dict:
             "size": _safe(cache_size, default=0),
         },
         "database": _safe(engine_status, default={"kind": "unknown", "status": "starting"}),
-        "sales_rows": await _safe_async(lambda: count_rows("sales"), default=0),
-        "purchase_rows": await _safe_async(lambda: count_rows("purchase"), default=0),
+        "data_rows": await _safe_async(_health_data_rows, default=0),
         "sentry": _safe(sentry_status, default={"enabled": False}),
         "llm": llm_block,
         "auth_enabled": settings.auth_enabled,
@@ -1148,24 +736,15 @@ async def health() -> dict:
 # ---------------------------------------------------------------------------
 # Shared post-ingest refresh — runs after ANY ingestion path (file upload or
 # Google Drive sync) so derived state stays consistent: data version bump,
-# cache invalidation, product-name backfill, hierarchy v1/v2 sync, inventory
-# + forecast + cost refresh, quantity backfill. Every step is best-effort —
-# a failure in one is logged and the rest still run. Returns the new data
-# version.
+# cache invalidation, relationship graph refresh. Returns the new data version.
 # ---------------------------------------------------------------------------
 
 async def _post_ingest_refresh() -> int:
     refresh_log = logging.getLogger("agentic_ai.api.ingest")
     new_version = bump_data_version()
     invalidate_all()
-    # Invalidate the dataset-relative time cache so the next analytics call
-    # recomputes MAX(Date) against the freshly inserted rows.
     invalidate_time_cache()
 
-    # Postgres path: detect cross-table relationships across the freshly
-    # ingested u_* tables and store them in `_relationships`. The Schema
-    # tool reads this to emit explicit JOIN-key hints to the LLM, so the
-    # SQL writer doesn't have to guess which columns join which tables.
     from app.db_engine import is_postgres
     if is_postgres():
         try:
@@ -1173,58 +752,7 @@ async def _post_ingest_refresh() -> int:
             rel_count = await refresh_relationships_pg()
             refresh_log.info("relationships refreshed: count=%d", rel_count)
         except Exception:
-            refresh_log.warning(
-                "relationship refresh failed (continuing)", exc_info=True,
-            )
-        # Everything below targets the SQLite-only legacy schema (static
-        # sales / purchase tables, product hierarchy, enrichment, cost
-        # master). Those tables don't exist on Postgres — every call would
-        # raise inside its try/except, wasting CPU and spamming the logs.
-        # The agentic loop reads u_* tables directly via the Schema tool.
-        return new_version
-
-    # Mock product-name backfill — fill any rows whose Product Name came in
-    # blank with a deterministic footwear name. MUST run before hierarchy
-    # sync so the new names get classified into the v1 + v2 trees this cycle.
-    try:
-        mock_stats = await backfill_missing_product_names()
-        if any(v > 0 for v in mock_stats.values()):
-            refresh_log.info("mock product backfill: %s", mock_stats)
-    except Exception:
-        refresh_log.warning("mock product backfill failed (continuing)", exc_info=True)
-    # Re-sync product hierarchy from the now-updated sales/purchase tables.
-    try:
-        sync_stats = await sync_product_master_from_data()
-        refresh_log.info("product hierarchy v1 synced: %s", sync_stats)
-    except Exception:
-        refresh_log.warning("product hierarchy v1 sync failed (continuing)", exc_info=True)
-    # v2 sync — enterprise 6-level hierarchy. Additive; v1 stays intact.
-    try:
-        v2_stats = await sync_product_sku_master()
-        refresh_log.info("product hierarchy v2 synced: %s", v2_stats)
-    except Exception:
-        refresh_log.warning("product hierarchy v2 sync failed (continuing)", exc_info=True)
-    # Enrichment refresh — inventory + forecast derived from real sales.
-    try:
-        inv_stats = await refresh_inventory()
-        refresh_log.info("inventory refreshed: %s", inv_stats)
-    except Exception:
-        refresh_log.warning("inventory refresh failed (continuing)", exc_info=True)
-    try:
-        fc_stats = await refresh_forecast()
-        refresh_log.info("forecast refreshed: %s", fc_stats)
-    except Exception:
-        refresh_log.warning("forecast refresh failed (continuing)", exc_info=True)
-    # Cost master + quantity backfill — feeds profit / margin / unit velocity
-    # KPIs. Costs depend on product+line classification so this runs AFTER
-    # hierarchy v2 sync.
-    try:
-        cost_stats = await refresh_product_costs()
-        refresh_log.info("product costs refreshed: %s", cost_stats)
-        qty_stats = await backfill_quantities()
-        refresh_log.info("quantity backfill: %s", qty_stats)
-    except Exception:
-        refresh_log.warning("cost/quantity refresh failed (continuing)", exc_info=True)
+            refresh_log.warning("relationship refresh failed (continuing)", exc_info=True)
     return new_version
 
 
@@ -1874,6 +1402,7 @@ async def upload_preview(
     request: Request,
     file: UploadFile = File(...),
     target: str = Form("sales"),
+    principal: "Principal" = Depends(require_principal),
 ):
     upload_log = logging.getLogger("agentic_ai.api.upload.preview")
     target_table = (target or "sales").strip().lower()
@@ -1928,9 +1457,9 @@ async def upload_preview(
                 "Empty file", kind="upload",
             ))
 
-        # File-hash check against existing active uploads
+        # File-hash check against existing active uploads (scoped to this tenant)
         file_hash, _ = compute_file_hash(tmp_path)
-        existing = await find_active_upload_by_file_hash(file_hash)
+        existing = await find_active_upload_by_file_hash(file_hash, tenant_id=principal.tenant_id)
         existing_summary = None
         if existing is not None:
             existing_summary = {
@@ -2505,7 +2034,6 @@ _AUTH_PUBLIC_PREFIXES = (
     "/docs",
     "/openapi.json",
     "/redoc",
-    "/mcp",            # MCP sub-app has its own session handshake
 )
 
 
@@ -2624,8 +2152,6 @@ def _module_for_path(path: str) -> str:
     if p.startswith("/uploads"):    return "upload"
     if p.startswith("/dashboard"):  return "dashboard"
     if p.startswith("/query"):      return "ai"
-    if p.startswith("/kpi"):        return "kpi"
-    if p.startswith("/hierarchy"):  return "hierarchy"
     if p.startswith("/auth"):       return "auth"
     if p.startswith("/drive"):      return "auth"
     if p.startswith("/datasets"):   return "upload"
@@ -2638,23 +2164,10 @@ def _module_for_path(path: str) -> str:
 
 async def _startup() -> None:
     from app.infrastructure import init_database, list_uploads_meta, load_synonyms
-    from app.db_engine import is_postgres as _is_pg
     from app.vector import register_vocabulary
 
     await init_database()
     _app_log.info("database engine: %s", engine_kind())
-
-    # Postgres flag: KPI registry, hierarchy seeding, enrichment, mock backfill,
-    # quantity backfill are all SQLite-only legacy paths. Skip them on Postgres
-    # for tonight's 5-hour migration — the agentic loop (Schema + sqlWriter +
-    # SqlExecutor) does NOT depend on any of these; KPI fast-path is bypassed
-    # and the LLM writes SQL directly against the u_* tables.
-    _on_pg = _is_pg()
-    if _on_pg:
-        _app_log.info(
-            "Postgres engine detected — skipping SQLite-only seeding "
-            "(KPI registry, hierarchy, enrichment, mock backfill)."
-        )
 
     # Registry reconcile — rebuild dynamic_tables.json from SQLite so AI
     # queries work immediately after restart even if the JSON was lost.
@@ -2666,24 +2179,6 @@ async def _startup() -> None:
             _app_log.info("dynamic table registry: up to date")
     except Exception:
         _app_log.exception("dynamic table registry reconcile failed (continuing)")
-
-    # KPI registry — table + default catalog. Always rebuild on startup so
-    # shipped template updates (e.g. dataset-relative time tokens) propagate
-    # to existing DBs without a manual /kpi/rebuild call. User-added KPIs
-    # (ids not in DEFAULT_KPIS) are untouched because rebuild_catalog only
-    # upserts the shipped default catalog.
-    if not _on_pg:
-        try:
-            await init_kpi_table()
-            n = await rebuild_catalog()
-            _app_log.info("kpi registry rebuilt: %d shipped KPIs upserted", n)
-            kpi_rows = await list_kpis(enabled_only=False)
-            _app_log.info(
-                "kpi registry: %d total (%d enabled)",
-                len(kpi_rows), sum(1 for k in kpi_rows if k.enabled),
-            )
-        except Exception:
-            _app_log.exception("kpi registry bootstrap failed (continuing)")
 
     # Time engine — invalidate any stale cached tokens, then probe once so
     # the operator sees the current dataset date in the boot log.
@@ -2700,46 +2195,6 @@ async def _startup() -> None:
             _app_log.info("time engine: no uploaded data yet — relative-time KPIs will fail until first upload")
     except Exception:
         _app_log.exception("time engine probe failed (continuing)")
-
-    # Mock product-name backfill — runs BEFORE hierarchy so newly-named
-    # rows propagate to the trees in the same boot cycle. Idempotent:
-    # rows that already have a real product name are never touched.
-    if not _on_pg:
-        try:
-            mock_stats = await backfill_missing_product_names()
-            if any(v > 0 for v in mock_stats.values()):
-                _app_log.info("mock product backfill (startup): %s", mock_stats)
-        except Exception:
-            _app_log.exception("mock product backfill failed (continuing)")
-
-    # Hierarchy — seed default business/branch + sync product master from
-    # whatever data is already in the SQLite tables (v1 + v2 in parallel).
-    if not _on_pg:
-        try:
-            seeds = await seed_default_business()
-            _app_log.info("default branch chain seeded: %s", seeds)
-            sync_stats = await sync_product_master_from_data()
-            _app_log.info("product hierarchy v1: %s", sync_stats)
-            v2_stats = await sync_product_sku_master()
-            _app_log.info("product hierarchy v2: %s", v2_stats)
-            branches = await list_branches()
-            _app_log.info("branches: %d enabled", len(branches))
-        except Exception:
-            _app_log.exception("hierarchy bootstrap failed (continuing)")
-
-    # Enrichment — inventory + forecast derived from the real sales data.
-    if not _on_pg:
-        try:
-            inv_stats = await refresh_inventory()
-            _app_log.info("inventory enrichment: %s", inv_stats)
-            fc_stats = await refresh_forecast()
-            _app_log.info("forecast enrichment: %s", fc_stats)
-            cost_stats = await refresh_product_costs()
-            _app_log.info("cost master enrichment: %s", cost_stats)
-            qty_stats = await backfill_quantities()
-            _app_log.info("quantity backfill (startup): %s", qty_stats)
-        except Exception:
-            _app_log.exception("enrichment bootstrap failed (continuing)")
 
     # Coordinator registry — Phase 2: 4 capabilities only.
     # Sub-agents (sqlWriter, rcaReasoner, insightFmt) are called internally

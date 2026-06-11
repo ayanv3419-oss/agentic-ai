@@ -21,7 +21,6 @@ from app.coordinator.tools.schema import SchemaTool
 from app.coordinator.tools.sql_dry_run import SqlDryRunTool
 from app.coordinator.tools.sql_executor import SqlExecutorTool
 from app.coordinator.sub_agents.sql_writer import SqlWriterAgent
-from app.kpi.matcher import match_kpi as _match_kpi
 
 
 _schema_tool   = SchemaTool()
@@ -86,36 +85,6 @@ class RunDataQueryCapability(Tool):
         if schema_outcome.state_updates:
             updates.update(schema_outcome.state_updates)
             state = state.apply(**schema_outcome.state_updates)
-
-        # ── Step 1b: KPI matcher ────────────────────────────────────────────
-        # Match the user's question + intent to a registered KPI. If we get a
-        # confident-enough match, pass the KPI's formula concept and
-        # aggregation type to sqlWriter so it writes correct SQL instead of
-        # guessing. SqlExecutor also reads aggregation_type to compute the
-        # chart total correctly (e.g. average for percent metrics, not sum).
-        # Floor lowered to 0.65 so weaker matches still surface as hints —
-        # they are tagged with match_strength so downstream tools can decide
-        # how much to trust them. Below 0.65 the noise outweighs the signal.
-        try:
-            _kpi_text = f"{state.question} {intent}"
-            _kpi_match = await _match_kpi(_kpi_text)
-        except Exception:
-            _kpi_match = None
-
-        if _kpi_match and _kpi_match.confidence >= 0.65:
-            _k = _kpi_match.kpi
-            kpi_hint: dict[str, Any] = {
-                "id":               _k.id,
-                "name":             _k.kpi_name,
-                "formula":          _k.formula_expression,
-                "aggregation_type": _k.aggregation_type,
-                "output_type":      _k.output_type,
-                "description":      _k.description,
-                "confidence":       _kpi_match.confidence,
-                "match_strength":   "strong" if _kpi_match.confidence >= 0.85 else "weak",
-            }
-            updates["kpi_hint"] = kpi_hint
-            state = state.apply(kpi_hint=kpi_hint)
 
         # ── Step 2: sqlWriter + SqlDryRun (with one auto-retry) ─────────
         sql: str | None = None
