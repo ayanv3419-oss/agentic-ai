@@ -611,9 +611,21 @@ CREATE TABLE IF NOT EXISTS tenant_schema_maps (
 
 
 def uploads_dir() -> Path:
-    """Permanent directory for source CSV/XLSX files. Files live here until
-    the user explicitly disconnects the dataset — never auto-cleaned."""
-    p = Path(settings.financial_db_path).parent / "uploads"
+    """Directory for source CSV/XLSX files.
+
+    On Postgres (DATABASE_URL set) the data lives in PG; /data may not be
+    writable on Render without a mounted disk, so fall back to /tmp which is
+    always writable. Files under /tmp are ephemeral across restarts, but that
+    is acceptable — ingest re-reads the file then stores rows in Postgres.
+
+    On SQLite the file is the source of truth, so we keep it on the persistent
+    path under financial_db_path.
+    """
+    import os
+    if os.environ.get("DATABASE_URL"):
+        p = Path("/tmp") / "agentic_uploads"
+    else:
+        p = Path(settings.financial_db_path).parent / "uploads"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -1935,6 +1947,9 @@ def bump_data_version() -> int:
 
 
 def _cache_path() -> Path:
+    import os
+    if os.environ.get("DATABASE_URL"):
+        return Path("/tmp") / "agentic_response_store.json"
     return Path(settings.response_store_path)
 
 
