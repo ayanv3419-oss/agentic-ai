@@ -663,15 +663,8 @@ async def errors_report(req: FrontendErrorReport):
     return {"ok": True, "error_id": eid}
 
 
-@api_router.get("/health")
 async def _health_data_rows() -> int:
-    """Return total row count across all dynamic (u_*) tables for the system.
-
-    On Postgres: sums row_count from list_dynamic_tables_for_tenant() which
-    queries information_schema live — gives real uploaded-data volume instead
-    of the old static-table zeros.
-    On SQLite: falls back to the legacy count_rows("sales") sum.
-    """
+    """Return total row count across all dynamic (u_*) tables for the system."""
     from app.db_engine import is_postgres
     if is_postgres():
         tables = await list_dynamic_tables_for_tenant()
@@ -679,6 +672,7 @@ async def _health_data_rows() -> int:
     return await count_rows("sales") + await count_rows("purchase")
 
 
+@api_router.get("/health")
 async def health() -> dict:
     """Defensive health endpoint.
 
