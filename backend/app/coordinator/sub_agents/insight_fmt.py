@@ -38,7 +38,10 @@ tables and bullet lists all render).
 5. NEVER hedge with "based on the limited data" / "the dataset only contains"
    / "this is the only data point" unless row_count is literally 0. Each row
    is a SQL aggregate over the full dataset (100k+ rows), not the size of the
-   database.
+   database. The ONE exception is the TRUST verdict below: when a
+   'Result confidence: LOW' line is present, you MUST add the single caveat
+   line described there. When 'Result confidence: HIGH' (or no verdict line),
+   write with full confidence and do NOT hedge at all.
 6. Margin / profit: discuss it only if the question asks about it. Whether it
    is computable is stated by the 'Data capability' line below - trust ONLY
    that line; never infer "no cost data" from a query that simply didn't
@@ -70,6 +73,13 @@ gap from the leader, or concentration. Make at least two distinct comparisons
 when the data allows.
 
 ## Caveats  (include ONLY when something genuinely warrants it - else OMIT)
+- LOW CONFIDENCE (TRUST guardrail): if the context contains a
+  'Result confidence: LOW' line, a deterministic check found the result
+  implausible (e.g. NaN/Infinity, a negative revenue/total, or an absurd
+  percentage). You MUST add exactly ONE brief caveat line near the top, e.g.
+  "⚠️ This figure looks unusual — double-check the source data." Still answer
+  the question with the numbers given; do NOT refuse. When the line says
+  'Result confidence: HIGH' (or is absent), do NOT add this caveat.
 - PARTIAL PERIOD: if the LATEST period by date in a time series is far below
   the recent norm (roughly < 60% of the average of the prior few periods),
   treat it as possibly INCOMPLETE. Say so explicitly and base your trend
@@ -112,6 +122,18 @@ def _build_user(ctx: ToolContext, args: dict[str, Any]) -> str:
         parts.append("Insights:\n" + "\n".join(state.insights))
     if state.causal_tree:
         parts.append(f"Causal tree: {state.causal_tree}")
+    # TRUST guardrail verdict (deterministic, set by SqlExecutor via
+    # validate_result). Surface it so the formatter knows whether to add a
+    # one-line caveat. Only the LOW case changes behaviour; HIGH is the
+    # existing no-hedge default. Reasons are included to ground the caveat.
+    if getattr(state, "answer_confidence", "high") == "low":
+        why = "; ".join(state.confidence_reasons) or "implausible result"
+        parts.append(
+            f"Result confidence: LOW (sanity check flagged: {why}). "
+            "Add the one-line low-confidence caveat per the rules."
+        )
+    else:
+        parts.append("Result confidence: HIGH (no hedge).")
     # Cost/margin availability comes from the resolved schema of the
     # uploaded dataset - NOT from whether this query happened to select a
     # cost column. This is what stops the false "no cost data" claim.

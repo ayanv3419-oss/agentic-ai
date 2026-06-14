@@ -301,3 +301,120 @@ def verify_token(token: str) -> "Principal | None":
     if not isinstance(exp, (int, float)) or exp < time.time():
         return None
     return Principal(user_id=uid, tenant_id=tid, email=u)
+
+
+# ---------------------------------------------------------------------------
+# Password reset — single-use-ish, time-limited signed tokens + a write that
+# rotates the stored bcrypt hash. The token reuses the SAME HMAC primitives and
+# the SAME ``settings.auth_token_secret`` as the bearer token above (one secret
+# rotation invalidates reset links too), but carries a distinct payload tagged
+# ``"k": "pwreset"`` so a bearer token can never be replayed as a reset token
+# (or vice-versa) even though both share the wire shape and signer.
+# ---------------------------------------------------------------------------
+
+# How long a reset link stays valid. 30 minutes — long enough to find the email
+# and click, short enough to limit exposure of a leaked link.
+_RESET_TOKEN_TTL_SECONDS = 30 * 60
+
+# Payload discriminator. Verification rejects any token lacking this exact tag,
+# so a {u,uid,tid} *login* token (which has no "k") can't satisfy the reset
+# verifier.
+_RESET_TOKEN_KIND = "pwreset"
+
+
+def make_password_reset_token(user_id: str, email: str) -> str:
+    """Mint a signed, time-limited (~30 min) password-reset token.
+
+    Payload: ``{"k": "pwreset", "uid": user_id, "u": email, "iat", "exp"}``,
+    signed ``HMAC-SHA256(settings.auth_token_secret, payload_b64)`` via the
+    shared :func:`app.auth._sign` — identical machinery and secret as
+    :func:`mint_token`, only the payload (kind + shorter TTL) differs. Wire
+    shape is ``<payload_b64>.<sig_b64>``, URL-safe for use as a query param.
+    """
+    now = int(time.time())
+    payload: dict[str, Any] = {
+        "k": _RESET_TOKEN_KIND,
+        "uid": user_id,
+        "u": email,
+        "iat": now,
+        "exp": now + _RESET_TOKEN_TTL_SECONDS,
+    }
+    payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    payload_b64 = _b64u_encode(payload_json.encode("utf-8"))
+    sig_b64 = _sign(payload_b64, settings.auth_token_secret)
+    return f"{payload_b64}.{sig_b64}"
+
+
+def verify_password_reset_token(token: str) -> "dict | None":
+    """Return ``{"user_id": ..., "email": ...}`` for a valid reset token, else
+    ``None``.
+
+    Validates (constant-time) the HMAC signature with the same secret as
+    :func:`make_password_reset_token`, requires the ``"k" == "pwreset"``
+    discriminator, and rejects an expired/missing ``exp``. A tampered payload or
+    signature, a login token (no ``"k"``), a malformed string, or any unexpected
+    input yields ``None``. Never raises.
+    """
+    if not token or "." not in token:
+        return None
+    try:
+        payload_b64, sig_b64 = token.rsplit(".", 1)
+    except ValueError:
+        return None
+    expected_sig = _sign(payload_b64, settings.auth_token_secret)
+    # Constant-time compare — a timing side-channel leaks the secret over
+    # enough samples.
+    if not hmac.compare_digest(expected_sig, sig_b64):
+        return None
+    try:
+        payload = json.loads(_b64u_decode(payload_b64).decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("k") != _RESET_TOKEN_KIND:
+        return None
+    uid = payload.get("uid")
+    email = payload.get("u")
+    exp = payload.get("exp")
+    if not isinstance(uid, str) or not isinstance(email, str):
+        return None
+    if not isinstance(exp, (int, float)) or exp < time.time():
+        return None
+    return {"user_id": uid, "email": email}
+
+
+async def set_password(user_id: str, new_password: str) -> bool:
+    """Rotate the stored bcrypt hash for ``user_id`` to ``new_password``.
+
+    Hashes with the SAME bcrypt path used at :func:`signup` and UPDATEs the
+    user's ``password_hash`` via the SAME ``get_connection`` helper the rest of
+    this module writes through. Enforces the same ``_MIN_PASSWORD_LEN`` floor as
+    signup (raises ``ValueError`` on a weak/empty password — the
+    ``POST /auth/reset`` route maps that to a 400). Returns ``True`` when a row
+    was updated, ``False`` when ``user_id`` matched no user (e.g. account
+    deleted between link issuance and use).
+    """
+    if not user_id:
+        raise ValueError("user_id is required")
+    if not new_password or len(new_password) < _MIN_PASSWORD_LEN:
+        raise ValueError(
+            f"password must be at least {_MIN_PASSWORD_LEN} characters"
+        )
+
+    password_hash = _hash_password(new_password)
+    async with get_connection() as db:
+        # Confirm the user exists first so we can report the no-such-user case
+        # distinctly (engine-agnostic — no reliance on UPDATE rowcount, which
+        # differs across the SQLite/asyncpg shims).
+        cur = await db.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+        rows = await cur.fetchall()
+        await cur.close()
+        if not rows:
+            return False
+        await db.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (password_hash, user_id),
+        )
+        await db.commit()
+    return True

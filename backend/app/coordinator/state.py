@@ -132,6 +132,14 @@ class TurnState(BaseModel):
     insights: list[str] = Field(default_factory=list)
     final_answer: str | None = None
 
+    # TRUST guardrail ----------------------------------------------------
+    # Deterministic post-execution sanity verdict on the latest SQL result
+    # (set by validate_result, consumed by insightFmt). "high" → no hedge;
+    # "low" → the formatter MAY add a one-line caveat. Defaults to "high"
+    # so any turn that never ran SQL behaves exactly as before.
+    answer_confidence: Literal["high", "low"] = "high"
+    confidence_reasons: list[str] = Field(default_factory=list)
+
     # Loop bookkeeping ---------------------------------------------------
     iteration: int = 0
     tool_calls: list[ToolCall] = Field(default_factory=list)

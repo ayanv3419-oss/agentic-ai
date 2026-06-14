@@ -39,8 +39,10 @@ import {
 import {
   cn,
   fetchUploadsList,
+  forgotPassword,
   loginWith,
   probeAuthEnabled,
+  resetPassword,
   signupWith,
   useAppStore,
 } from '@/client_core'
@@ -335,6 +337,10 @@ type AuthMode = 'login' | 'signup'
 
 function LoginGate({ onSuccess }: { onSuccess: () => void }) {
   const [mode, setMode] = useState<AuthMode>('login')
+  // Whether the inline "forgot password" view is showing. Kept as a separate
+  // boolean (rather than a third AuthMode) so the login/signup toggle and its
+  // shared field state stay untouched while the request-reset view is open.
+  const [forgot, setForgot] = useState(false)
   // Login accepts a username OR email (backend admin login is username-based);
   // signup is strictly email-based. One field backs both — its label changes
   // with the mode.
@@ -349,6 +355,12 @@ function LoginGate({ onSuccess }: { onSuccess: () => void }) {
     if (next === mode) return
     setMode(next)
     setError(null)
+  }
+
+  // Render the inline "request reset" view instead of the login/signup form.
+  // Returning from it (Back to sign in) restores the login form untouched.
+  if (forgot) {
+    return <ForgotPasswordView onBack={() => setForgot(false)} />
   }
 
   const submit = async (e: React.FormEvent) => {
@@ -451,6 +463,21 @@ function LoginGate({ onSuccess }: { onSuccess: () => void }) {
             className="w-full px-3 py-2 rounded-md bg-zinc-950 border border-zinc-800 text-sm text-zinc-100 focus:outline-none focus:border-emerald-500"
             disabled={submitting}
           />
+          {!isSignup && (
+            <div className="text-right">
+              <button
+                type="button"
+                onClick={() => {
+                  setError(null)
+                  setForgot(true)
+                }}
+                disabled={submitting}
+                className="text-[11px] text-zinc-400 hover:text-emerald-400 disabled:opacity-50"
+              >
+                Forgot password?
+              </button>
+            </div>
+          )}
         </div>
         {error && (
           <div className="text-[11px] text-red-300 bg-red-500/10 border border-red-500/30 rounded-md px-2 py-1.5">
@@ -472,6 +499,220 @@ function LoginGate({ onSuccess }: { onSuccess: () => void }) {
         </button>
       </form>
     </div>
+  )
+}
+
+
+// Shared chrome for the auth cards (logo + heading) so the forgot/reset views
+// match the LoginGate's framing exactly without duplicating the markup.
+function AuthCardShell({
+  subtitle,
+  onSubmit,
+  children,
+}: {
+  subtitle: string
+  onSubmit: (e: React.FormEvent) => void
+  children: React.ReactNode
+}) {
+  return (
+    <div className="h-screen w-screen flex items-center justify-center bg-zinc-950 text-zinc-100">
+      <form
+        onSubmit={onSubmit}
+        className="w-full max-w-sm rounded-2xl bg-zinc-900/70 border border-zinc-800 p-6 space-y-4"
+      >
+        <div className="flex items-center gap-2">
+          <div className="w-7 h-7 rounded-md bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
+            <Logo className="w-3.5 h-3.5 text-emerald-400" />
+          </div>
+          <div>
+            <div className="font-semibold tracking-tight">Metric AI</div>
+            <div className="text-[11px] text-zinc-500">{subtitle}</div>
+          </div>
+        </div>
+        {children}
+      </form>
+    </div>
+  )
+}
+
+
+// Inline "request a reset link" view, reached from the login form's
+// "Forgot password?" link. Calls forgotPassword(email) — which always resolves
+// — then shows a NEUTRAL confirmation that never reveals whether an account
+// exists for that address (matching the backend's anti-enumeration contract).
+function ForgotPasswordView({ onBack }: { onBack: () => void }) {
+  const [email, setEmail] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [sent, setSent] = useState(false)
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!email.trim()) return
+    setSubmitting(true)
+    // forgotPassword never throws (neutral by design); the confirmation shows
+    // regardless of outcome.
+    await forgotPassword(email.trim())
+    setSubmitting(false)
+    setSent(true)
+  }
+
+  if (sent) {
+    return (
+      <AuthCardShell subtitle="Check your email" onSubmit={(e) => e.preventDefault()}>
+        <div className="text-[13px] text-zinc-300 leading-relaxed">
+          If an account exists for that email, a reset link has been sent.
+          The link expires in 30 minutes.
+        </div>
+        <button
+          type="button"
+          onClick={onBack}
+          className="w-full py-2 rounded-md bg-emerald-500/80 hover:bg-emerald-500 text-zinc-950 text-sm font-medium"
+        >
+          Back to sign in
+        </button>
+      </AuthCardShell>
+    )
+  }
+
+  return (
+    <AuthCardShell subtitle="Reset your password" onSubmit={submit}>
+      <div className="text-[11px] text-zinc-500">
+        Enter your account email and we'll send a link to set a new password.
+      </div>
+      <div className="space-y-2">
+        <label className="block text-xs text-zinc-400">Email</label>
+        <input
+          type="email"
+          autoFocus
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          className="w-full px-3 py-2 rounded-md bg-zinc-950 border border-zinc-800 text-sm text-zinc-100 focus:outline-none focus:border-emerald-500"
+          disabled={submitting}
+        />
+      </div>
+      <button
+        type="submit"
+        disabled={submitting || !email.trim()}
+        className="w-full py-2 rounded-md bg-emerald-500/80 hover:bg-emerald-500 text-zinc-950 text-sm font-medium disabled:opacity-50"
+      >
+        {submitting ? 'Sending…' : 'Send reset link'}
+      </button>
+      <button
+        type="button"
+        onClick={onBack}
+        disabled={submitting}
+        className="w-full text-[11px] text-zinc-400 hover:text-zinc-200 disabled:opacity-50"
+      >
+        Back to sign in
+      </button>
+    </AuthCardShell>
+  )
+}
+
+
+// Full-screen "set a new password" view, shown by App when the URL carries a
+// reset token (?reset_token=…). Collects new-password + confirm, calls
+// resetPassword(token, pw); on success shows "Password updated, please log in"
+// and invokes onDone (which clears the token from the URL and returns to the
+// login form). On a 400 (expired/invalid token, weak password) it shows the
+// server's message.
+function ResetPasswordView({
+  token,
+  onDone,
+}: {
+  token: string
+  onDone: () => void
+}) {
+  const [password, setPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [done, setDone] = useState(false)
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (password.length < 6) {
+      setError('Password must be at least 6 characters.')
+      return
+    }
+    if (password !== confirm) {
+      setError('Passwords do not match.')
+      return
+    }
+    setSubmitting(true)
+    setError(null)
+    try {
+      await resetPassword(token, password)
+      setDone(true)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Password reset failed.'
+      setError(msg)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  if (done) {
+    return (
+      <AuthCardShell subtitle="Password updated" onSubmit={(e) => e.preventDefault()}>
+        <div className="text-[13px] text-zinc-300 leading-relaxed">
+          Password updated, please log in with your new password.
+        </div>
+        <button
+          type="button"
+          onClick={onDone}
+          className="w-full py-2 rounded-md bg-emerald-500/80 hover:bg-emerald-500 text-zinc-950 text-sm font-medium"
+        >
+          Back to sign in
+        </button>
+      </AuthCardShell>
+    )
+  }
+
+  return (
+    <AuthCardShell subtitle="Choose a new password" onSubmit={submit}>
+      <div className="space-y-2">
+        <label className="block text-xs text-zinc-400">New password</label>
+        <input
+          type="password"
+          autoFocus
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          className="w-full px-3 py-2 rounded-md bg-zinc-950 border border-zinc-800 text-sm text-zinc-100 focus:outline-none focus:border-emerald-500"
+          disabled={submitting}
+        />
+      </div>
+      <div className="space-y-2">
+        <label className="block text-xs text-zinc-400">Confirm password</label>
+        <input
+          type="password"
+          value={confirm}
+          onChange={(e) => setConfirm(e.target.value)}
+          className="w-full px-3 py-2 rounded-md bg-zinc-950 border border-zinc-800 text-sm text-zinc-100 focus:outline-none focus:border-emerald-500"
+          disabled={submitting}
+        />
+      </div>
+      {error && (
+        <div className="text-[11px] text-red-300 bg-red-500/10 border border-red-500/30 rounded-md px-2 py-1.5">
+          {error}
+        </div>
+      )}
+      <button
+        type="submit"
+        disabled={submitting}
+        className="w-full py-2 rounded-md bg-emerald-500/80 hover:bg-emerald-500 text-zinc-950 text-sm font-medium disabled:opacity-50"
+      >
+        {submitting ? 'Updating…' : 'Update password'}
+      </button>
+      <button
+        type="button"
+        onClick={onDone}
+        disabled={submitting}
+        className="w-full text-[11px] text-zinc-400 hover:text-zinc-200 disabled:opacity-50"
+      >
+        Back to sign in
+      </button>
+    </AuthCardShell>
   )
 }
 
@@ -514,6 +755,10 @@ export default function App() {
   const [authProbe, setAuthProbe] = useState(0)
   // Fix 1c: Drive OAuth callback — error message surfaced at shell level.
   const [driveCallbackError, setDriveCallbackError] = useState<string | null>(null)
+  // Password-reset deep link. Captured once on mount from ?reset_token=… so the
+  // reset view can render even on AUTH_ENABLED=false deployments and before the
+  // /health probe resolves (the user arrives here from an email, unauthenticated).
+  const [resetToken, setResetToken] = useState<string | null>(null)
 
   // Probe /health on boot to discover whether AUTH_ENABLED=true. Result
   // lives in store.auth.authEnabled — the gate below renders only when
@@ -521,6 +766,20 @@ export default function App() {
   useEffect(() => {
     void probeAuthEnabled()
   }, [authProbe])
+
+  // Capture a ?reset_token=… password-reset deep link on first mount, then
+  // strip it from the URL so a refresh / shared link doesn't re-trigger the
+  // view and the token doesn't linger in the address bar / history.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const t = params.get('reset_token')
+    if (!t) return
+    setResetToken(t)
+    params.delete('reset_token')
+    const clean = window.location.pathname + (params.toString() ? `?${params}` : '')
+    window.history.replaceState({}, '', clean)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Fix 1c: Detect ?drive=connected / ?drive=error from the OAuth callback.
   // This must live at the App level (always mounted) so the callback works
@@ -567,6 +826,19 @@ export default function App() {
       })
       .catch(() => { /* backend not ready yet — keep whatever localStorage has */ })
   }, [authToken])
+
+  // Password-reset deep link takes precedence over every gate: the user
+  // arrived from an email link, is unauthenticated, and may be on an
+  // AUTH_ENABLED=false deployment. Render the reset view until they finish (or
+  // bail), then drop back into the normal flow with the token cleared.
+  if (resetToken) {
+    return (
+      <ResetPasswordView
+        token={resetToken}
+        onDone={() => setResetToken(null)}
+      />
+    )
+  }
 
   // Gate the app on a real backend login when AUTH_ENABLED=true.
   // The boolean stays null until probeAuthEnabled resolves; treat null

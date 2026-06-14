@@ -12,6 +12,7 @@ from typing import Any
 
 from app.coordinator.tools.base import Tool, ToolContext, ToolOutcome
 from app.coordinator.tools.sql_dry_run import _validate_shape
+from app.coordinator.validation import validate_result
 from app.infrastructure import get_connection
 
 
@@ -558,10 +559,22 @@ class SqlExecutorTool(Tool):
             (chart or {}).get("kind"),
             sql[:160],
         )
+        # TRUST guardrail: deterministic sanity check on the result the moment
+        # it's available, BEFORE it flows to insightFmt. No LLM call. A low
+        # verdict lets the formatter add a one-line caveat instead of emitting
+        # a wrong-but-nonzero figure as a confident headline.
+        verdict = validate_result(
+            result,
+            columns=list(result[0].keys()) if result else None,
+            query_kind=getattr(ctx.state, "route", None),
+        )
+
         updates: dict[str, Any] = {
             "sql_final": final_sql,
             "rows": result,
             "row_count": len(result),
+            "answer_confidence": verdict["confidence"],
+            "confidence_reasons": verdict["reasons"],
         }
         if chart is not None:
             updates["chart_payload"] = chart

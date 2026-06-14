@@ -20,16 +20,20 @@ Hard separation from the legacy sales/purchase pipeline:
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import logging
+import os
 import re
 import sqlite3
+import tempfile
 from datetime import date as _date_cls, datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Iterator
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 from app.infrastructure import db_path, get_connection, quoted, settings
 
@@ -1254,6 +1258,156 @@ async def ingest_workbook(
         batch_id=batch_id,
         progress_cb=progress_cb,
     )
+
+
+# ---------------------------------------------------------------------------
+# Single-table / CSV ingest — routed through the SAME dynamic u_* machinery
+# ---------------------------------------------------------------------------
+
+def _csv_grid_to_workbook_path(
+    rows: list[list[Any]],
+    *,
+    sheet_title: str,
+) -> Path:
+    """Materialize a raw 2-D cell grid as a single-sheet ``.xlsx`` on disk and
+    return its path. The caller owns the file and MUST unlink it.
+
+    The grid is written verbatim — NO header detection, NO type coercion here.
+    That keeps the synthetic workbook byte-identical (cell-for-cell) to what the
+    user would have uploaded as an XLSX, so the downstream ``ingest_workbook``
+    pipeline runs its own liberal header detection + type inference unchanged.
+
+    The sheet title is sanitized to openpyxl's 31-char / no-special-chars limit.
+    The downstream pipeline derives the persisted ``u_*`` table name from this
+    worksheet title via ``sheet_to_table_name``, so a short clean stem like
+    ``sales`` becomes ``u_sales``; very long or special-char stems are clamped
+    to the 31-char title first (same name they would get as an XLSX sheet).
+    """
+    wb = Workbook(write_only=False)
+    ws = wb.active
+    # openpyxl rejects sheet titles >31 chars or containing []:*?/\\ — clamp it.
+    safe_title = re.sub(r"[\[\]:*?/\\]", "_", (sheet_title or "Sheet1"))[:31] or "Sheet1"
+    ws.title = safe_title
+    for row in rows:
+        ws.append(list(row) if row is not None else [])
+    fd, tmp_name = tempfile.mkstemp(suffix=".xlsx", prefix="csv_ingest_")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        wb.save(str(tmp_path))
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+    return tmp_path
+
+
+async def ingest_csv(
+    *,
+    file_bytes: bytes,
+    source_file_name: str,
+    batch_id: str,
+    progress_cb: "ProgressCb | None" = None,
+) -> dict[str, Any]:
+    """Ingest a SINGLE-TABLE upload (a CSV file) through the SAME dynamic
+    ``u_*`` machinery the multi-sheet XLSX path uses — engine-agnostic.
+
+    The CSV is treated as a synthetic single-sheet workbook: its raw cell grid
+    is written to a throwaway ``.xlsx`` file, which is then handed to the public
+    :func:`ingest_workbook` dispatcher. That means CSV ingestion reuses, with
+    ZERO duplication, the exact header detection (:func:`_find_header_row`), type
+    inference (:func:`_infer_column_type` / :func:`_refine_pg_type`), table
+    creation, and transactional insert that XLSX uploads already use — and it
+    branches SQLite vs Postgres for free, because ``ingest_workbook`` does
+    (``ingest_workbook_pg`` on Postgres, ``ingest_workbook_sync`` on SQLite).
+
+    The single table is named ``u_<snake_case(file_stem)>`` (e.g. ``sales.csv``
+    → ``u_sales``), mirroring how a sheet name maps to a table name.
+
+    Parameters
+    ----------
+    file_bytes : bytes
+        Raw CSV file content. Decoded as UTF-8 (BOM-tolerant), latin-1 fallback.
+    source_file_name : str
+        Original filename (e.g. ``"sales.csv"``). Used for the registry
+        ``source_file`` metadata and to derive the table / sheet name.
+    batch_id : str
+        Upload batch id, written to every row's ``_batch_id`` column.
+    progress_cb : callable(done, total, msg) | None
+        Optional progress hook, forwarded to ``ingest_workbook`` unchanged. For a
+        single CSV the totals are (0, 1) then (1, 1).
+
+    Returns
+    -------
+    summary : dict
+        IDENTICAL shape to :func:`ingest_workbook` (the XLSX path), so the HTTP
+        route can respond identically::
+
+            {
+              "batch_id":    <batch_id>,
+              "source_file": <source_file_name>,
+              "sheet_count": 1,
+              "ingested": [ {                       # one entry for the CSV
+                  "table":            "u_<stem>",
+                  "source_sheet":     "<stem>",
+                  "header_row":       <1-based int>,
+                  "columns":          [{"name","type"}, ...],
+                  "rows_inserted":    <int>,
+                  "dropped_existing": <bool>,
+                  "skipped_rows":     <int>,
+              } ],
+              "skipped":  [ {"sheet","reason"}, ... ],   # empty on success
+              "tables":   ["u_<stem>"],
+            }
+
+    Raises
+    ------
+    DynamicIngestError
+        If the CSV is empty / undecodable. A CSV with content but no detectable
+        header does NOT raise here — like the XLSX path, the sheet lands in the
+        returned ``skipped`` list with a reason, and ``ingested`` is empty.
+    """
+    # 1. Decode + parse the raw CSV into a 2-D grid (header detection happens
+    #    LATER, inside the shared pipeline — we only preserve the raw cells).
+    if not file_bytes:
+        raise DynamicIngestError("CSV file is empty")
+    try:
+        text = file_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = file_bytes.decode("latin-1", errors="replace")
+    grid: list[list[Any]] = list(csv.reader(io.StringIO(text)))
+    # Drop fully-empty trailing rows the csv module sometimes yields.
+    while grid and not any(str(c).strip() for c in grid[-1]):
+        grid.pop()
+    if not grid:
+        raise DynamicIngestError("CSV has no rows")
+
+    # 2. Derive the source sheet / table name from the filename stem so the
+    #    persisted table is u_<stem> (sales.csv -> u_sales).
+    stem = Path(source_file_name or "table").stem or "table"
+
+    # 3. Materialize the grid as a synthetic single-sheet workbook and route it
+    #    through the SAME engine-aware dispatcher the XLSX upload uses.
+    tmp_path = await asyncio.to_thread(
+        _csv_grid_to_workbook_path, grid, sheet_title=stem
+    )
+    try:
+        summary = await ingest_workbook(
+            wb_path=tmp_path,
+            source_file_name=source_file_name,
+            batch_id=batch_id,
+            progress_cb=progress_cb,
+        )
+    finally:
+        try:
+            tmp_path.unlink()
+        except Exception:
+            log.warning(
+                "ingest_csv: could not delete temp workbook %s", tmp_path,
+                exc_info=True,
+            )
+    return summary
 
 
 # ---------------------------------------------------------------------------

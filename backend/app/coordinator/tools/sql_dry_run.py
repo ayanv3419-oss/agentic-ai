@@ -8,6 +8,10 @@ Checks:
     SELECT ... INTO materialization).
   * No references to system/metadata catalogs (information_schema,
     pg_catalog / pg_*, sqlite_master / sqlite_*).
+  * No schema-qualified TABLE sources after FROM/JOIN
+    (`t_other.u_sales`, `public.users`) — those escape the tenant's
+    search_path. Only unqualified table names are allowed; column
+    qualifiers (`alias.col`) elsewhere are untouched.
   * SQLite parser accepts it (via EXPLAIN).
 
 Used by the Coordinator before SqlExecutor so bad SQL is caught with no
@@ -45,6 +49,25 @@ _SYSTEM_SCHEMA = re.compile(
 # search_path. Legitimate LLM-generated SQL never needs `public.anything` —
 # tenant data is always accessed unqualified under the tenant's own schema.
 _PUBLIC_QUALIFIER = re.compile(r"\bpublic\s*\.", re.IGNORECASE)
+
+# Schema-qualified TABLE SOURCES (e.g. `FROM t_other.u_sales`, `JOIN public.users`,
+# `FROM pg_catalog.x`) bypass the tenant's search_path entirely and can read
+# another tenant's schema — the central isolation hole this validator closes.
+#
+# We only inspect the position immediately AFTER `FROM` / `JOIN`, i.e. the table
+# SOURCE, and reject when that source is of the form `<ident>.<ident>`. This is
+# deliberately narrow so legit `alias.column` / `table.column` refs elsewhere
+# (SELECT / WHERE / ORDER BY / GROUP BY) are untouched — those never sit right
+# after a FROM/JOIN keyword. Each side of the qualifier may be a bare identifier
+# or a "double-quoted" identifier (so `"My Schema"."My Table"` is also caught),
+# tolerating whitespace around the dot. Subqueries (`FROM (SELECT ...)`) and the
+# unqualified `FROM u_sales [alias]` form do NOT match.
+#   group 1 = the FROM/JOIN keyword that introduced the source (for the message).
+_IDENT = r'(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)'
+_QUALIFIED_TABLE_SOURCE = re.compile(
+    r"\b(from|join)\s+" + _IDENT + r"\s*\.\s*" + _IDENT,
+    re.IGNORECASE,
+)
 
 # Sensitive internal tables that live in the public schema. Under a tenant
 # search_path these are still reachable via the public fallback, so we block
@@ -99,6 +122,13 @@ def _validate_shape(sql: str) -> str | None:
         )
     if _SELECT_INTO.search(stripped):
         return "SELECT ... INTO (table/file materialization) is not allowed"
+    qts = _QUALIFIED_TABLE_SOURCE.search(stripped)
+    if qts:
+        return (
+            "Schema-qualified table references are not allowed; use the "
+            f"unqualified table name (offending {qts.group(1).upper()} source: "
+            f"{qts.group(0).split(None, 1)[1].strip()!r})"
+        )
     if _PUBLIC_QUALIFIER.search(stripped):
         return "Cross-schema qualifiers (public.) are not allowed in tenant queries"
     itm = _INTERNAL_TABLES.search(stripped)

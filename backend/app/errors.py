@@ -135,6 +135,17 @@ def log_error(
     payload_json = _jsonify(request_payload)
     context_json = _jsonify(context)
 
+    # Stamp the owning tenant so per-tenant reads can scope WHERE tenant_id=?.
+    # Read it from the request-scoped contextvar set by require_principal; falls
+    # back to the 'public' sentinel (AUTH-off / no request context, e.g. tests
+    # or startup). Captured here (sync) so the Postgres fire-and-forget task
+    # below closes over the correct value rather than re-reading a reset context.
+    try:
+        from app.db_engine import current_tenant_var
+        tenant_id = current_tenant_var.get() or "public"
+    except Exception:
+        tenant_id = "public"
+
     from app.db_engine import is_postgres as _is_pg
     if _is_pg():
         # Postgres path — write via the asyncpg shim so errors are queryable
@@ -147,12 +158,12 @@ def log_error(
                 async with _get_conn() as db:
                     await db.execute(
                         "INSERT INTO error_log "
-                        "(error_id, severity, module, error_type, message, "
+                        "(error_id, tenant_id, severity, module, error_type, message, "
                         " endpoint, method, user_facing, suggested_fix, source, "
                         " stack_trace, request_payload, context) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
-                            error_id, sev, module or "system", error_type, msg[:8000],
+                            error_id, tenant_id, sev, module or "system", error_type, msg[:8000],
                             endpoint, method, 1 if user_facing else 0,
                             fix, source, stack, payload_json, context_json,
                         ),
@@ -179,12 +190,12 @@ def log_error(
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute(
                 "INSERT INTO error_log "
-                "(error_id, severity, module, error_type, message, "
+                "(error_id, tenant_id, severity, module, error_type, message, "
                 " endpoint, method, user_facing, suggested_fix, source, "
                 " stack_trace, request_payload, context) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    error_id, sev, module or "system", error_type, msg[:8000],
+                    error_id, tenant_id, sev, module or "system", error_type, msg[:8000],
                     endpoint, method, 1 if user_facing else 0,
                     fix or None, source, stack, payload_json, context_json,
                 ),
@@ -220,10 +231,14 @@ async def list_errors(
     resolved: bool | None = None,
     limit: int = 200,
     offset: int = 0,
+    tenant_id: str | None = None,
 ) -> list[dict[str, Any]]:
     sql = f"SELECT {_LIST_COLS} FROM error_log"
     where: list[str] = []
     params: list[Any] = []
+    if tenant_id is not None:
+        where.append("tenant_id = ?")
+        params.append(tenant_id)
     if module:
         where.append("module = ?")
         params.append(module)
@@ -240,17 +255,27 @@ async def list_errors(
     return await fetch_all(sql, tuple(params))
 
 
-async def get_error(error_id: str) -> dict[str, Any] | None:
+async def get_error(error_id: str, *, tenant_id: str | None = None) -> dict[str, Any] | None:
+    if tenant_id is not None:
+        return await fetch_one(
+            f"SELECT {_DETAIL_COLS} FROM error_log "
+            "WHERE error_id = ? AND tenant_id = ?",
+            (error_id, tenant_id),
+        )
     return await fetch_one(
         f"SELECT {_DETAIL_COLS} FROM error_log WHERE error_id = ?",
         (error_id,),
     )
 
 
-async def resolve_error(error_id: str, note: str | None = None) -> bool:
+async def resolve_error(
+    error_id: str, note: str | None = None, *, tenant_id: str | None = None
+) -> bool:
     """Mark resolved=1 and stamp resolved_at. Returns False on unknown id.
 
-    Cross-engine: on Postgres routes through the async connection; on
+    When ``tenant_id`` is given the UPDATE is scoped to that tenant so one
+    tenant can never resolve (or probe the existence of) another tenant's
+    error. Cross-engine: on Postgres routes through the async connection; on
     SQLite keeps the legacy direct sqlite3 path (idempotent, no behaviour
     change). Both paths use NOW() / datetime('now') correctly per engine.
     """
@@ -259,17 +284,30 @@ async def resolve_error(error_id: str, note: str | None = None) -> bool:
         try:
             from app.infrastructure import get_connection as _get_conn
             async with _get_conn() as db:
-                cur = await db.execute(
-                    "UPDATE error_log SET resolved = 1, "
-                    "resolved_at = NOW(), resolved_note = ? "
-                    "WHERE error_id = ?",
-                    (note, error_id),
-                )
+                if tenant_id is not None:
+                    cur = await db.execute(
+                        "UPDATE error_log SET resolved = 1, "
+                        "resolved_at = NOW(), resolved_note = ? "
+                        "WHERE error_id = ? AND tenant_id = ?",
+                        (note, error_id, tenant_id),
+                    )
+                else:
+                    cur = await db.execute(
+                        "UPDATE error_log SET resolved = 1, "
+                        "resolved_at = NOW(), resolved_note = ? "
+                        "WHERE error_id = ?",
+                        (note, error_id),
+                    )
                 # asyncpg shim doesn't expose rowcount; we treat any
                 # non-error path as success and let the caller re-check
                 # via get_error() if it needs strict confirmation.
                 await cur.close()
                 await db.commit()
+                # With a tenant scope, confirm a matching row actually exists
+                # so an unknown/cross-tenant id reports False rather than a
+                # misleading success.
+                if tenant_id is not None:
+                    return (await get_error(error_id, tenant_id=tenant_id)) is not None
                 return True
         except Exception:
             _log.exception("resolve_error (postgres) failed for %s", error_id)
@@ -278,12 +316,20 @@ async def resolve_error(error_id: str, note: str | None = None) -> bool:
         import sqlite3
         conn = sqlite3.connect(str(db_path()), isolation_level=None)
         try:
-            cur = conn.execute(
-                "UPDATE error_log SET resolved = 1, "
-                "resolved_at = datetime('now'), resolved_note = ? "
-                "WHERE error_id = ?",
-                (note, error_id),
-            )
+            if tenant_id is not None:
+                cur = conn.execute(
+                    "UPDATE error_log SET resolved = 1, "
+                    "resolved_at = datetime('now'), resolved_note = ? "
+                    "WHERE error_id = ? AND tenant_id = ?",
+                    (note, error_id, tenant_id),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE error_log SET resolved = 1, "
+                    "resolved_at = datetime('now'), resolved_note = ? "
+                    "WHERE error_id = ?",
+                    (note, error_id),
+                )
             return (cur.rowcount or 0) > 0
         finally:
             conn.close()
@@ -292,51 +338,75 @@ async def resolve_error(error_id: str, note: str | None = None) -> bool:
         return False
 
 
-async def error_counts_by_module() -> list[dict[str, Any]]:
+def _tenant_clause(tenant_id: str | None, params: list[Any], *, leading: bool = True) -> str:
+    """Return a ``tenant_id = ?`` SQL fragment (and append the param) when a
+    tenant is given, else ``""``. ``leading=True`` prefixes ``WHERE``."""
+    if tenant_id is None:
+        return ""
+    params.append(tenant_id)
+    return (" WHERE " if leading else " AND ") + "tenant_id = ?"
+
+
+async def error_counts_by_module(*, tenant_id: str | None = None) -> list[dict[str, Any]]:
+    params: list[Any] = []
+    where = _tenant_clause(tenant_id, params)
     return await fetch_all(
         "SELECT module, COUNT(*) AS n, "
         "       SUM(CASE WHEN resolved = 0 THEN 1 ELSE 0 END) AS unresolved "
-        "FROM error_log GROUP BY module ORDER BY n DESC"
+        f"FROM error_log{where} GROUP BY module ORDER BY n DESC",
+        tuple(params),
     )
 
 
-async def error_counts_by_severity() -> list[dict[str, Any]]:
+async def error_counts_by_severity(*, tenant_id: str | None = None) -> list[dict[str, Any]]:
+    params: list[Any] = []
+    where = _tenant_clause(tenant_id, params)
     return await fetch_all(
         "SELECT severity, COUNT(*) AS n, "
         "       SUM(CASE WHEN resolved = 0 THEN 1 ELSE 0 END) AS unresolved "
-        "FROM error_log GROUP BY severity ORDER BY "
+        f"FROM error_log{where} GROUP BY severity ORDER BY "
         "CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
-        "              WHEN 'medium' THEN 2 ELSE 3 END"
+        "              WHEN 'medium' THEN 2 ELSE 3 END",
+        tuple(params),
     )
 
 
-async def top_error_types(limit: int = 10) -> list[dict[str, Any]]:
+async def top_error_types(limit: int = 10, *, tenant_id: str | None = None) -> list[dict[str, Any]]:
+    params: list[Any] = []
+    where = _tenant_clause(tenant_id, params)
+    params.append(max(1, min(int(limit), 100)))
     return await fetch_all(
         "SELECT error_type, COUNT(*) AS n, "
         "       MAX(occurred_at) AS last_seen "
-        "FROM error_log GROUP BY error_type ORDER BY n DESC LIMIT ?",
-        (max(1, min(int(limit), 100)),),
+        f"FROM error_log{where} GROUP BY error_type ORDER BY n DESC LIMIT ?",
+        tuple(params),
     )
 
 
-async def error_analytics() -> dict[str, Any]:
-    """Single dashboard payload."""
+async def error_analytics(*, tenant_id: str | None = None) -> dict[str, Any]:
+    """Single dashboard payload, scoped to ``tenant_id`` when given."""
+    total_params: list[Any] = []
+    total_where = _tenant_clause(tenant_id, total_params)
     total_row = await fetch_one(
         "SELECT COUNT(*) AS total, "
         "       SUM(CASE WHEN resolved = 0 THEN 1 ELSE 0 END) AS unresolved "
-        "FROM error_log"
+        f"FROM error_log{total_where}",
+        tuple(total_params),
     )
+    recent_params: list[Any] = []
+    recent_tenant = _tenant_clause(tenant_id, recent_params, leading=False)
     recent24h = await fetch_one(
         "SELECT COUNT(*) AS n FROM error_log "
-        "WHERE occurred_at >= datetime('now', '-1 day')"
+        f"WHERE occurred_at >= datetime('now', '-1 day'){recent_tenant}",
+        tuple(recent_params),
     )
     return {
         "total":       int((total_row or {}).get("total") or 0),
         "unresolved":  int((total_row or {}).get("unresolved") or 0),
         "last_24h":    int((recent24h or {}).get("n") or 0),
-        "by_module":   await error_counts_by_module(),
-        "by_severity": await error_counts_by_severity(),
-        "top_types":   await top_error_types(10),
+        "by_module":   await error_counts_by_module(tenant_id=tenant_id),
+        "by_severity": await error_counts_by_severity(tenant_id=tenant_id),
+        "top_types":   await top_error_types(10, tenant_id=tenant_id),
     }
 
 

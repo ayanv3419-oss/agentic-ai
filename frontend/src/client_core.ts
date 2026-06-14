@@ -676,6 +676,48 @@ export function clearAuth(): void {
   useAppStore.getState().setAuthToken(null, null)
 }
 
+// Request a password-reset email. POST /auth/forgot { email } ALWAYS resolves
+// 200 { ok: true } — the backend does not reveal whether an account exists for
+// that address (anti-enumeration). We deliberately do NOT throw on a non-2xx
+// here either: the calling UI shows the same neutral confirmation regardless,
+// so a transient backend error must not leak a different outcome. Unauthenticated
+// (no withAuthHeader) — the user is locked out by definition.
+export async function forgotPassword(email: string): Promise<void> {
+  try {
+    await safeFetch(`${BASE_URL}/auth/forgot`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    })
+  } catch {
+    // Swallow network/transport errors too — the confirmation is neutral by
+    // design and must look identical whether or not the address exists.
+  }
+}
+
+// Complete a password reset. POST /auth/reset { token, password } → 200
+// { ok: true } on success; 400 { detail } on an invalid/expired token or a
+// password that fails the server's strength floor. We surface the server's
+// detail message on failure so the reset view can show "link expired" vs
+// "password too short" verbatim. Unauthenticated (the user has no session).
+export async function resetPassword(token: string, password: string): Promise<void> {
+  const res = await safeFetch(`${BASE_URL}/auth/reset`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token, password }),
+  })
+  if (!res.ok) {
+    const detail = await readErrorBody(res)
+    throw new ApiError(
+      (detail as { detail?: string } | undefined)?.detail
+        ?? (typeof detail === 'string' && detail.trim() ? detail.trim() : undefined)
+        ?? `Password reset failed (HTTP ${res.status})`,
+      res.status,
+      detail,
+    )
+  }
+}
+
 // Probe /health for the backend's AUTH_ENABLED flag. Called once on app
 // boot so the LoginGate knows whether to render. Never throws. On a network
 // error or non-200 we default authEnabled to `false` (not null) so the app

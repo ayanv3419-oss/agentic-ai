@@ -831,6 +831,7 @@ _ERROR_LOG_DDL = """
 CREATE TABLE IF NOT EXISTS error_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     error_id        TEXT NOT NULL UNIQUE,
+    tenant_id       TEXT NOT NULL DEFAULT 'public',  -- owning tenant; reads are scoped to it
     occurred_at     TEXT NOT NULL DEFAULT (datetime('now')),
     severity        TEXT NOT NULL,        -- critical | high | medium | low
     module          TEXT NOT NULL,        -- sales | upload | ai | kpi | dashboard | auth | database | system | frontend | ...
@@ -855,6 +856,7 @@ _ERROR_LOG_INDEXES: tuple[str, ...] = (
     'CREATE INDEX IF NOT EXISTS "idx_error_log_module"     ON error_log(module, severity)',
     'CREATE INDEX IF NOT EXISTS "idx_error_log_resolved"   ON error_log(resolved, occurred_at DESC)',
     'CREATE INDEX IF NOT EXISTS "idx_error_log_type"       ON error_log(error_type)',
+    'CREATE INDEX IF NOT EXISTS "idx_error_log_tenant"     ON error_log(tenant_id, occurred_at DESC)',
 )
 
 
@@ -914,6 +916,7 @@ _ERROR_LOG_DDL_PG = """
 CREATE TABLE IF NOT EXISTS error_log (
     id              BIGSERIAL PRIMARY KEY,
     error_id        TEXT NOT NULL UNIQUE,
+    tenant_id       TEXT NOT NULL DEFAULT 'public',
     occurred_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     severity        TEXT NOT NULL,
     module          TEXT NOT NULL,
@@ -991,6 +994,17 @@ async def _init_database_postgres() -> None:
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_conversations_tenant "
             "ON conversations(tenant_id, updated_at)"
+        )
+        # error_log tenant scoping — additive, idempotent. Existing rows
+        # backfill to 'public' so the operator/global view still finds them,
+        # while every per-tenant read filters WHERE tenant_id = <caller>.
+        await db.execute(
+            "ALTER TABLE error_log "
+            "ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'public'"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_error_log_tenant "
+            "ON error_log(tenant_id, occurred_at DESC)"
         )
     log.info(
         "postgres DB initialized (minimum schema: uploads + error_log "

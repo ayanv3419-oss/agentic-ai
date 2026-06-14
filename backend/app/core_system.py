@@ -221,6 +221,44 @@ class SignupRequest(BaseModel):
     password: str | None = Field(default=None, max_length=200)
 
 
+class ForgotPasswordRequest(BaseModel):
+    """Reset-request body — ``{email}``. Always answered with 200 regardless of
+    whether the email exists, so it can't be used to enumerate accounts."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    email: str | None = Field(default=None, max_length=200)
+
+
+class ResetPasswordRequest(BaseModel):
+    """Reset body — ``{token, password}`` where ``token`` is the signed,
+    time-limited value carried in the emailed link's ``?reset_token=`` param."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    token:    str | None = Field(default=None, max_length=4000)
+    password: str | None = Field(default=None, max_length=200)
+
+
+def _frontend_base_url(request: Request) -> str:
+    """Best-effort origin to build the password-reset link against: explicit
+    ``FRONTEND_BASE_URL`` env wins, else the request's ``Origin`` header, else
+    the first configured CORS origin, else the request base URL. Trailing
+    slashes trimmed so ``f"{base}?reset_token=..."`` is well-formed."""
+    candidates = [
+        os.environ.get("FRONTEND_BASE_URL", "").strip(),
+        (request.headers.get("origin") or "").strip(),
+    ]
+    for origin in _raw_origins:
+        if origin and origin != "*":
+            candidates.append(origin)
+    candidates.append(str(request.base_url))
+    for c in candidates:
+        if c and c != "*":
+            return c.rstrip("/")
+    return ""
+
+
 @api_router.post("/auth/signup")
 async def auth_signup(req: SignupRequest, request: Request):
     """Create a real per-user account and return a tenant-bearing token.
@@ -334,6 +372,92 @@ async def auth_login(req: LoginRequest, request: Request) -> dict:
         "token_ttl_hours": settings.auth_token_ttl_hours,
         "auth_enabled": settings.auth_enabled,
     }
+
+
+@api_router.post("/auth/forgot")
+async def auth_forgot(req: ForgotPasswordRequest, request: Request):
+    """Begin a password reset. ``{ email } -> { ok: true }`` ALWAYS.
+
+    Neutral by design: whether or not the email maps to an account, the
+    response is identical so this endpoint can't be used to enumerate users.
+    When a user IS found we mint a signed, 30-min reset token, build the
+    frontend reset link, and fire the email (which itself never raises —
+    delivery failures are logged, not surfaced).
+    """
+    rate_error = _rate_limit_check(_client_ip(request))
+    if rate_error is not None:
+        return JSONResponse(status_code=429, content=rate_error)
+
+    from app import identity
+    from app.email import send_password_reset_email
+    from app.infrastructure import get_connection
+
+    email = (req.email or "").strip().lower()
+    if email:
+        try:
+            async with get_connection() as db:
+                cur = await db.execute(
+                    "SELECT id FROM users WHERE email = ?", (email,)
+                )
+                rows = await cur.fetchall()
+                await cur.close()
+            if rows:
+                user_id = dict(rows[0])["id"]
+                token = identity.make_password_reset_token(user_id, email)
+                base = _frontend_base_url(request)
+                reset_url = f"{base}?reset_token={token}" if base else f"?reset_token={token}"
+                await send_password_reset_email(email, reset_url)
+                log.info("auth/forgot: reset link issued for user=%r", email[:40])
+        except Exception:
+            # Never leak failure to the caller — log and still return ok.
+            log.warning("auth/forgot: failed to issue reset link", exc_info=True)
+
+    return {"ok": True}
+
+
+@api_router.post("/auth/reset")
+async def auth_reset(req: ResetPasswordRequest, request: Request):
+    """Complete a password reset. ``{ token, password } -> { ok: true }``.
+
+    Verifies the signed reset token, then rotates the user's bcrypt hash. A
+    bad/expired token or a too-weak password is a 400.
+    """
+    rate_error = _rate_limit_check(_client_ip(request))
+    if rate_error is not None:
+        return JSONResponse(status_code=429, content=rate_error)
+
+    from app import identity
+
+    token = (req.token or "").strip()
+    password = req.password or ""
+
+    payload = identity.verify_password_reset_token(token)
+    if payload is None:
+        return JSONResponse(status_code=400, content=envelope(
+            "Invalid or expired reset link",
+            detail="This password-reset link is invalid or has expired. "
+                   "Request a new one.",
+            kind="auth",
+        ))
+
+    try:
+        ok = await identity.set_password(payload["user_id"], password)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content=envelope(
+            "Weak password",
+            detail=str(e) or "Password is too short.",
+            kind="validation",
+        ))
+
+    if not ok:
+        return JSONResponse(status_code=400, content=envelope(
+            "Invalid or expired reset link",
+            detail="The account for this reset link no longer exists.",
+            kind="auth",
+        ))
+
+    log.info("auth/reset: password rotated for user=%r", payload.get("email", "")[:40])
+    return {"ok": True}
 
 
 @api_router.get("/auth/me")
@@ -576,6 +700,7 @@ async def errors_list(
     resolved: bool | None = None,
     limit: int = 200,
     offset: int = 0,
+    principal: Principal = Depends(require_principal),
 ):
     if severity is not None and severity not in SEVERITIES:
         return JSONResponse(status_code=400, content=envelope(
@@ -585,19 +710,19 @@ async def errors_list(
         ))
     rows = await list_errors(
         module=module, severity=severity, resolved=resolved,
-        limit=limit, offset=offset,
+        limit=limit, offset=offset, tenant_id=principal.tenant_id,
     )
     return {"count": len(rows), "errors": rows}
 
 
 @api_router.get("/errors/analytics")
-async def errors_analytics():
-    return await error_analytics()
+async def errors_analytics(principal: Principal = Depends(require_principal)):
+    return await error_analytics(tenant_id=principal.tenant_id)
 
 
 @api_router.get("/errors/{error_id}")
-async def errors_get(error_id: str):
-    row = await get_error(error_id)
+async def errors_get(error_id: str, principal: Principal = Depends(require_principal)):
+    row = await get_error(error_id, tenant_id=principal.tenant_id)
     if row is None:
         return JSONResponse(status_code=404, content=envelope(
             "Error not found", detail=f"unknown error_id: {error_id!r}",
@@ -616,8 +741,12 @@ async def errors_get(error_id: str):
 
 
 @api_router.post("/errors/{error_id}/resolve")
-async def errors_resolve(error_id: str, note: str | None = None):
-    ok = await resolve_error(error_id, note=note)
+async def errors_resolve(
+    error_id: str,
+    note: str | None = None,
+    principal: Principal = Depends(require_principal),
+):
+    ok = await resolve_error(error_id, note=note, tenant_id=principal.tenant_id)
     if not ok:
         return JSONResponse(status_code=404, content=envelope(
             "Error not found", detail=f"unknown error_id: {error_id!r}",
@@ -638,9 +767,14 @@ class FrontendErrorReport(BaseModel):
 
 
 @api_router.post("/errors/report")
-async def errors_report(req: FrontendErrorReport):
+async def errors_report(
+    req: FrontendErrorReport,
+    principal: Principal = Depends(require_principal),
+):
     """Frontend error-boundary reporter. UI crashes / fetch failures /
-    chart-render exceptions all POST here."""
+    chart-render exceptions all POST here. ``require_principal`` binds the
+    caller's tenant into the request context so ``log_error`` stamps the
+    report with the right tenant (and the /errors dashboard scopes to it)."""
     sev = req.severity if req.severity in SEVERITIES else "medium"
     # Stack arrived as a plain string from the browser; pass it through
     # the `context` field so it shows in the dashboard but doesn't pretend
@@ -883,6 +1017,107 @@ async def upload(
                     "options": ["skip", "replace", "append"],
                 },
             ))
+
+        # On Postgres the legacy sales/purchase insert path is a no-op, so a
+        # CSV here would silently ingest ZERO rows and then fail. Route CSV
+        # through the dynamic u_* pipeline (the same machinery /upload_workbook
+        # uses) so it actually creates a table and inserts rows. SQLite keeps
+        # the legacy DataCleanAgent path unchanged (that's what the suite
+        # exercises and it works on SQLite).
+        from app.db_engine import is_postgres as _is_pg_upload
+        if _is_pg_upload() and suffix == ".csv":
+            from app.dynamic_ingest import ingest_csv, DynamicIngestError
+            try:
+                summary = await ingest_csv(
+                    file_bytes=persistent_path.read_bytes(),
+                    source_file_name=filename,
+                    batch_id=batch_id,
+                )
+            except DynamicIngestError as e:
+                await _record_error(f"bad upload: {e}", target_table)
+                log_error(
+                    exc=e, module="upload", severity="high",
+                    endpoint="/upload", method="POST", user_facing=True,
+                    source="ingest_csv",
+                    context={"batch_id": batch_id, "filename": filename},
+                )
+                crashed = True
+                return JSONResponse(status_code=400, content=envelope(
+                    "Bad upload", detail=str(e), kind="upload",
+                ))
+            except Exception as e:
+                upload_log.exception("ingest_csv: crashed")
+                await _record_error(f"{type(e).__name__}: {e}", target_table)
+                log_error(
+                    exc=e, module="upload", severity="critical",
+                    endpoint="/upload", method="POST", user_facing=False,
+                    source="ingest_csv",
+                    context={"batch_id": batch_id, "filename": filename},
+                )
+                crashed = True
+                return JSONResponse(status_code=500, content=envelope(
+                    "Ingest failed",
+                    detail=f"{type(e).__name__}: {e}",
+                    kind="internal",
+                ))
+
+            ingested = summary.get("ingested") or []
+            if not ingested:
+                reason = "; ".join(
+                    s.get("reason", "no header detected")
+                    for s in (summary.get("skipped") or [])
+                ) or "Could not detect a header row in the CSV."
+                await _record_error(f"bad upload: {reason}", target_table)
+                crashed = True
+                return JSONResponse(status_code=400, content=envelope(
+                    "Bad upload", detail=reason, kind="upload",
+                ))
+
+            rows_inserted = sum(int(s.get("rows_inserted") or 0) for s in ingested)
+            rows_failed = sum(int(s.get("skipped_rows") or 0) for s in ingested)
+            table_name = ingested[0].get("table") or target_table
+
+            # ingest_csv (via the dynamic path) already wrote the uploads row;
+            # patch the audit fields so disconnect + dedup can find it later.
+            try:
+                from app.infrastructure import get_connection
+                async with get_connection() as db:
+                    await db.execute(
+                        "UPDATE uploads SET file_path = ?, file_hash = ?, "
+                        "file_bytes = ? WHERE batch_id = ?",
+                        (str(persistent_path), file_hash, file_bytes_total, batch_id),
+                    )
+                    await db.commit()
+            except Exception:
+                upload_log.warning("could not stamp file_path on uploads row", exc_info=True)
+
+            new_version = await _post_ingest_refresh()
+            upload_log.info(
+                "upload(csv->dynamic) ok rows=%d table=%s batch=%s data_version=%d",
+                rows_inserted, table_name, batch_id, new_version,
+            )
+            return {
+                "batch_id":          batch_id,
+                "filename":          filename,
+                "target":            table_name,
+                "rows_inserted":     rows_inserted,
+                "rows_failed":       rows_failed,
+                "rows_skipped_duplicate": 0,
+                "rows_replaced":     0,
+                "dedup_mode":        dedup_mode,
+                "dedup":             None,
+                "errors":            [],
+                "summary":           {"total_sales": 0, "min_date": "", "max_date": ""},
+                "unmatched_headers": [],
+                "sheet_name":        ingested[0].get("source_sheet"),
+                "header_row_used":   [c.get("name") for c in (ingested[0].get("columns") or [])],
+                "validation":        None,
+                "bytes_received":    bytes_written,
+                "table_total":       rows_inserted,
+                "file_path":         str(persistent_path),
+                "file_hash":         file_hash,
+                "data_version":      new_version,
+            }
 
         agent = DataCleanAgent()
         try:
@@ -2023,6 +2258,8 @@ _AUTH_PUBLIC_PREFIXES = (
     "/auth/login",
     "/auth/signup",
     "/auth/me",
+    "/auth/forgot",
+    "/auth/reset",
     "/auth/google/login",
     "/auth/google/callback",
     "/docs",
