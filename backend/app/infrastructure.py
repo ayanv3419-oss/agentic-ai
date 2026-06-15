@@ -1935,6 +1935,16 @@ _DATA_VERSION_LOCK = Lock()
 
 
 def _data_version_path() -> Path:
+    # On Postgres (DATABASE_URL set) the version sidecar must NOT live next to
+    # financial_db_path: Render points FINANCIAL_DB_PATH at /data, which has no
+    # writable disk on the free plan, so bump_data_version() would raise
+    # PermissionError('/data') and 500 an otherwise-successful upload. Mirror
+    # uploads_dir() / _cache_path() and fall back to /tmp (always writable;
+    # ephemeral is fine — data_version is just a monotonic cache-busting
+    # counter). SQLite / local keeps the persistent path beside the DB file.
+    import os
+    if os.environ.get("DATABASE_URL"):
+        return Path("/tmp") / "agentic_data.version"
     return Path(settings.financial_db_path).with_suffix(".version")
 
 
@@ -1952,10 +1962,22 @@ def bump_data_version() -> int:
     with _DATA_VERSION_LOCK:
         v = get_data_version() + 1
         p = _data_version_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".version.tmp")
-        tmp.write_text(str(v), encoding="utf-8")
-        tmp.replace(p)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".version.tmp")
+            tmp.write_text(str(v), encoding="utf-8")
+            tmp.replace(p)
+        except OSError:
+            # A non-writable path must never turn a successful ingest into a
+            # 500 (the bug this guards: FINANCIAL_DB_PATH=/data on Render's
+            # diskless free plan). get_data_version() already tolerates a
+            # missing/unreadable file (returns 0), so degrade gracefully:
+            # log and return the in-memory increment without persisting.
+            _cache_log.warning(
+                "data_version write failed at %s (continuing un-persisted)",
+                p, exc_info=True,
+            )
+            return v
     _cache_log.info("data_version bumped to %d", v)
     return v
 
