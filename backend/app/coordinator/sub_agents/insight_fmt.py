@@ -105,6 +105,41 @@ generic filler.
 Aim for 250-550 words - thorough but never padded."""
 
 
+# Answer-language support. English is the default and adds no directive (the
+# prompt above is already English). "hi" means ROMANISED Hindi — Hindi words
+# written in the Latin alphabet ("Hinglish"), NOT Devanagari.
+_LANG_NAMES = {
+    "en": "English",
+    "hi": "Roman Hindi (Hindi in the Latin alphabet)",
+}
+
+
+def _language_directive(code: str) -> str:
+    """Strong instruction telling insightFmt which language to answer in.
+
+    Empty for English (default / anything unrecognised). For "hi" it asks for
+    ROMANISED Hindi (Hinglish) — Hindi in the Latin alphabet, never Devanagari —
+    while leaving numbers, ₹ amounts, dates, %, data column/metric names and
+    Markdown structure untouched.
+    """
+    code = (code or "en").strip().lower()
+    if code != "hi":
+        return ""
+    return (
+        "\n\n# LANGUAGE — HIGHEST PRIORITY\n"
+        "Write your ENTIRE answer in HINDI, but using ONLY the Roman "
+        "(Latin / English) alphabet — i.e. romanised \"Hinglish\", NOT the "
+        "Devanagari script. Example tone: \"Aapki kul bikri pichhle mahine "
+        "₹600 rahi, jo ek stable trend dikhata hai.\" Every heading, sentence, "
+        "bullet and label must be Hindi words spelled in Roman letters; do NOT "
+        "use Devanagari characters, and do NOT reply in plain English. Keep "
+        "these EXACTLY as-is: all numbers, the ₹ symbol and money amounts, "
+        "dates, percentages, and the column / metric names taken from the data. "
+        "Preserve the Markdown structure (##, **bold**, pipe tables, bullet "
+        "lists)."
+    )
+
+
 def _build_user(ctx: ToolContext, args: dict[str, Any]) -> str:
     state = ctx.state
     parts: list[str] = []
@@ -149,7 +184,15 @@ def _build_user(ctx: ToolContext, args: dict[str, Any]) -> str:
                 "Data capability: the uploaded dataset has no usable cost "
                 "column - margin and profit cannot be computed."
             )
-    parts.append("\nWrite the final answer now.")
+    # Reinforce the answer language at the very end of the prompt (recency
+    # anchor) in addition to the system directive, so a smaller model is far
+    # less likely to drift back into English mid-answer.
+    lang = getattr(state, "answer_language", "en")
+    if lang and lang != "en":
+        name = _LANG_NAMES.get(lang, "English")
+        parts.append(f"\nWrite the final answer now — entirely in {name}.")
+    else:
+        parts.append("\nWrite the final answer now.")
     return "\n".join(parts)
 
 
@@ -178,9 +221,10 @@ class InsightFmtAgent(Tool):
         if llm is None:
             return ToolOutcome(ok=False, error="insightFmt requires an LLM client.")
         user = _build_user(ctx, args)
+        system = _SYSTEM + _language_directive(getattr(ctx.state, "answer_language", "en"))
         resp = await llm.complete(
             [
-                {"role": "system", "content": _SYSTEM},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
             temperature=0.0,

@@ -518,14 +518,14 @@ export async function streamQuery(
   onEvent: (e: SseEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const { conversationId } = useAppStore.getState()
+  const { conversationId, language } = useAppStore.getState()
   const res = await safeFetch(`${BASE_URL}/query_stream`, withAuthHeader({
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
     },
-    body: JSON.stringify({ question, conversation_id: conversationId }),
+    body: JSON.stringify({ question, conversation_id: conversationId, language }),
     signal,
   }))
   if (!res.ok || !res.body) {
@@ -968,10 +968,19 @@ async function streamQueryWithRetry(
 // 5. Global state store (Zustand + persist) — no auth
 // ---------------------------------------------------------------------------
 
+// Language the AI assistant writes its answers in. The UI chrome stays English;
+// this only controls the language of the streamed analyst answer (sent to the
+// backend on each /query_stream call and honoured by insightFmt).
+// 'hi' = Roman Hindi (Hindi in Latin letters / "Hinglish"), not Devanagari.
+export type Language = 'en' | 'hi'
+
 interface AppState {
   shop: ShopInfo
   dataset: DatasetMeta | null
   filters: DashboardFilters
+
+  // Answer language for the AI assistant (persisted). Default 'en'.
+  language: Language
 
   chatHistory: ChatMessage[]
   isStreaming: boolean
@@ -1010,6 +1019,7 @@ interface AppState {
   setShop: (info: Partial<ShopInfo>) => void
   setDataset: (d: DatasetMeta | null) => void
   setFilters: (f: Partial<DashboardFilters>) => void
+  setLanguage: (l: Language) => void
   clearShop: () => void
 
   appendMessage: (m: ChatMessage) => void
@@ -1058,6 +1068,7 @@ export const useAppStore = create<AppState>()(
       shop: emptyShop,
       dataset: null,
       filters: { month: defaultMonth() },
+      language: 'en',
 
       chatHistory: [],
       isStreaming: false,
@@ -1075,6 +1086,7 @@ export const useAppStore = create<AppState>()(
       setShop: (info) => set((s) => ({ shop: { ...s.shop, ...info } })),
       setDataset: (d) => set({ dataset: d }),
       setFilters: (f) => set((s) => ({ filters: { ...s.filters, ...f } })),
+      setLanguage: (l) => set({ language: l }),
       clearShop: () => set({ shop: emptyShop }),
 
       appendMessage: (m) =>
@@ -1163,6 +1175,7 @@ export const useAppStore = create<AppState>()(
         shop: s.shop,
         filters: s.filters,
         dataset: s.dataset,
+        language: s.language,
         chatHistory: s.chatHistory.slice(-MAX_PERSISTED_MESSAGES),
         conversationId: s.conversationId,
         // Persist auth so a page refresh doesn't kick the user out.

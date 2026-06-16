@@ -2011,7 +2011,7 @@ def _cache_save(data: dict[str, Any]) -> None:
     tmp.replace(p)
 
 
-_PROMPT_VERSION = "v2-charts-2026-05-29"
+_PROMPT_VERSION = "v4-roman-hindi-2026-06-16"
 
 
 def cache_key_for(
@@ -2019,8 +2019,9 @@ def cache_key_for(
     *,
     conversation_id: str | None = None,
     tenant_id: str = "public",
+    language: str = "en",
 ) -> str:
-    """Cache key embeds (tenant_id, prompt_version, data_version, conversation_id, question).
+    """Cache key embeds (tenant_id, prompt_version, data_version, conversation_id, language, question).
     Bumping ``_PROMPT_VERSION`` invalidates every cached answer in one shot —
     used whenever the system prompt or formatter prompt changes meaningfully,
     so users immediately see the new behaviour instead of stale answers.
@@ -2032,9 +2033,14 @@ def cache_key_for(
     unchanged from before tenant scoping was added."""
     tenant = (tenant_id or "public").strip()
     convo = (conversation_id or "default").strip()
+    # The answer language is part of the identity of a cached answer: the same
+    # question in English vs Hindi vs Gujarati produces different prose, so they
+    # must never collide on one cache entry (which would serve the wrong-language
+    # answer back). "en" keeps the historical default.
+    lang = (language or "en").strip().lower() or "en"
     version = get_data_version()
     norm_q = (question or "").strip().lower()
-    payload = f"{tenant}|{_PROMPT_VERSION}|{version}|{convo}|{norm_q}"
+    payload = f"{tenant}|{_PROMPT_VERSION}|{version}|{convo}|{lang}|{norm_q}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

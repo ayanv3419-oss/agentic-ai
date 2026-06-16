@@ -2004,6 +2004,15 @@ async def conversation_delete(
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=4000)
     conversation_id: str | None = Field(default=None, max_length=128)
+    # Language the assistant writes its answer in: "en" (default) | "hi".
+    # "hi" = ROMANISED Hindi (Hindi in Latin letters, "Hinglish"), not Devanagari.
+    # Anything unrecognised is coerced to "en" at the request boundary.
+    language: str = Field(default="en", max_length=8)
+
+
+# Languages the assistant can answer in. Anything outside this set falls back
+# to English so a bad/stale client value can never wedge a turn.
+ANSWER_LANGUAGES = {"en", "hi"}
 
 
 HEARTBEAT_SECONDS = 15.0
@@ -2139,10 +2148,15 @@ async def query_stream(req: QueryRequest, request: Request):
     from app.tenant_context import require_principal
     principal = await require_principal(request)
 
+    answer_language = (req.language or "en").strip().lower()
+    if answer_language not in ANSWER_LANGUAGES:
+        answer_language = "en"
+
     initial = TurnState(
         question=req.question,
         conversation_id=req.conversation_id,
         tenant_id=principal.tenant_id,
+        answer_language=answer_language,
     )
     runner_task = _safe_create_task(_runner(initial, emitter))
     heartbeat_task = _safe_create_task(_heartbeat(emitter))

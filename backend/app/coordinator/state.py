@@ -93,6 +93,13 @@ class TurnState(BaseModel):
     tenant_id: str = "public"
     started_at: float = Field(default_factory=time.time)
 
+    # Language the final user-facing answer (insightFmt) is written in.
+    # "en" (default) → English, behaviour unchanged. "hi" / "gu" → the answer
+    # PROSE is written in Hindi / Gujarati while numbers, ₹ amounts, dates and
+    # Markdown structure are preserved. Set once at the /query_stream boundary
+    # from the request; read-only thereafter.
+    answer_language: str = "en"
+
     # Routing ------------------------------------------------------------
     route: str | None = None              # set by RouteClass tool
     granularity: str | None = None        # set by Granularity tool

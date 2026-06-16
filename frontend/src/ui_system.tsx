@@ -101,6 +101,7 @@ import type {
   ChatMessage,
   DashboardData,
   DriveFile,
+  Language,
   PeriodTotals,
   RankingItem,
   SalesChart,
@@ -886,6 +887,15 @@ const newId = (): string =>
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`
 
+// BCP-47 tags for the browser Web Speech API, keyed by the assistant's answer
+// language. The mic dictates in the chosen language, so picking Hindi switches
+// both dictation (hi-IN — the browser transcribes spoken Hindi) and the answer
+// language (Roman Hindi).
+const SPEECH_LANG: Record<Language, string> = {
+  en: 'en-IN',
+  hi: 'hi-IN',
+}
+
 export function AiAssistant() {
   const liveMessages = useAppStore((s) => s.chatHistory)
   const isStreaming = useAppStore((s) => s.isStreaming)
@@ -893,6 +903,10 @@ export function AiAssistant() {
   const updateMessage = useAppStore((s) => s.updateMessage)
   const clearChat = useAppStore((s) => s.clearChat)
   const setStreaming = useAppStore((s) => s.setStreaming)
+  // Answer language: the assistant writes its reply in this language. Sent to
+  // the backend on every query via streamQuery (read from the store there).
+  const language = useAppStore((s) => s.language)
+  const setLanguage = useAppStore((s) => s.setLanguage)
 
   // Recents (read-only history) — server-sourced session list + the
   // currently-open read-only transcript. When viewingSessionId is null the
@@ -951,7 +965,7 @@ export function AiAssistant() {
   const speech = useSpeechInput((transcript) => {
     const base = baseTextRef.current.trim()
     setInput(base ? `${base} ${transcript}` : transcript)
-  })
+  }, { lang: SPEECH_LANG[language] })
   const handleMicToggle = () => {
     if (speech.listening) {
       speech.stop()
@@ -1246,6 +1260,16 @@ export function AiAssistant() {
                   }
                   className="flex-1 resize-none bg-transparent px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none"
                 />
+                <select
+                  value={language}
+                  onChange={(e) => setLanguage(e.target.value as Language)}
+                  className="shrink-0 h-9 rounded-lg bg-zinc-800/60 border border-zinc-700 text-xs text-zinc-300 px-2 focus:outline-none focus:border-emerald-500/50 cursor-pointer"
+                  title="Language the assistant answers in"
+                  aria-label="Answer language"
+                >
+                  <option value="en">English</option>
+                  <option value="hi">Hindi (Roman)</option>
+                </select>
                 {speech.supported && (
                   <button
                     type="button"
@@ -3260,7 +3284,17 @@ export function ShopInfo() {
         </div>
       </form>
 
-      <div className="mt-10 max-w-2xl rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
+      <div className="mt-8 max-w-2xl rounded-xl border border-zinc-800 bg-zinc-900/40 p-5 flex items-center gap-4">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-emerald-500/10 border border-emerald-500/20">
+          <span className="text-sm font-semibold text-emerald-400">MA</span>
+        </div>
+        <div>
+          <p className="text-sm font-medium text-zinc-200">Mansuri Ayan</p>
+          <p className="text-xs text-zinc-500">Author · MetricAI</p>
+        </div>
+      </div>
+
+      <div className="mt-4 max-w-2xl rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
           <h3 className="text-sm font-medium text-zinc-200">Account</h3>
           <p className="mt-1 text-xs text-zinc-500">
             Sign out of this device. You will need to log in again to continue.

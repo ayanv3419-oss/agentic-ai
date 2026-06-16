@@ -75,6 +75,7 @@ async def run_query_turn(
             state.question,
             conversation_id=state.conversation_id,
             tenant_id=state.tenant_id,
+            language=state.answer_language,
         )
         cached = await asyncio.to_thread(get_cached, cache_key)
         if cached and isinstance(cached, dict) and cached.get("final_answer"):
