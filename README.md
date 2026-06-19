@@ -2,7 +2,7 @@
 
 **Ask your business data questions in plain English — get real numbers, narrative insight, and live charts back.**
 
-Metric AI is an LLM-orchestrated analytics platform for small businesses. Upload your
+Metric AI is an LLM-orchestrated analytics platform for businesses. Upload your
 sales and inventory spreadsheets (CSV / XLSX), then ask things like *"why did Brand X
 drop last month?"* or *"show me monthly revenue for 2025"*. An autonomous agent figures
 out what you're asking, writes and validates the SQL itself, runs it against your data,
@@ -100,7 +100,7 @@ next move, until it has enough to answer.
 - **The LLM orchestrates; the tools are deterministic.** The model decides *what* to do,
   but each tool does *exactly* one thing the same way every time. This keeps behavior
   debuggable — you can replay any turn and see precisely which tool produced which result.
-- **`SqlDryRun` is a hard gate.** The executor refuses to run any SQL the validator
+- **`SqlDryRun`ses to  is a hard gate.** The executor refurun any SQL the validator
   hasn't approved on the same turn. LLM-written SQL never touches the database unchecked.
 - **Immutable state.** A single `TurnState` is passed between tools and never mutated —
   every change produces a new state via `.apply()`. No hidden cross-tool side effects.
