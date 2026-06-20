@@ -140,6 +140,63 @@ def _language_directive(code: str) -> str:
     )
 
 
+def _needs_data(state: Any) -> bool:
+    """True when the question is about the user's uploaded data.
+
+    Every route except CHAT (greetings / thanks) implies the user expects an
+    answer grounded in their records. Reaching insightFmt for one of these
+    without ever retrieving a row means there is nothing to ground numbers in —
+    so a confident numeric answer would be fabricated. A missing route (the
+    model skipped RouteClass) is treated as a data question, which is the safe
+    default for an analytics product.
+    """
+    return (getattr(state, "route", None) or "").strip().upper() != "CHAT"
+
+
+def _has_grounding(state: Any) -> bool:
+    """True if this turn actually pulled data — or at least ran a query.
+
+    A successful SqlExecutor counts even when it returned 0 rows: that is the
+    legitimate "no data for that period" path, which insightFmt should answer
+    normally ("no sales in that window"). What we block is the case where NO
+    query ever ran AND no rows exist — the fabrication path.
+    """
+    if getattr(state, "rows", None) or getattr(state, "row_count", 0):
+        return True
+    return any(
+        r.name == "SqlExecutor" and r.status == "ok"
+        for r in getattr(state, "tool_results", [])
+    )
+
+
+def _no_data_answer(lang: str) -> str:
+    """Deterministic refusal shown when a data question has no data behind it.
+
+    Doubles as onboarding: it tells the user exactly what to do next. Honours
+    the answer-language selector (English / Roman Hindi)."""
+    if (lang or "en").strip().lower() == "hi":
+        return (
+            "**Abhi tak koi data nahi mila jisse main is sawaal ka jawaab de "
+            "sakun.**\n\n"
+            "Main sirf aapke upload kiye gaye records se hi jawaab deta hoon, "
+            "aur is sawaal ke liye koi figure nahi mila. Agar aapne abhi tak "
+            "kuch upload nahi kiya hai, to **Upload Data** par jaakar apni "
+            "sales / transactions ki CSV ya Excel file add karein — phir "
+            "dobara poochhein.\n\n"
+            "Data aane ke baad main revenue, trends, top products waghairah ka "
+            "breakdown de sakta hoon."
+        )
+    return (
+        "**I don't have any data to answer that yet.**\n\n"
+        "I can only answer from the records you've uploaded, and I didn't find "
+        "any figures for this question. If you haven't uploaded anything yet, "
+        "go to **Upload Data** and add a CSV or Excel file of your sales / "
+        "transactions — then ask me again.\n\n"
+        "Once your data is in, I can break down revenue, trends, top products "
+        "and more."
+    )
+
+
 def _build_user(ctx: ToolContext, args: dict[str, Any]) -> str:
     state = ctx.state
     parts: list[str] = []
@@ -217,6 +274,20 @@ class InsightFmtAgent(Tool):
     }
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolOutcome:
+        state = ctx.state
+        # GROUNDING GUARD: a data question that retrieved no data must NOT be
+        # answered with invented figures. Short-circuit with a deterministic
+        # refusal (no LLM call → impossible to hallucinate) and finish the turn
+        # cleanly. This is the only hard, code-level stop; the integrity rules
+        # in the system prompt are advisory and small models ignore them.
+        if _needs_data(state) and not _has_grounding(state):
+            answer = _no_data_answer(getattr(state, "answer_language", "en"))
+            return ToolOutcome(
+                ok=True,
+                output={"answer": answer, "grounded": False},
+                state_updates={"final_answer": answer},
+            )
+
         llm: LLMClient | None = ctx.llm
         if llm is None:
             return ToolOutcome(ok=False, error="insightFmt requires an LLM client.")
