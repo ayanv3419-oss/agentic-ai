@@ -41,7 +41,10 @@ def instrument_fastapi(app: FastAPI) -> None:
     """Attach the request-id + Sentry-scope + security-headers middleware
     to a FastAPI app.
 
-    Call once, after middleware order is fixed (so this runs INSIDE CORS).
+    Call once, BEFORE CORSMiddleware is added — Starlette runs later-added
+    middleware outermost, so registering CORS after this keeps this layer
+    INSIDE CORS (every response gets CORS headers) while staying OUTSIDE
+    the auth gate (401 short-circuits keep request ids + security headers).
     """
 
     @app.middleware("http")

@@ -806,6 +806,25 @@ async def _health_data_rows() -> int:
     return await count_rows("sales") + await count_rows("purchase")
 
 
+async def _health_db_ping() -> dict:
+    """Round-trip ``SELECT 1`` against the live engine.
+
+    ``engine_status()`` only reports what is CONFIGURED; this proves the
+    database actually ANSWERS — a paused Supabase project passes every
+    config check but fails here (2026-08-03 outage: /health said "ok" for
+    hours while the DB was dead). Bounded so a hung database can't stall
+    /health indefinitely (Render polls it for liveness): 8s typical worst
+    case; tearing down a silently-dead pooled connection can add asyncpg's
+    shielded release budget (~15s) on top before the timeout surfaces.
+    """
+    from app.infrastructure import fetch_one
+    try:
+        await asyncio.wait_for(fetch_one("SELECT 1"), timeout=8)
+        return {"reachable": True}
+    except Exception as exc:  # noqa: BLE001 — health must never raise
+        return {"reachable": False, "detail": f"{type(exc).__name__}: {str(exc)[:200]}"}
+
+
 @api_router.get("/health")
 async def health() -> dict:
     """Defensive health endpoint.
@@ -845,16 +864,34 @@ async def health() -> dict:
             "base_url": settings.llm_base_url,
         }
 
+    db_block = _safe(engine_status, default={"kind": "unknown", "status": "starting"})
+    db_probe = await _health_db_ping()
+    if isinstance(db_block, dict):
+        db_block = {**db_block, **db_probe}
+
+    # Row count only when the ping succeeded: with the DB down it would
+    # re-dial the unreachable server under asyncpg's own 60s connect timeout
+    # — long enough to trip Render's liveness probe and restart-loop the
+    # service. Bounded for the same reason even on the happy path.
+    data_rows = 0
+    if db_probe.get("reachable"):
+        data_rows = await _safe_async(
+            lambda: asyncio.wait_for(_health_data_rows(), timeout=10), default=0
+        )
+
     return {
-        "status": "ok",
+        # "degraded" (still HTTP 200 — Render's liveness check must not
+        # restart-loop the service over a paused external DB) signals that
+        # the app is up but the database isn't answering.
+        "status": "ok" if db_probe.get("reachable") else "degraded",
         "version": app.version,
         "data_version": _safe(get_data_version, default=0),
         "cache": {
             "kind": "json_file",
             "size": _safe(cache_size, default=0),
         },
-        "database": _safe(engine_status, default={"kind": "unknown", "status": "starting"}),
-        "data_rows": await _safe_async(_health_data_rows, default=0),
+        "database": db_block,
+        "data_rows": data_rows,
         "sentry": _safe(sentry_status, default={"enabled": False}),
         "llm": llm_block,
         "auth_enabled": settings.auth_enabled,
@@ -2250,20 +2287,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-_raw_origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
-_allow_all = _raw_origins == ["*"]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if _allow_all else _raw_origins,
-    allow_origin_regex=None if _allow_all else None,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
-
-
 # Public routes that must NEVER require auth — load-balancer health probe,
 # the login endpoint itself, the session probe, and the FastAPI/MCP
 # discovery surface. Everything else is gated when AUTH_ENABLED=true.
@@ -2334,6 +2357,45 @@ except Exception:
 
 instrument_fastapi(app)
 
+# CORS is registered LAST on purpose. Starlette runs the most recently
+# added middleware OUTERMOST, and CORS must wrap everything: an early-return
+# 401 from the auth middleware above would otherwise leave without an
+# Access-Control-Allow-Origin header, and browsers mask such responses as
+# "TypeError: Failed to fetch" — the frontend can't tell "session expired"
+# from "backend down". Resulting stack, outermost → innermost:
+# CORS → request-context/security-headers → auth → routes.
+_raw_origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
+_allow_all = _raw_origins == ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if _allow_all else _raw_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
+
+def _cors_headers_for(request: Request) -> dict[str, str]:
+    """CORS headers for responses that BYPASS CORSMiddleware.
+
+    Starlette hoists the ``@app.exception_handler(Exception)`` handler into
+    ServerErrorMiddleware, which is built OUTSIDE every user middleware —
+    including CORS, no matter the registration order. Without these headers
+    an unhandled-500 envelope reaches the browser CORS-blocked and gets
+    masked as "TypeError: Failed to fetch" (the 2026-08-03 fake-network-error
+    symptom, on the 500 path). Mirrors CORSMiddleware's origin policy.
+    """
+    origin = (request.headers.get("origin") or "").strip()
+    if not origin or not (_allow_all or origin in _raw_origins):
+        return {}
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "true",
+        "Vary": "Origin",
+    }
+
 
 def _sanitize_validation_errors(errors: list) -> list:
     safe: list = []
@@ -2387,6 +2449,9 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
             kind="internal",
             extra={"error_id": error_id} if error_id else None,
         ),
+        # This handler renders OUTSIDE CORSMiddleware (see _cors_headers_for)
+        # so it must attach the CORS headers itself or browsers hide the 500.
+        headers=_cors_headers_for(request),
     )
 
 
