@@ -715,6 +715,22 @@ export function Dashboard() {
 // Monthly Sales Distribution — pie chart
 // ===========================================================================
 
+// True on phone-width screens (< md). Used to move pie legends to the bottom
+// so the donut can center instead of being clipped by a right-side legend.
+function useIsNarrow(maxWidth = 767): boolean {
+  const [narrow, setNarrow] = useState(
+    () => typeof window !== 'undefined' && window.innerWidth <= maxWidth,
+  )
+  useEffect(() => {
+    const mq = window.matchMedia(`(max-width: ${maxWidth}px)`)
+    const onChange = () => setNarrow(mq.matches)
+    onChange()
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [maxWidth])
+  return narrow
+}
+
 const PIE_PALETTE = [
   '#10b981', '#34d399', '#6ee7b7', '#22d3ee', '#0ea5e9',
   '#6366f1', '#8b5cf6', '#a855f7', '#ec4899', '#f43f5e',
@@ -727,6 +743,7 @@ interface MonthlySalesPieProps {
 
 function MonthlySalesPie({ data }: MonthlySalesPieProps) {
   const total = data.reduce((acc, d) => acc + (d.sales || 0), 0)
+  const narrow = useIsNarrow()
 
   return (
     <section className="mt-5 card p-5 md:p-7">
@@ -740,7 +757,7 @@ function MonthlySalesPie({ data }: MonthlySalesPieProps) {
         </div>
       ) : (
         <div className="mt-4 grid lg:grid-cols-[1fr_auto] gap-6 items-center">
-          <div style={{ height: 320 }}>
+          <div style={{ height: narrow ? 440 : 320 }}>
             <ResponsiveContainer>
               <PieChart>
                 <Pie
@@ -748,9 +765,9 @@ function MonthlySalesPie({ data }: MonthlySalesPieProps) {
                   dataKey="sales"
                   nameKey="month"
                   cx="50%"
-                  cy="50%"
-                  innerRadius={60}
-                  outerRadius={120}
+                  cy={narrow ? '38%' : '50%'}
+                  innerRadius={narrow ? 52 : 60}
+                  outerRadius={narrow ? 96 : 120}
                   paddingAngle={data.length > 1 ? 2 : 0}
                   stroke="#0a0a0a"
                   strokeWidth={2}
@@ -778,11 +795,15 @@ function MonthlySalesPie({ data }: MonthlySalesPieProps) {
                   }}
                 />
                 <Legend
-                  verticalAlign="middle"
-                  align="right"
-                  layout="vertical"
+                  verticalAlign={narrow ? 'bottom' : 'middle'}
+                  align={narrow ? 'center' : 'right'}
+                  layout={narrow ? 'horizontal' : 'vertical'}
                   iconType="circle"
-                  wrapperStyle={{ fontSize: 12, color: '#a1a1aa', paddingLeft: 16 }}
+                  wrapperStyle={
+                    narrow
+                      ? { fontSize: 12, color: '#a1a1aa', paddingTop: 12 }
+                      : { fontSize: 12, color: '#a1a1aa', paddingLeft: 16 }
+                  }
                   formatter={(value: string) => (
                     <span style={{ color: '#d4d4d8' }}>{value}</span>
                   )}
@@ -1244,7 +1265,7 @@ export function AiAssistant() {
                   </button>
                 </div>
               )}
-              <div className="relative flex items-end gap-2 rounded-2xl border border-zinc-800 bg-zinc-900/60 focus-within:border-emerald-500/50 transition-colors p-2">
+              <div className="relative flex flex-col sm:flex-row sm:items-end gap-2 rounded-2xl border border-zinc-800 bg-zinc-900/60 focus-within:border-emerald-500/50 transition-colors p-2">
                 <textarea
                   ref={textareaRef}
                   value={input}
@@ -1256,57 +1277,62 @@ export function AiAssistant() {
                       ? 'Listening… speak now'
                       : 'Ask anything about your business…'
                   }
-                  className="flex-1 min-w-0 resize-none bg-transparent px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none"
+                  className="w-full sm:flex-1 min-w-0 resize-none bg-transparent px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none"
                 />
-                <select
-                  value={language}
-                  onChange={(e) => setLanguage(e.target.value as Language)}
-                  className="shrink-0 h-9 rounded-lg bg-zinc-800/60 border border-zinc-700 text-xs text-zinc-300 px-2 focus:outline-none focus:border-emerald-500/50 cursor-pointer"
-                  title="Language the assistant answers in"
-                  aria-label="Answer language"
-                >
-                  <option value="en">English</option>
-                  <option value="hi">Hindi (Roman)</option>
-                </select>
-                {speech.supported && (
-                  <button
-                    type="button"
-                    onClick={handleMicToggle}
-                    className={cn(
-                      'inline-flex items-center justify-center rounded-lg h-9 w-9 shrink-0 transition-colors',
-                      speech.listening
-                        ? 'bg-red-500/15 text-red-400 ring-1 ring-red-500/40 animate-pulse'
-                        : 'text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800',
-                    )}
-                    title={speech.listening ? 'Stop dictation' : 'Dictate — speak instead of typing'}
-                    aria-label={speech.listening ? 'Stop voice dictation' : 'Start voice dictation'}
-                    aria-pressed={speech.listening}
+                {/* On phones these controls drop to their own row; on >=sm
+                    `sm:contents` dissolves this wrapper so they sit inline in
+                    the composer exactly as before. */}
+                <div className="flex items-center gap-2 sm:contents">
+                  <select
+                    value={language}
+                    onChange={(e) => setLanguage(e.target.value as Language)}
+                    className="shrink-0 h-9 rounded-lg bg-zinc-800/60 border border-zinc-700 text-xs text-zinc-300 px-2 focus:outline-none focus:border-emerald-500/50 cursor-pointer"
+                    title="Language the assistant answers in"
+                    aria-label="Answer language"
                   >
-                    <Mic className="w-4 h-4" />
-                  </button>
-                )}
-                {isStreaming ? (
-                  <button
-                    type="button"
-                    onClick={stop}
-                    className="btn btn-secondary h-9 px-3 shrink-0"
-                    title="Stop"
-                  >
-                    <Square className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">Stop</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => void handleSend()}
-                    disabled={!canSend}
-                    className="btn btn-primary h-9 px-3 shrink-0"
-                    title="Send"
-                  >
-                    <Send className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">Send</span>
-                  </button>
-                )}
+                    <option value="en">English</option>
+                    <option value="hi">Hindi (Roman)</option>
+                  </select>
+                  {speech.supported && (
+                    <button
+                      type="button"
+                      onClick={handleMicToggle}
+                      className={cn(
+                        'inline-flex items-center justify-center rounded-lg h-9 w-9 shrink-0 transition-colors',
+                        speech.listening
+                          ? 'bg-red-500/15 text-red-400 ring-1 ring-red-500/40 animate-pulse'
+                          : 'text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800',
+                      )}
+                      title={speech.listening ? 'Stop dictation' : 'Dictate — speak instead of typing'}
+                      aria-label={speech.listening ? 'Stop voice dictation' : 'Start voice dictation'}
+                      aria-pressed={speech.listening}
+                    >
+                      <Mic className="w-4 h-4" />
+                    </button>
+                  )}
+                  {isStreaming ? (
+                    <button
+                      type="button"
+                      onClick={stop}
+                      className="btn btn-secondary h-9 px-3 shrink-0 ml-auto sm:ml-0"
+                      title="Stop"
+                    >
+                      <Square className="w-3.5 h-3.5" />
+                      <span>Stop</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void handleSend()}
+                      disabled={!canSend}
+                      className="btn btn-primary h-9 px-3 shrink-0 ml-auto sm:ml-0"
+                      title="Send"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                      <span>Send</span>
+                    </button>
+                  )}
+                </div>
               </div>
               {speech.error && (
                 <p className="mt-2 text-[11px] text-red-400 text-center">{speech.error}</p>
@@ -1711,6 +1737,7 @@ function ChartUnavailable({ title }: { title?: string }) {
 // bar→BarChart, pie→PieChart. When there are no points it shows a small
 // "Chart unavailable" note (rather than nothing) so an empty payload is visible.
 function PointsChart({ chart }: { chart: ChatChartPayload }) {
+  const narrow = useIsNarrow()
   const points = chart.points ?? []
   if (points.length === 0) return <ChartUnavailable title={chart.title} />
 
@@ -1740,7 +1767,7 @@ function PointsChart({ chart }: { chart: ChatChartPayload }) {
           {chart.title}
         </div>
       )}
-      <div className="-ml-2" style={{ height: kind === 'pie' ? 240 : chartHeight }}>
+      <div className="-ml-2" style={{ height: kind === 'pie' ? (narrow ? 340 : 240) : chartHeight }}>
         <ResponsiveContainer>
           {kind === 'pie' ? (
             <PieChart>
@@ -1749,9 +1776,9 @@ function PointsChart({ chart }: { chart: ChatChartPayload }) {
                 dataKey="value"
                 nameKey="label"
                 cx="50%"
-                cy="50%"
-                innerRadius={50}
-                outerRadius={92}
+                cy={narrow ? '40%' : '50%'}
+                innerRadius={narrow ? 44 : 50}
+                outerRadius={narrow ? 80 : 92}
                 paddingAngle={points.length > 1 ? 2 : 0}
                 stroke="#0a0a0a"
                 strokeWidth={2}
@@ -1772,11 +1799,15 @@ function PointsChart({ chart }: { chart: ChatChartPayload }) {
                 }}
               />
               <Legend
-                verticalAlign="middle"
-                align="right"
-                layout="vertical"
+                verticalAlign={narrow ? 'bottom' : 'middle'}
+                align={narrow ? 'center' : 'right'}
+                layout={narrow ? 'horizontal' : 'vertical'}
                 iconType="circle"
-                wrapperStyle={{ fontSize: 11, color: '#a1a1aa', paddingLeft: 12 }}
+                wrapperStyle={
+                  narrow
+                    ? { fontSize: 11, color: '#a1a1aa', paddingTop: 10 }
+                    : { fontSize: 11, color: '#a1a1aa', paddingLeft: 12 }
+                }
                 formatter={(value: string) => (
                   <span style={{ color: '#d4d4d8' }}>{fmtTick(value)}</span>
                 )}
