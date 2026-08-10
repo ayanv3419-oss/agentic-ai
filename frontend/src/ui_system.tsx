@@ -573,7 +573,7 @@ export function Dashboard() {
 
       {/* No-data empty state: replaces charts when nothing has been uploaded yet */}
       {!loading && !error && data && data.kpis.orders === 0 && data.series.length === 0 ? (
-        <div className="mt-8 card p-10 flex flex-col items-center justify-center text-center gap-4 border-dashed">
+        <div className="mt-8 card p-6 md:p-10 flex flex-col items-center justify-center text-center gap-4 border-dashed">
           <div className="w-16 h-16 rounded-2xl bg-zinc-900 border border-zinc-800 flex items-center justify-center">
             <BarChart2 className="w-8 h-8 text-zinc-700" />
           </div>
@@ -586,7 +586,7 @@ export function Dashboard() {
         </div>
       ) : (
         <>
-      <section className="mt-8 card p-7">
+      <section className="mt-8 card p-5 md:p-7">
         <SectionHeader
           title="Sales Performance"
           hint={
@@ -642,7 +642,7 @@ export function Dashboard() {
         </div>
       </section>
 
-      <section className="mt-5 card p-7">
+      <section className="mt-5 card p-5 md:p-7">
         <SectionHeader
           title="Revenue Trend"
           hint={
@@ -729,7 +729,7 @@ function MonthlySalesPie({ data }: MonthlySalesPieProps) {
   const total = data.reduce((acc, d) => acc + (d.sales || 0), 0)
 
   return (
-    <section className="mt-5 card p-7">
+    <section className="mt-5 card p-5 md:p-7">
       <SectionHeader
         title="Monthly Sales Distribution"
         hint="Share of total sales by month — across the full uploaded history."
@@ -1175,12 +1175,10 @@ export function AiAssistant() {
             title={sessions.find((s) => s.id === viewingSessionId)?.title || 'Conversation'}
             onBack={closeSession}
           />
-        ) : (
-          <ChatHeader onClear={clearChat} hasMessages={messages.length > 0} />
-        )}
+        ) : null}
 
         <div ref={scrollerRef} className="flex-1 overflow-y-auto">
-          <div className="max-w-3xl mx-auto px-6 md:px-10 py-8">
+          <div className="max-w-3xl mx-auto px-4 md:px-10 py-8">
             {messages.length === 0 ? (
               isViewing ? (
                 <p className="py-16 text-center text-sm text-zinc-500">
@@ -1200,8 +1198,8 @@ export function AiAssistant() {
         </div>
 
         {isViewing ? (
-          <div className="border-t border-zinc-800 bg-zinc-950">
-            <div className="max-w-3xl mx-auto px-6 md:px-10 py-4">
+          <div className="bg-zinc-950">
+            <div className="max-w-3xl mx-auto px-4 md:px-10 py-4">
               <div className="flex items-center justify-between gap-3 rounded-2xl border border-zinc-800 bg-zinc-900/40 px-4 py-3">
                 <p className="text-xs text-zinc-500">
                   You're viewing a past conversation. Start a new chat to ask more.
@@ -1228,8 +1226,8 @@ export function AiAssistant() {
             </div>
           </div>
         ) : (
-          <div className="border-t border-zinc-800 bg-zinc-950">
-            <div className="max-w-3xl mx-auto px-6 md:px-10 py-4">
+          <div className="bg-zinc-950">
+            <div className="max-w-3xl mx-auto px-4 md:px-10 py-4">
               {dataChangedMidConversation && !bannerDismissed && (
                 <div className="mb-3 flex items-start gap-2 text-xs text-emerald-300/90 bg-emerald-950/30 border border-emerald-900/40 rounded-md px-3 py-2">
                   <span className="mt-0.5">📊</span>
@@ -1258,7 +1256,7 @@ export function AiAssistant() {
                       ? 'Listening… speak now'
                       : 'Ask anything about your business…'
                   }
-                  className="flex-1 resize-none bg-transparent px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none"
+                  className="flex-1 min-w-0 resize-none bg-transparent px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none"
                 />
                 <select
                   value={language}
@@ -1291,7 +1289,7 @@ export function AiAssistant() {
                   <button
                     type="button"
                     onClick={stop}
-                    className="btn btn-secondary h-9 px-3"
+                    className="btn btn-secondary h-9 px-3 shrink-0"
                     title="Stop"
                   >
                     <Square className="w-3.5 h-3.5" />
@@ -1302,7 +1300,7 @@ export function AiAssistant() {
                     type="button"
                     onClick={() => void handleSend()}
                     disabled={!canSend}
-                    className="btn btn-primary h-9 px-3"
+                    className="btn btn-primary h-9 px-3 shrink-0"
                     title="Send"
                   >
                     <Send className="w-3.5 h-3.5" />
@@ -1327,7 +1325,7 @@ export function AiAssistant() {
 // back to the live chat (the composer is hidden in this mode).
 function ReadOnlyHeader({ title, onBack }: { title: string; onBack: () => void }) {
   return (
-    <div className="border-b border-zinc-800 px-6 md:px-10 py-4 flex items-center justify-between">
+    <div className="border-b border-zinc-800 px-4 md:px-10 py-4 flex items-center justify-between">
       <div className="flex items-center gap-3 min-w-0">
         <div className="w-9 h-9 rounded-lg bg-zinc-900 border border-zinc-800 flex items-center justify-center shrink-0">
           <MessageSquare className="w-4 h-4 text-zinc-400" />
@@ -1345,36 +1343,6 @@ function ReadOnlyHeader({ title, onBack }: { title: string; onBack: () => void }
       >
         <X className="w-3.5 h-3.5" />
         <span className="hidden sm:inline">Close</span>
-      </button>
-    </div>
-  )
-}
-
-function ChatHeader({ onClear, hasMessages }: { onClear: () => void; hasMessages: boolean }) {
-  return (
-    <div className="border-b border-zinc-800 px-6 md:px-10 py-4 flex items-center justify-between">
-      <div className="flex items-center gap-3">
-        <div className="w-9 h-9 rounded-lg bg-zinc-900 border border-zinc-800 flex items-center justify-center">
-          <Logo className="w-4 h-4 text-emerald-400" />
-        </div>
-        <div>
-          <h1 className="text-base font-semibold tracking-tight">AI Assistant</h1>
-          <p className="text-xs text-zinc-500">Ask about sales, revenue, or trends in plain English.</p>
-        </div>
-      </div>
-      <button
-        type="button"
-        onClick={() => {
-          if (!hasMessages) return
-          if (!confirm('Clear chat history?')) return
-          onClear()
-        }}
-        disabled={!hasMessages}
-        className="btn btn-ghost"
-        title="Clear chat"
-      >
-        <Trash2 className="w-3.5 h-3.5" />
-        <span className="hidden sm:inline">Clear</span>
       </button>
     </div>
   )
@@ -1401,7 +1369,7 @@ function EmptyState({ onPick }: { onPick: (s: string) => void }) {
               key={s.text}
               type="button"
               onClick={() => onPick(s.text)}
-              className="group text-left card px-4 py-3.5 hover:border-emerald-500/30 hover:bg-emerald-950/20 transition-all duration-150"
+              className="group text-left bg-zinc-900/50 border-l-2 border-zinc-700 rounded-r-xl px-4 py-3.5 hover:border-emerald-500/60 hover:bg-emerald-950/20 transition-all duration-150"
             >
               <div className="flex items-center gap-3">
                 <span className="w-7 h-7 rounded-lg bg-zinc-800 border border-zinc-700 flex items-center justify-center shrink-0 group-hover:bg-emerald-500/10 group-hover:border-emerald-500/30 transition-colors">
@@ -2543,7 +2511,7 @@ export function UploadData() {
 
       <div className="mt-8 grid md:grid-cols-2 gap-5">
         {/* Option A: file from device */}
-        <section className="card p-6">
+        <section className="card p-5 md:p-6">
           <div className="flex items-center gap-2 mb-1">
             <FileSpreadsheet className="w-4 h-4 text-zinc-400" />
             <h2 className="font-medium text-sm">From device</h2>
@@ -2606,7 +2574,7 @@ export function UploadData() {
         </section>
 
         {/* Option B: Google Drive */}
-        <section className="card p-6">
+        <section className="card p-5 md:p-6">
           <div className="flex items-center gap-2 mb-1">
             <Cloud className="w-4 h-4 text-zinc-400" />
             <h2 className="font-medium text-sm">Connect Google Drive</h2>
@@ -2898,7 +2866,7 @@ function SchemaConfirm({ proposal, onDone }: SchemaConfirmProps) {
   }
 
   return (
-    <section className="mt-8 card p-6 animate-slide-up">
+    <section className="mt-8 card p-5 md:p-6 animate-slide-up">
       <div className="flex items-center gap-2 mb-1">
         <CheckCircle2 className="w-4 h-4 text-emerald-400" />
         <h2 className="font-medium text-sm">Confirm how we read your data</h2>
@@ -3057,7 +3025,7 @@ function UploadsTable({ refreshKey = 0, onDisconnected }: UploadsTableProps) {
   }
 
   return (
-    <section className="card p-6">
+    <section className="card p-5 md:p-6">
       <header className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
           <FileSpreadsheet className="w-4 h-4 text-zinc-400" />
