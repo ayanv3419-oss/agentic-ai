@@ -136,6 +136,13 @@ class Settings(BaseSettings):
     # closed rather than exposing customer access-control to the world.
     admin_portal_token:  str  = Field(default="", alias="ADMIN_PORTAL_TOKEN")
 
+    # --- Access enforcement (Phase 2) -----------------------------------
+    # When True, the auth middleware blocks any customer whose access_status
+    # is not 'allowed' (i.e. pending/denied) from the data routes. Default
+    # False so deploying the code changes NOTHING until it is deliberately
+    # flipped on — a safe rollout switch.
+    access_enforcement: bool = Field(default=False, alias="ACCESS_ENFORCEMENT")
+
     # --- Server ---------------------------------------------------------
     host: str = Field(default="0.0.0.0", alias="HOST")
     port: int = Field(default=8000, alias="PORT")

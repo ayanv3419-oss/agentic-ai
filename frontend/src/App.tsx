@@ -37,7 +37,9 @@ import {
 } from 'lucide-react'
 
 import {
+  clearAuth,
   cn,
+  fetchAuthMe,
   fetchUploadsList,
   forgotPassword,
   loginWith,
@@ -769,6 +771,32 @@ function AuthProbePending() {
   )
 }
 
+// Full-page screen shown when access enforcement is on and this account is
+// not 'allowed'. PENDING = waiting for approval; DENIED = subscription lapsed.
+function AccessBlocked({ status }: { status: string }) {
+  const denied = status === 'denied'
+  return (
+    <div className="h-screen w-screen flex items-center justify-center bg-zinc-950 text-zinc-100 p-6">
+      <div className="max-w-md w-full text-center rounded-2xl border border-zinc-800 bg-zinc-900/60 p-8 shadow-xl">
+        <div className="mx-auto mb-5 w-14 h-14 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
+          <Logo className="w-6 h-6 text-emerald-400" />
+        </div>
+        <h1 className="text-lg font-semibold tracking-tight mb-2">
+          {denied ? 'Subscription inactive' : 'Account being set up'}
+        </h1>
+        <p className="text-sm text-zinc-400 leading-relaxed">
+          {denied
+            ? 'Your MetricAI subscription is currently inactive. Please contact us to renew and restore access.'
+            : 'Your MetricAI account is being activated — you’ll have access shortly.'}
+        </p>
+        <button type="button" onClick={() => clearAuth()} className="btn btn-secondary mt-6">
+          Sign out
+        </button>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   // Land in the chat by default (was 'dashboard'). The splash overlay below
   // covers the first paint and fades into this view.
@@ -791,6 +819,10 @@ export default function App() {
   // reset view can render even on AUTH_ENABLED=false deployments and before the
   // /health probe resolves (the user arrives here from an email, unauthenticated).
   const [resetToken, setResetToken] = useState<string | null>(null)
+  // Access control (Phase 2). Populated from /auth/me once logged in.
+  // { enforced } is the backend rollout flag; { status } is this account's
+  // access_status. The blocked screen shows only when enforced && != allowed.
+  const [access, setAccess] = useState<{ status?: string; enforced?: boolean } | null>(null)
 
   // Probe /health on boot to discover whether AUTH_ENABLED=true. Result
   // lives in store.auth.authEnabled — the gate below renders only when
@@ -798,6 +830,24 @@ export default function App() {
   useEffect(() => {
     void probeAuthEnabled()
   }, [authProbe])
+
+  // Access re-check. On login, and then every couple of minutes (a background
+  // re-validation — no re-login needed), pull /auth/me and note the access
+  // status. A transient error never locks the app (we just keep the last
+  // known state / stay open).
+  useEffect(() => {
+    if (!authToken) { setAccess(null); return }
+    let alive = true
+    const check = async () => {
+      try {
+        const me = await fetchAuthMe()
+        if (alive) setAccess({ status: me.access_status, enforced: me.access_enforced })
+      } catch { /* transient — do not lock the app on an error */ }
+    }
+    void check()
+    const id = window.setInterval(check, 120000)
+    return () => { alive = false; window.clearInterval(id) }
+  }, [authToken])
 
   // Capture a ?reset_token=… password-reset deep link on first mount, then
   // strip it from the URL so a refresh / shared link doesn't re-trigger the
@@ -895,6 +945,12 @@ export default function App() {
   // false this falls through to the shell; to true the LoginGate above renders.
   if (authEnabled === null && !authToken) {
     return <AuthProbePending />
+  }
+
+  // Access enforcement (Phase 2): when the backend is enforcing and this
+  // customer isn't 'allowed', show the blocked screen instead of the app.
+  if (access?.enforced && access.status && access.status !== 'allowed') {
+    return <AccessBlocked status={access.status} />
   }
 
   return (

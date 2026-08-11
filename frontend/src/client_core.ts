@@ -245,6 +245,10 @@ export interface AuthMe {
   google_configured?: boolean
   // Drive connection status for the CURRENT tenant (per-tenant token store).
   drive_connected?: boolean
+  // Access control (Phase 2). access_status = pending | allowed | denied.
+  // access_enforced = whether the backend is actually gating on it yet.
+  access_status?: string
+  access_enforced?: boolean
 }
 
 export interface DriveFile {

@@ -475,6 +475,10 @@ async def auth_me(request: Request) -> dict:
         from app import identity
         principal = identity.verify_token(auth_hdr[7:].strip())
         if principal is not None:
+            # Access status (Phase 2) — surfaced so the frontend can show the
+            # right blocked screen. `access_enforced` tells it whether the
+            # backend is actually gating on it yet (the rollout flag).
+            access = await identity.get_access_status(principal.user_id)
             # Drive connection is now PER-TENANT: report status for THIS
             # principal's tenant only.
             try:
@@ -486,6 +490,8 @@ async def auth_me(request: Request) -> dict:
                 "user_id": principal.user_id,
                 "email": principal.email,
                 "tenant_id": principal.tenant_id,
+                "access_status": access,
+                "access_enforced": settings.access_enforcement,
                 "authenticated": connected,
                 "drive_connected": connected,
                 "google_configured": google_drive.is_configured(),
@@ -2356,6 +2362,9 @@ async def admin_set_status(user_id: str, body: AdminStatusBody, request: Request
             (new_status, user_id),
         )
         await db.commit()
+    # Bust the enforcement cache so the change takes effect on the next request.
+    from app import identity
+    identity.invalidate_access_status(user_id)
     return {"ok": True, "id": user_id, "access_status": new_status}
 
 
@@ -2406,10 +2415,11 @@ async def _auth_middleware(request: Request, call_next):
     if any(path == p or path.startswith(p + "/") or path == p for p in _AUTH_PUBLIC_PREFIXES):
         return await call_next(request)
     # Defer the actual check to the helper so the logic stays in one place.
-    from app.identity import verify_token
+    from app.identity import verify_token, get_access_status
     hdr = request.headers.get("Authorization") or ""
     token = hdr[7:].strip() if hdr.lower().startswith("bearer ") else ""
-    if not token or verify_token(token) is None:
+    principal = verify_token(token) if token else None
+    if principal is None:
         return JSONResponse(
             status_code=401,
             content=envelope(
@@ -2419,6 +2429,26 @@ async def _auth_middleware(request: Request, call_next):
             ),
             headers={"WWW-Authenticate": 'Bearer realm="agentic-ai"'},
         )
+    # Access enforcement (Phase 2). OFF by default; when ACCESS_ENFORCEMENT is
+    # on, block any customer who isn't 'allowed' from the data routes. The
+    # status lookup is cached (identity.get_access_status), so this adds at
+    # most one DB read per user every few minutes. /auth/me stays reachable
+    # (it's a public prefix) so the frontend can still learn the status and
+    # show the right blocked screen.
+    if settings.access_enforcement:
+        access = await get_access_status(principal.user_id)
+        if access != "allowed":
+            body = envelope(
+                "Access blocked",
+                detail=(
+                    "Your account is pending approval."
+                    if access == "pending"
+                    else "Your MetricAI subscription is inactive."
+                ),
+                kind="access",
+            )
+            body["access_status"] = access
+            return JSONResponse(status_code=403, content=body)
     return await call_next(request)
 
 app.include_router(api_router)

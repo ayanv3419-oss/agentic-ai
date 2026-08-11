@@ -57,6 +57,54 @@ _BCRYPT_MAX_BYTES = 72
 _MIN_PASSWORD_LEN = 6
 
 
+# ---------------------------------------------------------------------------
+# Access-status enforcement (Phase 2). A small in-process cache so the paywall
+# check costs at most one DB read per user every few minutes — NOT one per
+# request — and customers never have to re-login. Fails OPEN so a transient DB
+# blip never locks paying customers out.
+# ---------------------------------------------------------------------------
+_ACCESS_CACHE: dict[str, tuple[str, float]] = {}
+_ACCESS_TTL = 300.0  # seconds
+
+
+def invalidate_access_status(user_id: str) -> None:
+    """Drop a user's cached access_status so the next request re-reads the DB.
+    Called after the admin portal changes a status → the change takes effect on
+    the very next request instead of waiting out the cache TTL."""
+    if user_id:
+        _ACCESS_CACHE.pop(user_id, None)
+
+
+async def get_access_status(user_id: str) -> str:
+    """Return the user's access_status ('allowed' | 'pending' | 'denied'),
+    cached for a few minutes. Unknown users and any lookup error resolve to
+    'allowed' (fail OPEN) — availability beats strictness for a paywall."""
+    if not user_id:
+        return "allowed"
+    now = time.time()
+    hit = _ACCESS_CACHE.get(user_id)
+    if hit is not None and hit[1] > now:
+        return hit[0]
+    status = "allowed"
+    try:
+        async with get_connection() as db:
+            cur = await db.execute(
+                "SELECT access_status FROM public.users WHERE id = ?",
+                (user_id,),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+        if rows:
+            val = dict(rows[0]).get("access_status")
+            if val:
+                status = str(val)
+    except Exception:
+        _log.warning("access_status lookup failed for %s", user_id, exc_info=True)
+        status = "allowed"  # fail open
+    _ACCESS_CACHE[user_id] = (status, now + _ACCESS_TTL)
+    return status
+
+
 @dataclass(frozen=True)
 class Principal:
     """The authenticated actor for a request: a user bound to their tenant."""
