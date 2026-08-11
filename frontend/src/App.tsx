@@ -30,7 +30,6 @@ import {
   AlertTriangle,
   Building2,
   LayoutDashboard,
-  Menu,
   MessageSquare,
   MessageSquarePlus,
   Trash2,
@@ -95,11 +94,13 @@ const ITEMS: NavItem[] = [
 interface SidebarProps {
   active: NavKey
   onSelect: (key: NavKey) => void
-  /** Mobile drawer open state. Ignored at >=md (sidebar is always visible). */
+  /** Drawer open state (all screen sizes). */
   open: boolean
+  /** Toggle the drawer — wired to the header logo so clicking it closes. */
+  onToggle: () => void
 }
 
-function Sidebar({ active, onSelect, open }: SidebarProps) {
+function Sidebar({ active, onSelect, open, onToggle }: SidebarProps) {
   const sessions = useAppStore((s) => s.sessions)
   const viewingSessionId = useAppStore((s) => s.viewingSessionId)
   const refreshSessions = useAppStore((s) => s.refreshSessions)
@@ -128,20 +129,25 @@ function Sidebar({ active, onSelect, open }: SidebarProps) {
   return (
     <aside
       className={cn(
-        // Mobile: fixed slide-in overlay drawer.
-        'fixed inset-y-0 left-0 z-50 w-64 shrink-0 bg-zinc-950 flex flex-col min-h-0',
+        // Slide-in overlay drawer on ALL screen sizes — toggled by the logo.
+        'fixed inset-y-0 left-0 z-50 w-64 bg-zinc-950 flex flex-col min-h-0',
         'transform transition-transform duration-200 ease-in-out motion-reduce:transition-none',
-        // Desktop (>=md): static, always visible — byte-for-byte as before.
-        'md:static md:z-auto md:translate-x-0',
+        'shadow-2xl shadow-black/40',
         open ? 'translate-x-0' : '-translate-x-full',
       )}
     >
-      <div className="px-5 h-16 flex items-center gap-2 shrink-0">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-label="Close menu"
+        title="Close menu"
+        className="px-5 h-16 flex items-center gap-2 shrink-0 text-left hover:bg-zinc-800/30 transition-colors"
+      >
         <div className="w-7 h-7 rounded-md bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
           <Logo className="w-3.5 h-3.5 text-emerald-400" />
         </div>
         <div className="font-semibold tracking-tight">Metric AI</div>
-      </div>
+      </button>
 
       <nav className="p-3 space-y-1 shrink-0">
         {ITEMS.map((item) => {
@@ -241,21 +247,22 @@ function Sidebar({ active, onSelect, open }: SidebarProps) {
 // TopBar
 // ===========================================================================
 
-function TopBar({ onMenuClick }: { onMenuClick: () => void }) {
+function TopBar({ onToggleSidebar }: { onToggleSidebar: () => void }) {
   const shop = useAppStore((s) => s.shop)
   const dataset = useAppStore((s) => s.dataset)
 
   return (
     <header className="h-16 shrink-0 px-4 md:px-8 flex items-center justify-between bg-zinc-950/80 backdrop-blur supports-[backdrop-filter]:bg-zinc-950/60">
       <div className="flex items-center gap-2 min-w-0">
-        {/* Hamburger — opens the mobile drawer. Hidden at >=md. */}
+        {/* Logo toggles the sidebar drawer. Visible on all screen sizes. */}
         <button
           type="button"
-          onClick={onMenuClick}
-          aria-label="Open navigation menu"
-          className="md:hidden -ml-1 shrink-0 p-2 rounded-md text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/40 transition-colors"
+          onClick={onToggleSidebar}
+          aria-label="Toggle navigation menu"
+          title="Menu"
+          className="-ml-1 shrink-0 flex items-center justify-center w-9 h-9 rounded-md bg-emerald-500/10 border border-emerald-500/30 hover:bg-emerald-500/20 transition-colors"
         >
-          <Menu className="w-5 h-5" />
+          <Logo className="w-4 h-4 text-emerald-400" />
         </button>
         <div className="min-w-0">
           {shop.ownerName ? (
@@ -906,10 +913,10 @@ export default function App() {
           </button>
         </div>
       )}
-      {/* Mobile drawer backdrop — click to close. Hidden at >=md. */}
+      {/* Drawer backdrop — click anywhere to close. All screen sizes. */}
       {sidebarOpen && (
         <div
-          className="fixed inset-0 bg-black/50 z-40 md:hidden"
+          className="fixed inset-0 bg-black/50 z-40"
           onClick={() => setSidebarOpen(false)}
           aria-hidden="true"
         />
@@ -917,15 +924,15 @@ export default function App() {
       <Sidebar
         active={view}
         open={sidebarOpen}
+        onToggle={() => setSidebarOpen((v) => !v)}
         onSelect={(key) => {
           setView(key)
           // Close the drawer on any nav / New chat / recent-chat selection.
-          // No-op on desktop (drawer already closed).
           setSidebarOpen(false)
         }}
       />
       <main className="flex-1 flex flex-col min-w-0">
-        <TopBar onMenuClick={() => setSidebarOpen(true)} />
+        <TopBar onToggleSidebar={() => setSidebarOpen((v) => !v)} />
         <ErrorBoundary key={view} fallbackTitle={`${view} view crashed.`}>
           {view === 'ai' ? (
             <AiAssistant key="ai" />
