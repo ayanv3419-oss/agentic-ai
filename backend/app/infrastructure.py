@@ -128,6 +128,14 @@ class Settings(BaseSettings):
                                       alias="AUTH_TOKEN_SECRET")
     auth_token_ttl_hours: int = Field(default=168,   alias="AUTH_TOKEN_TTL_HOURS")
 
+    # --- Admin portal ---------------------------------------------------
+    # Shared secret for the owner-only admin portal (a SEPARATE static site).
+    # Admin API routes (/admin/*) require this exact value in the
+    # `X-Admin-Token` header. Empty (default) = admin API disabled: every
+    # /admin call is rejected, so a deploy that forgets to set it fails
+    # closed rather than exposing customer access-control to the world.
+    admin_portal_token:  str  = Field(default="", alias="ADMIN_PORTAL_TOKEN")
+
     # --- Server ---------------------------------------------------------
     host: str = Field(default="0.0.0.0", alias="HOST")
     port: int = Field(default=8000, alias="PORT")
@@ -574,9 +582,43 @@ CREATE TABLE IF NOT EXISTS users (
     id            TEXT PRIMARY KEY,
     email         TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
-    created_at    TEXT NOT NULL
+    created_at    TEXT NOT NULL,
+    access_status TEXT NOT NULL DEFAULT 'allowed',
+    admin_notes   TEXT
 )
 """
+
+# Additive columns for databases created before access-control existed (live
+# prod). Adding `access_status` with DEFAULT 'allowed' backfills every EXISTING
+# account to 'allowed' so nobody is locked out when enforcement later ships;
+# new signups explicitly set 'pending'. (col_name, column_declaration).
+_USERS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("access_status", "TEXT NOT NULL DEFAULT 'allowed'"),
+    ("admin_notes", "TEXT"),
+)
+
+
+async def _apply_users_migrations(db) -> None:
+    """Idempotently add the access-control columns to an existing users table.
+
+    Engine-aware so it never bricks startup: on Postgres uses
+    ``ADD COLUMN IF NOT EXISTS`` (no error, so it can't poison the init
+    transaction); on SQLite uses a plain ``ADD COLUMN`` and swallows the
+    "duplicate column" error that occurs when it's already applied.
+    """
+    from app.db_engine import is_postgres
+
+    pg = is_postgres()
+    for name, decl in _USERS_MIGRATION_COLUMNS:
+        stmt = (
+            f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {name} {decl}"
+            if pg
+            else f"ALTER TABLE users ADD COLUMN {name} {decl}"
+        )
+        try:
+            await db.execute(stmt)
+        except Exception:  # noqa: BLE001 - already-applied / migrations must not block startup
+            pass
 
 _TENANTS_DDL = """
 CREATE TABLE IF NOT EXISTS tenants (
@@ -964,6 +1006,7 @@ async def _init_database_postgres() -> None:
             await db.execute(stmt)
         # Identity / auth foundation — additive, all-TEXT, same DDL as SQLite.
         await db.execute(_USERS_DDL)
+        await _apply_users_migrations(db)
         await db.execute(_TENANTS_DDL)
         for stmt in _IDENTITY_INDEXES:
             await db.execute(stmt)
@@ -1130,6 +1173,7 @@ async def init_database() -> None:
             await db.execute(stmt)
         # Identity / auth foundation (multi-tenant slice 1) — idempotent.
         await db.execute(_USERS_DDL)
+        await _apply_users_migrations(db)
         await db.execute(_TENANTS_DDL)
         for stmt in _IDENTITY_INDEXES:
             await db.execute(stmt)

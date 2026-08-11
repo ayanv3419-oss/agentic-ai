@@ -22,7 +22,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import (
-    APIRouter, Depends, FastAPI, File, Form, Request, UploadFile,
+    APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile,
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -2290,8 +2290,93 @@ app = FastAPI(
 # Public routes that must NEVER require auth — load-balancer health probe,
 # the login endpoint itself, the session probe, and the FastAPI/MCP
 # discovery surface. Everything else is gated when AUTH_ENABLED=true.
+# ---------------------------------------------------------------------------
+# Admin portal API (owner-only). A SEPARATE static admin site flips customer
+# access via these routes. Guarded by the ADMIN_PORTAL_TOKEN secret in the
+# `X-Admin-Token` header — NOT the customer Bearer auth (so "/admin" is in
+# _AUTH_PUBLIC_PREFIXES below). Reads/writes `public.users` across all tenants:
+# the one legitimate cross-tenant surface, reachable only by the token holder.
+# Fails CLOSED when the token is unset.
+# ---------------------------------------------------------------------------
+_VALID_ACCESS_STATUS = frozenset({"pending", "allowed", "denied"})
+
+
+def _require_admin(request: Request) -> None:
+    """Reject unless the request carries the exact admin portal token.
+
+    Constant-time compare; fails closed when ADMIN_PORTAL_TOKEN is unset so a
+    misconfigured deploy never exposes access-control to the public.
+    """
+    import hmac as _hmac
+
+    configured = (settings.admin_portal_token or "").strip()
+    supplied = (request.headers.get("X-Admin-Token") or "").strip()
+    if not configured or not supplied or not _hmac.compare_digest(configured, supplied):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+class AdminStatusBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    status: str = Field(default="", max_length=16)
+
+
+class AdminNotesBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    admin_notes: str | None = Field(default=None, max_length=2000)
+
+
+@api_router.get("/admin/users")
+async def admin_list_users(request: Request):
+    """List every account for the admin portal (owner-only)."""
+    _require_admin(request)
+    from app.infrastructure import get_connection
+
+    async with get_connection() as db:
+        cur = await db.execute(
+            "SELECT id, email, access_status, admin_notes, created_at "
+            "FROM public.users ORDER BY created_at DESC"
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+    return {"users": [dict(r) for r in rows]}
+
+
+@api_router.post("/admin/users/{user_id}/status")
+async def admin_set_status(user_id: str, body: AdminStatusBody, request: Request):
+    """Set a customer's access_status to pending / allowed / denied."""
+    _require_admin(request)
+    new_status = (body.status or "").strip().lower()
+    if new_status not in _VALID_ACCESS_STATUS:
+        raise HTTPException(status_code=400, detail="invalid status")
+    from app.infrastructure import get_connection
+
+    async with get_connection() as db:
+        await db.execute(
+            "UPDATE public.users SET access_status = ? WHERE id = ?",
+            (new_status, user_id),
+        )
+        await db.commit()
+    return {"ok": True, "id": user_id, "access_status": new_status}
+
+
+@api_router.post("/admin/users/{user_id}/notes")
+async def admin_set_notes(user_id: str, body: AdminNotesBody, request: Request):
+    """Update the owner's free-text notes for a customer."""
+    _require_admin(request)
+    from app.infrastructure import get_connection
+
+    async with get_connection() as db:
+        await db.execute(
+            "UPDATE public.users SET admin_notes = ? WHERE id = ?",
+            (body.admin_notes, user_id),
+        )
+        await db.commit()
+    return {"ok": True}
+
+
 _AUTH_PUBLIC_PREFIXES = (
     "/health",
+    "/admin",
     "/auth/login",
     "/auth/signup",
     "/auth/me",

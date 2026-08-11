@@ -157,9 +157,10 @@ async def signup(email: str, password: str) -> Principal:
 
         try:
             await db.execute(
-                "INSERT INTO users (id, email, password_hash, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (user_id, norm, password_hash, created_at),
+                "INSERT INTO users "
+                "(id, email, password_hash, created_at, access_status) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, norm, password_hash, created_at, "pending"),
             )
         except Exception as _e:
             # Catch unique-constraint violation (concurrent duplicate signup)

@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<meta name="robots" content="noindex, nofollow" />
+<title>MetricAI — Admin</title>
+<style>
+  :root {
+    --bg: #0a1018;
+    --bg-elev: #111a24;
+    --bg-card: #0f1720;
+    --border: #1f2b38;
+    --border-strong: #2b3a4a;
+    --text: #f1f5f9;
+    --text-dim: #94a3b8;
+    --text-faint: #64748b;
+    --accent: #10b981;
+    --accent-dim: #0f3d30;
+    --green: #10b981;
+    --green-bg: #08301f;
+    --amber: #f59e0b;
+    --amber-bg: #3a2a06;
+    --red: #ef4444;
+    --red-bg: #3a1114;
+    --focus: #34d399;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+
+  .wrap {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 16px 16px 64px;
+  }
+
+  /* ---- Header ---- */
+  header.top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 8px 0 16px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 1.15rem;
+    font-weight: 700;
+    letter-spacing: 0.2px;
+  }
+  .sigma {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    background: var(--accent-dim);
+    color: var(--accent);
+    font-size: 1.25rem;
+    font-weight: 800;
+    line-height: 1;
+    border: 1px solid #14503f;
+  }
+  .brand .muted { color: var(--text-dim); font-weight: 500; }
+
+  /* ---- Buttons (base) ---- */
+  button {
+    font-family: inherit;
+    font-size: 0.9rem;
+    cursor: pointer;
+    border-radius: 9px;
+    border: 1px solid var(--border-strong);
+    background: var(--bg-elev);
+    color: var(--text);
+    min-height: 42px;
+    padding: 0 14px;
+    transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
+  }
+  button:hover:not(:disabled) { background: #17222e; }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled { cursor: default; }
+
+  :focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+  }
+
+  .btn-refresh {
+    background: var(--accent-dim);
+    border-color: #14503f;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .btn-refresh:hover:not(:disabled) { background: #114536; }
+
+  /* ---- Summary counts ---- */
+  .summary {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .stat {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px 10px;
+    text-align: center;
+  }
+  .stat .num { font-size: 1.5rem; font-weight: 800; line-height: 1.1; }
+  .stat .lbl {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+  .stat.total .num { color: var(--text); }
+  .stat.allowed .num { color: var(--green); }
+  .stat.pending .num { color: var(--amber); }
+  .stat.denied  .num { color: var(--red); }
+
+  /* ---- Search ---- */
+  .toolbar {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 16px;
+    align-items: center;
+  }
+  .search-wrap { position: relative; flex: 1; }
+  input[type="search"], input.note {
+    width: 100%;
+    font-family: inherit;
+    font-size: 0.95rem;
+    color: var(--text);
+    background: var(--bg-card);
+    border: 1px solid var(--border-strong);
+    border-radius: 9px;
+    padding: 10px 12px;
+    min-height: 42px;
+  }
+  input::placeholder { color: var(--text-faint); }
+
+  /* ---- Status line ---- */
+  .status-line {
+    min-height: 20px;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    margin: -4px 0 12px;
+  }
+  .status-line.err { color: var(--red); }
+
+  /* ---- User cards ---- */
+  .list { display: flex; flex-direction: column; gap: 12px; }
+
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 14px;
+  }
+  .card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .email { font-weight: 700; font-size: 1rem; word-break: break-all; }
+  .meta { color: var(--text-faint); font-size: 0.78rem; margin-top: 2px; }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .pill::before {
+    content: "";
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .pill.allowed { color: var(--green); background: var(--green-bg); }
+  .pill.pending { color: var(--amber); background: var(--amber-bg); }
+  .pill.denied  { color: var(--red);   background: var(--red-bg); }
+
+  /* action buttons row */
+  .actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+    flex-wrap: wrap;
+  }
+  .actions button { flex: 1; min-width: 92px; font-weight: 600; }
+
+  .btn-allow.active  { background: var(--green-bg); border-color: #17614a; color: var(--green); }
+  .btn-deny.active   { background: var(--red-bg);   border-color: #6b2126; color: var(--red); }
+  .btn-pending.active{ background: var(--amber-bg); border-color: #6b4f10; color: var(--amber); }
+  .actions button.active { cursor: default; }
+
+  .btn-allow:hover:not(.active):not(:disabled)  { border-color: #17614a; color: var(--green); }
+  .btn-deny:hover:not(.active):not(:disabled)   { border-color: #6b2126; color: var(--red); }
+  .btn-pending:hover:not(.active):not(:disabled){ border-color: #6b4f10; color: var(--amber); }
+
+  /* notes */
+  .notes-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+    align-items: center;
+  }
+  .notes-row input.note { flex: 1; }
+  .btn-note { white-space: nowrap; }
+
+  .card-err {
+    color: var(--red);
+    font-size: 0.82rem;
+    margin-top: 10px;
+    min-height: 0;
+  }
+  .card-note-ok { color: var(--green); font-size: 0.82rem; margin-top: 8px; }
+
+  /* ---- Empty / full-page states ---- */
+  .empty, .loading {
+    text-align: center;
+    color: var(--text-dim);
+    padding: 48px 16px;
+    border: 1px dashed var(--border-strong);
+    border-radius: 14px;
+    background: var(--bg-card);
+  }
+
+  .fullpage {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .fullpage .box {
+    max-width: 440px;
+    text-align: center;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 32px 24px;
+  }
+  .fullpage .sigma { margin: 0 auto 16px; width: 44px; height: 44px; font-size: 1.6rem; }
+  .fullpage h1 { font-size: 1.1rem; margin: 0 0 10px; }
+  .fullpage p { color: var(--text-dim); font-size: 0.92rem; margin: 0; word-break: break-word; }
+  .fullpage code {
+    background: var(--bg-elev);
+    padding: 2px 6px;
+    border-radius: 5px;
+    color: var(--accent);
+    font-size: 0.85em;
+  }
+
+  .spinner {
+    display: inline-block;
+    width: 18px; height: 18px;
+    border: 2px solid var(--border-strong);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    vertical-align: -3px;
+    margin-right: 8px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .hidden { display: none !important; }
+
+  @media (max-width: 520px) {
+    .summary { grid-template-columns: repeat(2, 1fr); }
+    .actions button { min-width: 0; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Full-page gate messages (hidden by default) -->
+<div id="gate" class="fullpage hidden">
+  <div class="box">
+    <div class="sigma">&Sigma;</div>
+    <h1 id="gate-title">No admin key</h1>
+    <p id="gate-msg"></p>
+  </div>
+</div>
+
+<!-- Main app -->
+<div id="app" class="wrap hidden">
+  <header class="top">
+    <div class="brand">
+      <span class="sigma" aria-hidden="true">&Sigma;</span>
+      <span>MetricAI <span class="muted">— Admin</span></span>
+    </div>
+    <button type="button" id="refreshBtn" class="btn-refresh" aria-label="Refresh customer list">Refresh</button>
+  </header>
+
+  <section class="summary" aria-label="Access summary">
+    <div class="stat total">   <div class="num" id="cTotal">0</div>  <div class="lbl">Total</div></div>
+    <div class="stat allowed"> <div class="num" id="cAllowed">0</div><div class="lbl">Allowed</div></div>
+    <div class="stat pending"> <div class="num" id="cPending">0</div><div class="lbl">Pending</div></div>
+    <div class="stat denied">  <div class="num" id="cDenied">0</div> <div class="lbl">Denied</div></div>
+  </section>
+
+  <div class="toolbar">
+    <div class="search-wrap">
+      <label for="search" class="hidden">Search by email</label>
+      <input type="search" id="search" placeholder="Search by email…" autocomplete="off" aria-label="Search customers by email" />
+    </div>
+  </div>
+
+  <div class="status-line" id="statusLine" role="status" aria-live="polite"></div>
+
+  <div class="list" id="list"></div>
+</div>
+
+<script>
+"use strict";
+
+// ---- Config ----
+const API_BASE = "https://agentic-ai-anet.onrender.com";
+const KEY_STORAGE = "metricai_admin_key";
+
+// ---- State ----
+let ADMIN_KEY = null;
+let USERS = [];
+let filterText = "";
+
+// ---- Elements ----
+const $ = (id) => document.getElementById(id);
+const gateEl = $("gate");
+const appEl = $("app");
+const listEl = $("list");
+const statusLineEl = $("statusLine");
+
+// ---- Key handling ----
+function readKeyFromUrl() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const k = params.get("k");
+    if (k) {
+      localStorage.setItem(KEY_STORAGE, k);
+      // Strip the key from the visible URL.
+      params.delete("k");
+      const qs = params.toString();
+      const clean = window.location.pathname + (qs ? "?" + qs : "") + window.location.hash;
+      history.replaceState(null, "", clean);
+      return k;
+    }
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+function loadKey() {
+  const fromUrl = readKeyFromUrl();
+  if (fromUrl) return fromUrl;
+  try {
+    return localStorage.getItem(KEY_STORAGE);
+  } catch (e) {
+    return null;
+  }
+}
+
+function clearKey() {
+  try { localStorage.removeItem(KEY_STORAGE); } catch (e) { /* ignore */ }
+  ADMIN_KEY = null;
+}
+
+// ---- Full-page gate ----
+function showGate(title, msgHtml) {
+  $("gate-title").textContent = title;
+  $("gate-msg").innerHTML = msgHtml;
+  appEl.classList.add("hidden");
+  gateEl.classList.remove("hidden");
+}
+
+// ---- API helpers ----
+class AuthError extends Error {}
+
+async function apiFetch(path, options = {}) {
+  const opts = Object.assign({}, options);
+  opts.headers = Object.assign({}, options.headers, { "X-Admin-Token": ADMIN_KEY });
+  if (opts.method === "POST") {
+    opts.headers["Content-Type"] = "application/json";
+  }
+  const res = await fetch(API_BASE + path, opts);
+  if (res.status === 401 || res.status === 403) {
+    throw new AuthError("unauthorized");
+  }
+  if (!res.ok) {
+    let detail = "HTTP " + res.status;
+    try {
+      const body = await res.json();
+      if (body && (body.detail || body.error || body.message)) {
+        detail = body.detail || body.error || body.message;
+      }
+    } catch (e) { /* non-json body */ }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+function handleAuthFailure() {
+  clearKey();
+  showGate(
+    "Invalid admin key",
+    "Invalid or missing admin key — check the <code>?k=</code> value.<br><br>" +
+    "Reopen this page with <code>?k=YOUR_KEY</code> appended to the URL."
+  );
+}
+
+// ---- Rendering ----
+function setStatus(text, isError) {
+  statusLineEl.textContent = text || "";
+  statusLineEl.classList.toggle("err", !!isError);
+}
+
+function setLoadingStatus(loading) {
+  if (loading) {
+    statusLineEl.innerHTML = '<span class="spinner" aria-hidden="true"></span>Loading customers…';
+    statusLineEl.classList.remove("err");
+  }
+}
+
+function formatDate(raw) {
+  if (!raw) return "";
+  const d = new Date(raw);
+  if (isNaN(d.getTime())) return String(raw);
+  try {
+    return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  } catch (e) {
+    return d.toDateString();
+  }
+}
+
+function updateCounts() {
+  let allowed = 0, pending = 0, denied = 0;
+  for (const u of USERS) {
+    if (u.access_status === "allowed") allowed++;
+    else if (u.access_status === "pending") pending++;
+    else if (u.access_status === "denied") denied++;
+  }
+  $("cTotal").textContent = USERS.length;
+  $("cAllowed").textContent = allowed;
+  $("cPending").textContent = pending;
+  $("cDenied").textContent = denied;
+}
+
+// Escape text destined for attribute/text where we build innerHTML.
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+const STATUSES = ["allowed", "denied", "pending"];
+
+function statusLabel(s) {
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : "Unknown";
+}
+
+function renderList() {
+  const term = filterText.trim().toLowerCase();
+  const visible = term
+    ? USERS.filter((u) => (u.email || "").toLowerCase().includes(term))
+    : USERS.slice();
+
+  listEl.innerHTML = "";
+
+  if (USERS.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "No customers yet.";
+    listEl.appendChild(empty);
+    return;
+  }
+
+  if (visible.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "No customers match “" + term + "”.";
+    listEl.appendChild(empty);
+    return;
+  }
+
+  for (const u of visible) {
+    listEl.appendChild(renderCard(u));
+  }
+}
+
+function renderCard(u) {
+  const status = u.access_status || "pending";
+  const card = document.createElement("div");
+  card.className = "card";
+  card.dataset.id = u.id;
+
+  const notesVal = u.admin_notes == null ? "" : u.admin_notes;
+
+  card.innerHTML =
+    '<div class="card-head">' +
+      '<div>' +
+        '<div class="email">' + esc(u.email) + '</div>' +
+        '<div class="meta">Joined ' + esc(formatDate(u.created_at)) + '</div>' +
+      '</div>' +
+      '<span class="pill ' + esc(status) + '">' + esc(statusLabel(status)) + '</span>' +
+    '</div>' +
+    '<div class="actions" role="group" aria-label="Set access for ' + esc(u.email) + '">' +
+      '<button type="button" class="btn-allow"   data-status="allowed">Allow</button>' +
+      '<button type="button" class="btn-deny"    data-status="denied">Deny</button>' +
+      '<button type="button" class="btn-pending" data-status="pending">Pending</button>' +
+    '</div>' +
+    '<div class="notes-row">' +
+      '<label class="hidden" for="note-' + esc(u.id) + '">Notes for ' + esc(u.email) + '</label>' +
+      '<input class="note" id="note-' + esc(u.id) + '" type="text" value="' + esc(notesVal) + '" ' +
+        'placeholder="Plan, amount paid, renewal…" aria-label="Admin notes for ' + esc(u.email) + '" />' +
+      '<button type="button" class="btn-note">Save note</button>' +
+    '</div>' +
+    '<div class="card-err" role="alert"></div>';
+
+  // Mark active status button
+  card.querySelectorAll(".actions button").forEach((btn) => {
+    if (btn.dataset.status === status) {
+      btn.classList.add("active");
+      btn.disabled = true;
+      btn.setAttribute("aria-pressed", "true");
+    } else {
+      btn.setAttribute("aria-pressed", "false");
+    }
+    btn.addEventListener("click", () => onStatusClick(u.id, btn.dataset.status, card));
+  });
+
+  card.querySelector(".btn-note").addEventListener("click", () => {
+    const input = card.querySelector(".note");
+    onSaveNote(u.id, input.value, card);
+  });
+
+  return card;
+}
+
+function cardError(card, msg) {
+  const el = card.querySelector(".card-err");
+  el.textContent = msg || "";
+}
+
+function cardNoteOk(card) {
+  const errEl = card.querySelector(".card-err");
+  errEl.textContent = "Saved.";
+  errEl.style.color = "var(--green)";
+  setTimeout(() => {
+    if (errEl.textContent === "Saved.") { errEl.textContent = ""; errEl.style.color = ""; }
+  }, 2000);
+}
+
+// ---- Actions ----
+async function onStatusClick(id, status, card) {
+  cardError(card, "");
+  const buttons = card.querySelectorAll(".actions button");
+  buttons.forEach((b) => (b.disabled = true));
+  try {
+    await apiFetch("/admin/users/" + encodeURIComponent(id) + "/status", {
+      method: "POST",
+      body: JSON.stringify({ status: status }),
+    });
+    // Optimistic update
+    const u = USERS.find((x) => x.id === id);
+    if (u) u.access_status = status;
+    updateCounts();
+    // Re-fetch to stay authoritative
+    await loadUsers({ silent: true });
+  } catch (e) {
+    if (e instanceof AuthError) { handleAuthFailure(); return; }
+    cardError(card, "Could not update: " + e.message);
+    buttons.forEach((b) => (b.disabled = false));
+    // Restore active-disabled state for current status
+    const u = USERS.find((x) => x.id === id);
+    if (u) {
+      card.querySelectorAll(".actions button").forEach((b) => {
+        b.disabled = b.dataset.status === u.access_status;
+      });
+    }
+  }
+}
+
+async function onSaveNote(id, value, card) {
+  cardError(card, "");
+  const noteBtn = card.querySelector(".btn-note");
+  const input = card.querySelector(".note");
+  noteBtn.disabled = true;
+  const prevLabel = noteBtn.textContent;
+  noteBtn.textContent = "Saving…";
+  try {
+    await apiFetch("/admin/users/" + encodeURIComponent(id) + "/notes", {
+      method: "POST",
+      body: JSON.stringify({ admin_notes: value }),
+    });
+    const u = USERS.find((x) => x.id === id);
+    if (u) u.admin_notes = value;
+    cardNoteOk(card);
+  } catch (e) {
+    if (e instanceof AuthError) { handleAuthFailure(); return; }
+    cardError(card, "Could not save note: " + e.message);
+  } finally {
+    noteBtn.disabled = false;
+    noteBtn.textContent = prevLabel;
+    if (input) input.blur();
+  }
+}
+
+// ---- Load ----
+async function loadUsers(opts = {}) {
+  const silent = !!opts.silent;
+  const refreshBtn = $("refreshBtn");
+  if (!silent) {
+    setLoadingStatus(true);
+    refreshBtn.disabled = true;
+  }
+  try {
+    const data = await apiFetch("/admin/users", { method: "GET" });
+    USERS = (data && Array.isArray(data.users)) ? data.users : [];
+    updateCounts();
+    renderList();
+    if (!silent) {
+      const now = new Date();
+      let t;
+      try { t = now.toLocaleTimeString(); } catch (e) { t = now.toTimeString(); }
+      setStatus("Loaded " + USERS.length + " customer" + (USERS.length === 1 ? "" : "s") + " · " + t, false);
+    }
+  } catch (e) {
+    if (e instanceof AuthError) { handleAuthFailure(); return; }
+    setStatus("Failed to load: " + e.message, true);
+  } finally {
+    if (!silent) refreshBtn.disabled = false;
+  }
+}
+
+// ---- Init ----
+function init() {
+  ADMIN_KEY = loadKey();
+
+  if (!ADMIN_KEY) {
+    showGate(
+      "No admin key",
+      "Open this page with <code>?k=YOUR_KEY</code> appended to the URL."
+    );
+    return;
+  }
+
+  appEl.classList.remove("hidden");
+
+  $("refreshBtn").addEventListener("click", () => loadUsers());
+
+  const searchEl = $("search");
+  searchEl.addEventListener("input", (e) => {
+    filterText = e.target.value;
+    renderList();
+  });
+
+  loadUsers();
+}
+
+init();
+</script>
+</body>
+</html>
