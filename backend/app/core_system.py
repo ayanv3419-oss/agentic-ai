@@ -2383,6 +2383,76 @@ async def admin_set_notes(user_id: str, body: AdminNotesBody, request: Request):
     return {"ok": True}
 
 
+@api_router.delete("/admin/users/{user_id}")
+async def admin_delete_user(user_id: str, request: Request):
+    """PERMANENTLY delete a customer: their account, tenant, chat history,
+    upload records, and their entire per-tenant data schema.
+
+    Irreversible. The portal requires an explicit typed confirmation before
+    calling this. Cleanup is best-effort per step so a partial failure still
+    removes the account (the thing the owner actually asked for) rather than
+    leaving a half-deleted row behind.
+    """
+    _require_admin(request)
+    from app.infrastructure import get_connection
+
+    # Resolve the account + its tenant first — after deletion we can't.
+    async with get_connection() as db:
+        cur = await db.execute(
+            "SELECT id, email FROM public.users WHERE id = ?", (user_id,)
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        if not rows:
+            raise HTTPException(status_code=404, detail="user not found")
+        email = dict(rows[0]).get("email") or ""
+
+        cur = await db.execute(
+            "SELECT id FROM public.tenants WHERE owner_user_id = ?", (user_id,)
+        )
+        trows = await cur.fetchall()
+        await cur.close()
+        tenant_id = dict(trows[0])["id"] if trows else None
+
+        # Tenant-scoped rows in shared public tables. Each guarded: a table
+        # that doesn't exist on this deployment must not abort the delete.
+        if tenant_id:
+            for stmt in (
+                "DELETE FROM public.conversation_messages WHERE tenant_id = ?",
+                "DELETE FROM public.conversations WHERE tenant_id = ?",
+                "DELETE FROM public.uploads WHERE tenant_id = ?",
+                "DELETE FROM public.drive_tokens WHERE tenant_id = ?",
+            ):
+                try:
+                    await db.execute(stmt, (tenant_id,))
+                except Exception:  # noqa: BLE001 - best effort cleanup
+                    log.warning("admin delete: cleanup failed: %s", stmt, exc_info=True)
+
+        await db.execute("DELETE FROM public.tenants WHERE owner_user_id = ?", (user_id,))
+        await db.execute("DELETE FROM public.users WHERE id = ?", (user_id,))
+        await db.commit()
+
+    # Drop the tenant's own Postgres schema (all their u_* data tables).
+    if tenant_id:
+        try:
+            from app.db_engine import get_pool, is_postgres, tenant_schema
+
+            if is_postgres():
+                schema = tenant_schema(tenant_id)
+                if schema and schema != "public":
+                    pool = await get_pool()
+                    async with pool.acquire() as conn:
+                        await conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        except Exception:  # noqa: BLE001 - account is already gone; log only
+            log.warning("admin delete: schema drop failed for tenant %s",
+                        tenant_id, exc_info=True)
+
+    from app import identity
+    identity.invalidate_access_status(user_id)
+    log.info("admin deleted account %r (tenant=%r)", email[:60], tenant_id)
+    return {"ok": True, "id": user_id, "email": email}
+
+
 _AUTH_PUBLIC_PREFIXES = (
     "/health",
     "/admin",
