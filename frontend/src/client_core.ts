@@ -419,7 +419,25 @@ async function readErrorBody(res: Response): Promise<unknown> {
 // re-renders immediately (it watches auth.token). Shared by handle() and
 // streamQuery so both backend entry points trigger the gate without waiting
 // for the next manual action.
-function handleUnauthorized(status: number): void {
+// Access-blocked (paywall) notification. The backend answers 403 with
+// { kind: 'access', access_status } when enforcement blocks a request. Rather
+// than surfacing that as a raw error in whatever view made the call, we notify
+// the shell so it can swap straight to the payment / pending screen.
+type AccessBlockedListener = (accessStatus: string) => void
+let accessBlockedListener: AccessBlockedListener | null = null
+
+export function onAccessBlocked(cb: AccessBlockedListener | null): void {
+  accessBlockedListener = cb
+}
+
+function handleUnauthorized(status: number, detail?: unknown): void {
+  if (status === 403) {
+    const d = detail as { kind?: string; access_status?: string } | undefined
+    if (d && d.kind === 'access') {
+      try { accessBlockedListener?.(d.access_status || 'denied') } catch { /* never break the caller */ }
+    }
+    return
+  }
   if (status !== 401) return
   try { useAppStore.getState().setAuthToken(null, null) } catch { /* store may not be ready */ }
 }
@@ -430,7 +448,7 @@ async function handle<T>(res: Response, label: string): Promise<T> {
     // eslint-disable-next-line no-console
     console.error(`[api] ${label} → HTTP ${res.status}`, detail)
     // Fix 2: clear stored auth token on 401 so LoginGate reappears
-    handleUnauthorized(res.status)
+    handleUnauthorized(res.status, detail)
     throw new ApiError(errorMessage(label, res.status, detail), res.status, detail)
   }
   return (await res.json()) as T
@@ -537,8 +555,9 @@ export async function streamQuery(
     // eslint-disable-next-line no-console
     console.error(`[api] POST /query_stream → HTTP ${res.status}`, detail)
     // Clear the token on 401 so the LoginGate re-renders immediately, matching
-    // handle()'s behaviour for the non-streaming endpoints.
-    handleUnauthorized(res.status)
+    // handle()'s behaviour for the non-streaming endpoints. A 403 access block
+    // notifies the shell so the payment screen replaces the chat error.
+    handleUnauthorized(res.status, detail)
     throw new ApiError(
       errorMessage('POST /query_stream', res.status, detail),
       res.status,

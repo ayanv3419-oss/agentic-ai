@@ -40,6 +40,7 @@ import {
   clearAuth,
   cn,
   fetchAuthMe,
+  onAccessBlocked,
   fetchUploadsList,
   forgotPassword,
   loginWith,
@@ -874,6 +875,16 @@ function AccessBlocked({ status, email }: { status: string; email?: string }) {
           </>
         )}
 
+        {pending && (
+          <div className="mt-5 rounded-xl border border-zinc-800 bg-zinc-950/40 p-4 text-center">
+            <p className="text-xs text-zinc-400 leading-relaxed">
+              Need it activated now? Call or WhatsApp{' '}
+              <a href={`tel:${PAY_PHONE}`} className="text-emerald-400 font-medium">{PAY_PHONE}</a>
+              {email ? <> and mention <span className="font-mono text-zinc-300 break-all">{email}</span></> : null}.
+            </p>
+          </div>
+        )}
+
         <button type="button" onClick={() => clearAuth()} className="btn btn-secondary w-full justify-center mt-5">
           Sign out
         </button>
@@ -931,7 +942,13 @@ export default function App() {
     }
     void check()
     const id = window.setInterval(check, 120000)
-    return () => { alive = false; window.clearInterval(id) }
+    // Instant reaction: if ANY request comes back access-blocked, swap to the
+    // payment screen immediately rather than surfacing a raw error in whatever
+    // view made the call (and without waiting for the next poll).
+    onAccessBlocked((status) => {
+      if (alive) setAccess((prev) => ({ ...(prev || {}), status, enforced: true }))
+    })
+    return () => { alive = false; window.clearInterval(id); onAccessBlocked(null) }
   }, [authToken])
 
   // Capture a ?reset_token=… password-reset deep link on first mount, then
