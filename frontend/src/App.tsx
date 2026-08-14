@@ -994,6 +994,14 @@ export default function App() {
       .catch(() => { /* backend not ready yet — keep whatever localStorage has */ })
   }, [authToken])
 
+  // Owner preview: ?preview=expired|denied|pending renders the corresponding
+  // access screen without any account state or enforcement. Pure UI — reads no
+  // data and changes nothing — so it's safe to open (and handy for demos).
+  const previewMode = new URLSearchParams(window.location.search).get('preview')
+  if (previewMode && ['expired', 'denied', 'pending'].includes(previewMode)) {
+    return <AccessBlocked status={previewMode} email="shop.owner@example.com" />
+  }
+
   // Password-reset deep link takes precedence over every gate: the user
   // arrived from an email link, is unauthenticated, and may be on an
   // AUTH_ENABLED=false deployment. Render the reset view until they finish (or
