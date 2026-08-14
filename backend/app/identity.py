@@ -39,7 +39,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import bcrypt
@@ -65,6 +65,7 @@ _MIN_PASSWORD_LEN = 6
 # ---------------------------------------------------------------------------
 _ACCESS_CACHE: dict[str, tuple[str, float]] = {}
 _ACCESS_TTL = 300.0  # seconds
+TRIAL_DAYS = 7  # free-trial length granted to new signups
 
 
 def invalidate_access_status(user_id: str) -> None:
@@ -75,10 +76,30 @@ def invalidate_access_status(user_id: str) -> None:
         _ACCESS_CACHE.pop(user_id, None)
 
 
+def _effective_status(raw: str | None, trial_ends_at: str | None) -> str:
+    """Collapse the stored access_status (+ trial clock) into the EFFECTIVE gate
+    state the middleware acts on: 'allowed' | 'expired' | 'denied' | 'pending'.
+
+    A 'trial' account is 'allowed' until trial_ends_at, then 'expired' (→ the
+    payment screen). Anything unparseable fails OPEN (stays 'allowed') so our
+    own bug never locks a trial user out. Non-trial statuses pass through."""
+    status = (raw or "allowed").strip().lower()
+    if status != "trial":
+        return status
+    if not trial_ends_at:
+        return "allowed"
+    try:
+        if datetime.fromisoformat(trial_ends_at) > datetime.now(timezone.utc):
+            return "allowed"
+    except Exception:
+        return "allowed"  # unparseable date → don't punish a trial user
+    return "expired"
+
+
 async def get_access_status(user_id: str) -> str:
-    """Return the user's access_status ('allowed' | 'pending' | 'denied'),
-    cached for a few minutes. Unknown users and any lookup error resolve to
-    'allowed' (fail OPEN) — availability beats strictness for a paywall."""
+    """Return the EFFECTIVE access state ('allowed' | 'expired' | 'denied' |
+    'pending'), cached for a few minutes. Unknown users and any lookup error
+    resolve to 'allowed' (fail OPEN) — availability beats strictness."""
     if not user_id:
         return "allowed"
     now = time.time()
@@ -89,15 +110,14 @@ async def get_access_status(user_id: str) -> str:
     try:
         async with get_connection() as db:
             cur = await db.execute(
-                "SELECT access_status FROM public.users WHERE id = ?",
+                "SELECT access_status, trial_ends_at FROM public.users WHERE id = ?",
                 (user_id,),
             )
             rows = await cur.fetchall()
             await cur.close()
         if rows:
-            val = dict(rows[0]).get("access_status")
-            if val:
-                status = str(val)
+            r = dict(rows[0])
+            status = _effective_status(r.get("access_status"), r.get("trial_ends_at"))
     except Exception:
         _log.warning("access_status lookup failed for %s", user_id, exc_info=True)
         status = "allowed"  # fail open
@@ -184,6 +204,9 @@ async def signup(email: str, password: str) -> Principal:
 
     user_id = uuid.uuid4().hex
     created_at = _now_iso()
+    # 7-day free trial (Phase 3): new signups get full access until this moment,
+    # after which enforcement flips them to 'expired' → the payment screen.
+    trial_ends_at = (datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)).isoformat(timespec="seconds")
     password_hash = _hash_password(password)
     # Tenant display name defaults to the email's local-part ("ada" of
     # "ada@example.com"); falls back to the full normalized email if there's
@@ -206,9 +229,9 @@ async def signup(email: str, password: str) -> Principal:
         try:
             await db.execute(
                 "INSERT INTO users "
-                "(id, email, password_hash, created_at, access_status) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (user_id, norm, password_hash, created_at, "pending"),
+                "(id, email, password_hash, created_at, access_status, trial_ends_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, norm, password_hash, created_at, "trial", trial_ends_at),
             )
         except Exception as _e:
             # Catch unique-constraint violation (concurrent duplicate signup)

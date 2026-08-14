@@ -51,6 +51,7 @@ import {
 import type { NavKey } from '@/client_core'
 import { AiAssistant, Dashboard, ShopInfo, UploadData } from '@/ui_system'
 import { Logo } from '@/logo'
+import { UPI_QR_DATA_URI } from '@/upi_qr'
 import { SplashScreen } from '@/splash'
 
 // ===========================================================================
@@ -771,25 +772,109 @@ function AuthProbePending() {
   )
 }
 
-// Full-page screen shown when access enforcement is on and this account is
-// not 'allowed'. PENDING = waiting for approval; DENIED = subscription lapsed.
-function AccessBlocked({ status }: { status: string }) {
-  const denied = status === 'denied'
+// ---------------------------------------------------------------------------
+// Payment / access-blocked screen
+// ---------------------------------------------------------------------------
+// Shown full-page when enforcement is on and this account isn't 'allowed':
+//   expired → 7-day trial over, show payment instructions
+//   denied  → subscription lapsed, show payment instructions
+//   pending → awaiting manual approval (no payment ask)
+const PAY_UPI_ID = '9023505664@fam'
+const PAY_PHONE = '9023505664'
+const PAY_AMOUNT = 1500
+const PAY_LINK =
+  `upi://pay?pa=${encodeURIComponent(PAY_UPI_ID)}&pn=${encodeURIComponent('MetricAI')}` +
+  `&am=${PAY_AMOUNT}&cu=INR&tn=${encodeURIComponent('MetricAI subscription')}`
+
+function AccessBlocked({ status, email }: { status: string; email?: string }) {
+  const [copied, setCopied] = useState(false)
+  const pending = status === 'pending'
+  const expired = status === 'expired'
+
+  const copyUpi = () => {
+    void navigator.clipboard?.writeText(PAY_UPI_ID).then(
+      () => { setCopied(true); window.setTimeout(() => setCopied(false), 1800) },
+      () => {},
+    )
+  }
+
   return (
-    <div className="h-screen w-screen flex items-center justify-center bg-zinc-950 text-zinc-100 p-6">
-      <div className="max-w-md w-full text-center rounded-2xl border border-zinc-800 bg-zinc-900/60 p-8 shadow-xl">
-        <div className="mx-auto mb-5 w-14 h-14 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
-          <Logo className="w-6 h-6 text-emerald-400" />
+    <div className="min-h-screen w-screen overflow-y-auto flex items-center justify-center bg-zinc-950 text-zinc-100 p-4 sm:p-6">
+      <div className="max-w-md w-full rounded-2xl border border-zinc-800 bg-zinc-900/60 p-6 sm:p-8 shadow-xl">
+        <div className="text-center">
+          <div className="mx-auto mb-5 w-14 h-14 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
+            <Logo className="w-6 h-6 text-emerald-400" />
+          </div>
+          <h1 className="text-lg font-semibold tracking-tight">
+            {pending ? 'Account being set up' : expired ? 'Your free trial has ended' : 'Subscription inactive'}
+          </h1>
+          <p className="mt-2 text-sm text-zinc-400 leading-relaxed">
+            {pending
+              ? 'Your MetricAI account is being activated — you’ll have access shortly.'
+              : expired
+                ? 'Your 7-day free trial is over. Continue using MetricAI for ₹1,500/month.'
+                : 'Your MetricAI subscription is inactive. Pay ₹1,500 to restore access.'}
+          </p>
         </div>
-        <h1 className="text-lg font-semibold tracking-tight mb-2">
-          {denied ? 'Subscription inactive' : 'Account being set up'}
-        </h1>
-        <p className="text-sm text-zinc-400 leading-relaxed">
-          {denied
-            ? 'Your MetricAI subscription is currently inactive. Please contact us to renew and restore access.'
-            : 'Your MetricAI account is being activated — you’ll have access shortly.'}
-        </p>
-        <button type="button" onClick={() => clearAuth()} className="btn btn-secondary mt-6">
+
+        {!pending && (
+          <>
+            <div className="mt-6 rounded-xl border border-emerald-500/30 bg-emerald-950/20 p-5 text-center">
+              <div className="text-3xl font-bold tracking-tight text-emerald-50">₹1,500</div>
+              <div className="mt-1 text-xs uppercase tracking-wider text-zinc-500">per month · unlimited questions</div>
+            </div>
+
+            <a
+              href={PAY_LINK}
+              className="btn btn-primary w-full justify-center mt-4 h-11 text-sm font-semibold"
+            >
+              Pay ₹1,500 with any UPI app
+            </a>
+
+            <div className="mt-4 flex flex-col items-center">
+              <div className="text-[11px] uppercase tracking-wider text-zinc-500 mb-2">Or scan to pay</div>
+              <img
+                src={UPI_QR_DATA_URI}
+                alt="UPI QR code to pay ₹1,500 to MetricAI"
+                width={160}
+                height={160}
+                className="rounded-lg bg-white p-2"
+              />
+            </div>
+
+            <div className="mt-3">
+              <div className="text-[11px] uppercase tracking-wider text-zinc-500 mb-1.5">Or pay to this UPI ID</div>
+              <button
+                type="button"
+                onClick={copyUpi}
+                className="w-full flex items-center justify-between gap-3 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2.5 text-left hover:border-zinc-700 transition-colors"
+                title="Copy UPI ID"
+              >
+                <span className="font-mono text-sm text-zinc-200 truncate">{PAY_UPI_ID}</span>
+                <span className="text-[11px] font-medium text-emerald-400 shrink-0">
+                  {copied ? 'Copied' : 'Copy'}
+                </span>
+              </button>
+            </div>
+
+            <div className="mt-5 rounded-xl border border-zinc-800 bg-zinc-950/40 p-4">
+              <div className="text-xs font-semibold text-zinc-300 mb-2">After paying</div>
+              <p className="text-xs text-zinc-400 leading-relaxed">
+                Call or WhatsApp{' '}
+                <a href={`tel:${PAY_PHONE}`} className="text-emerald-400 font-medium">{PAY_PHONE}</a>{' '}
+                and tell us your account email. We’ll activate it right away.
+              </p>
+              {email && (
+                <div className="mt-3">
+                  <div className="text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Your account email</div>
+                  <div className="font-mono text-sm text-zinc-200 break-all">{email}</div>
+                </div>
+              )}
+            </div>
+          </>
+        )}
+
+        <button type="button" onClick={() => clearAuth()} className="btn btn-secondary w-full justify-center mt-5">
           Sign out
         </button>
       </div>
@@ -822,7 +907,7 @@ export default function App() {
   // Access control (Phase 2). Populated from /auth/me once logged in.
   // { enforced } is the backend rollout flag; { status } is this account's
   // access_status. The blocked screen shows only when enforced && != allowed.
-  const [access, setAccess] = useState<{ status?: string; enforced?: boolean } | null>(null)
+  const [access, setAccess] = useState<{ status?: string; enforced?: boolean; email?: string } | null>(null)
 
   // Probe /health on boot to discover whether AUTH_ENABLED=true. Result
   // lives in store.auth.authEnabled — the gate below renders only when
@@ -841,7 +926,7 @@ export default function App() {
     const check = async () => {
       try {
         const me = await fetchAuthMe()
-        if (alive) setAccess({ status: me.access_status, enforced: me.access_enforced })
+        if (alive) setAccess({ status: me.access_status, enforced: me.access_enforced, email: me.email })
       } catch { /* transient — do not lock the app on an error */ }
     }
     void check()
@@ -950,7 +1035,7 @@ export default function App() {
   // Access enforcement (Phase 2): when the backend is enforcing and this
   // customer isn't 'allowed', show the blocked screen instead of the app.
   if (access?.enforced && access.status && access.status !== 'allowed') {
-    return <AccessBlocked status={access.status} />
+    return <AccessBlocked status={access.status} email={access.email} />
   }
 
   return (

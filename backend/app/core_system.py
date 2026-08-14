@@ -2339,7 +2339,7 @@ async def admin_list_users(request: Request):
 
     async with get_connection() as db:
         cur = await db.execute(
-            "SELECT id, email, access_status, admin_notes, created_at "
+            "SELECT id, email, access_status, admin_notes, created_at, trial_ends_at "
             "FROM public.users ORDER BY created_at DESC"
         )
         rows = await cur.fetchall()
@@ -2357,8 +2357,11 @@ async def admin_set_status(user_id: str, body: AdminStatusBody, request: Request
     from app.infrastructure import get_connection
 
     async with get_connection() as db:
+        # Clearing trial_ends_at on ALLOW is what turns a trial account into a
+        # paid one: with no trial clock, _effective_status() stops expiring it,
+        # so a paid customer stays on until the owner manually denies them.
         await db.execute(
-            "UPDATE public.users SET access_status = ? WHERE id = ?",
+            "UPDATE public.users SET access_status = ?, trial_ends_at = NULL WHERE id = ?",
             (new_status, user_id),
         )
         await db.commit()
@@ -2508,15 +2511,12 @@ async def _auth_middleware(request: Request, call_next):
     if settings.access_enforcement:
         access = await get_access_status(principal.user_id)
         if access != "allowed":
-            body = envelope(
-                "Access blocked",
-                detail=(
-                    "Your account is pending approval."
-                    if access == "pending"
-                    else "Your MetricAI subscription is inactive."
-                ),
-                kind="access",
-            )
+            detail = {
+                "pending": "Your account is pending approval.",
+                "expired": "Your free trial has ended.",
+                "denied": "Your MetricAI subscription is inactive.",
+            }.get(access, "Access blocked.")
+            body = envelope("Access blocked", detail=detail, kind="access")
             body["access_status"] = access
             return JSONResponse(status_code=403, content=body)
     return await call_next(request)

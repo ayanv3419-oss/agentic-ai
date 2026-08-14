@@ -137,7 +137,7 @@
 
   /* ---------- Summary / cockpit ---------- */
   .summary {
-    display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px;
     margin-bottom: 12px;
   }
   .stat {
@@ -238,6 +238,11 @@
   .pill.allowed { color: var(--green); background: rgba(16,185,129,0.12); border-color: rgba(52,211,153,0.28); }
   .pill.pending { color: var(--amber); background: rgba(251,191,36,0.10); border-color: rgba(251,191,36,0.28); }
   .pill.denied  { color: var(--red);   background: rgba(248,113,113,0.10); border-color: rgba(248,113,113,0.28); }
+  .pill.trial   { color: #7dd3fc; background: rgba(56,189,248,0.10); border-color: rgba(56,189,248,0.30); }
+  .pill.expired { color: #fca5a5; background: rgba(248,113,113,0.10); border-color: rgba(248,113,113,0.28); }
+  .stat.trial { --c: #7dd3fc; --glow: rgba(56,189,248,0.15); }
+  .stat.trial .num { color: #7dd3fc; }
+  .dist .seg-trial { background: linear-gradient(90deg,#0284c7,#7dd3fc); }
 
   /* segmented control */
   .actions {
@@ -390,13 +395,14 @@
 
   <section class="summary" aria-label="Access summary">
     <div class="stat total glass">   <div class="top"><span class="dot"></span></div><div class="num" id="cTotal">0</div>  <div class="lbl">Total</div></div>
-    <div class="stat allowed glass"> <div class="top"><span class="dot"></span></div><div class="num" id="cAllowed">0</div><div class="lbl">Allowed</div></div>
-    <div class="stat pending glass"> <div class="top"><span class="dot"></span></div><div class="num" id="cPending">0</div><div class="lbl">Pending</div></div>
+    <div class="stat allowed glass"> <div class="top"><span class="dot"></span></div><div class="num" id="cAllowed">0</div><div class="lbl">Paid</div></div>
+    <div class="stat trial glass">   <div class="top"><span class="dot"></span></div><div class="num" id="cTrial">0</div>  <div class="lbl">On trial</div></div>
+    <div class="stat pending glass"> <div class="top"><span class="dot"></span></div><div class="num" id="cExpired">0</div><div class="lbl">Expired</div></div>
     <div class="stat denied glass">  <div class="top"><span class="dot"></span></div><div class="num" id="cDenied">0</div> <div class="lbl">Denied</div></div>
   </section>
 
   <div class="dist" id="distBar" aria-hidden="true">
-    <span class="seg-allowed"></span><span class="seg-pending"></span><span class="seg-denied"></span>
+    <span class="seg-allowed"></span><span class="seg-trial"></span><span class="seg-pending"></span><span class="seg-denied"></span>
   </div>
 
   <div class="toolbar">
@@ -526,11 +532,12 @@ function animateCount(el, target) {
   requestAnimationFrame(step);
 }
 
-function updateDistBar(a, p, d, total) {
+function updateDistBar(a, tr, p, d, total) {
   const bar = $("distBar");
   if (!bar) return;
   const t = total || 1;
   bar.querySelector(".seg-allowed").style.width = (a / t * 100) + "%";
+  bar.querySelector(".seg-trial").style.width = (tr / t * 100) + "%";
   bar.querySelector(".seg-pending").style.width = (p / t * 100) + "%";
   bar.querySelector(".seg-denied").style.width = (d / t * 100) + "%";
   bar.classList.toggle("empty", total === 0);
@@ -563,17 +570,20 @@ function formatDate(raw) {
 }
 
 function updateCounts() {
-  let allowed = 0, pending = 0, denied = 0;
+  let allowed = 0, trial = 0, blocked = 0, denied = 0;
   for (const u of USERS) {
-    if (u.access_status === "allowed") allowed++;
-    else if (u.access_status === "pending") pending++;
-    else if (u.access_status === "denied") denied++;
+    const s = effectiveStatus(u);
+    if (s === "allowed") allowed++;
+    else if (s === "trial") trial++;
+    else if (s === "denied") denied++;
+    else blocked++;              // expired + pending
   }
   animateCount($("cTotal"), USERS.length);
   animateCount($("cAllowed"), allowed);
-  animateCount($("cPending"), pending);
+  animateCount($("cTrial"), trial);
+  animateCount($("cExpired"), blocked);
   animateCount($("cDenied"), denied);
-  updateDistBar(allowed, pending, denied, USERS.length);
+  updateDistBar(allowed, trial, blocked, denied, USERS.length);
 }
 
 function esc(s) {
@@ -583,6 +593,29 @@ function esc(s) {
 }
 
 function statusLabel(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : "Unknown"; }
+
+// Mirror of the backend's _effective_status(): a 'trial' account reads as
+// 'trial' while the clock runs and 'expired' once it passes. Everything else
+// passes through unchanged.
+function effectiveStatus(u) {
+  const raw = (u.access_status || "allowed").toLowerCase();
+  if (raw !== "trial") return raw;
+  if (!u.trial_ends_at) return "allowed";
+  const end = new Date(u.trial_ends_at);
+  if (isNaN(end.getTime())) return "allowed";
+  return end > new Date() ? "trial" : "expired";
+}
+
+// "3 days left" / "ended 2 days ago" for a trial account.
+function trialInfo(u) {
+  if (!u.trial_ends_at) return "";
+  const end = new Date(u.trial_ends_at);
+  if (isNaN(end.getTime())) return "";
+  const ms = end - new Date();
+  const days = Math.ceil(Math.abs(ms) / 86400000);
+  if (ms > 0) return "Trial: " + days + (days === 1 ? " day left" : " days left");
+  return "Trial ended " + days + (days === 1 ? " day ago" : " days ago");
+}
 
 function hueFor(email) {
   const s = String(email || "");
@@ -638,7 +671,7 @@ function renderList() {
 }
 
 function renderCard(u) {
-  const status = u.access_status || "pending";
+  const status = effectiveStatus(u);
   const card = document.createElement("div");
   card.className = "card glass";
   card.dataset.id = u.id;
@@ -653,7 +686,8 @@ function renderCard(u) {
         '<div class="avatar" style="--h:' + hue + '" aria-hidden="true">' + initial + '</div>' +
         '<div class="who-text">' +
           '<div class="email">' + esc(u.email) + '</div>' +
-          '<div class="meta">Joined ' + esc(formatDate(u.created_at)) + '</div>' +
+          '<div class="meta">Joined ' + esc(formatDate(u.created_at)) +
+            (trialInfo(u) ? ' · ' + esc(trialInfo(u)) : '') + '</div>' +
         '</div>' +
       '</div>' +
       '<div class="card-top-right">' +

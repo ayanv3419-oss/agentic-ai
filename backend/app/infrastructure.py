@@ -591,7 +591,8 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     created_at    TEXT NOT NULL,
     access_status TEXT NOT NULL DEFAULT 'allowed',
-    admin_notes   TEXT
+    admin_notes   TEXT,
+    trial_ends_at TEXT
 )
 """
 
@@ -602,6 +603,9 @@ CREATE TABLE IF NOT EXISTS users (
 _USERS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("access_status", "TEXT NOT NULL DEFAULT 'allowed'"),
     ("admin_notes", "TEXT"),
+    # 7-day free trial (Phase 3). Set at signup for access_status='trial'
+    # accounts; NULL for grandfathered/allowed/denied accounts.
+    ("trial_ends_at", "TEXT"),
 )
 
 
