@@ -96,6 +96,25 @@ def _effective_status(raw: str | None, trial_ends_at: str | None) -> str:
     return "expired"
 
 
+async def get_trial_ends_at(user_id: str) -> str | None:
+    """The user's trial end timestamp (ISO string), or None when they aren't on
+    a trial. Powers the "N days left" badge. Never raises."""
+    if not user_id:
+        return None
+    try:
+        async with get_connection() as db:
+            cur = await db.execute(
+                "SELECT trial_ends_at FROM public.users WHERE id = ?", (user_id,)
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+        if rows:
+            return dict(rows[0]).get("trial_ends_at") or None
+    except Exception:
+        _log.warning("trial_ends_at lookup failed for %s", user_id, exc_info=True)
+    return None
+
+
 async def get_access_status(user_id: str) -> str:
     """Return the EFFECTIVE access state ('allowed' | 'expired' | 'denied' |
     'pending'), cached for a few minutes. Unknown users and any lookup error

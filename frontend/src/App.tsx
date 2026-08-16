@@ -7,7 +7,7 @@
  *
  * Pages live in `ui_system.tsx`. Data and state live in `client_core.ts`.
  */
-import React, { useEffect, useState, type ComponentType } from 'react'
+import React, { useEffect, useState, type ComponentType, type ReactNode } from 'react'
 import ReactDOM from 'react-dom/client'
 import * as Sentry from '@sentry/react'
 import './index.css'
@@ -29,8 +29,10 @@ import {
   Activity,
   AlertTriangle,
   Building2,
+  Check,
   LayoutDashboard,
   MessageSquare,
+  Sparkles,
   MessageSquarePlus,
   Trash2,
   Upload,
@@ -102,9 +104,13 @@ interface SidebarProps {
   open: boolean
   /** Toggle the drawer — wired to the header logo so clicking it closes. */
   onToggle: () => void
+  /** Days remaining in the free trial, or null when not on a trial. */
+  trialDaysLeft?: number | null
+  /** Open the plans / upgrade page. */
+  onUpgrade?: () => void
 }
 
-function Sidebar({ active, onSelect, open, onToggle }: SidebarProps) {
+function Sidebar({ active, onSelect, open, onToggle, trialDaysLeft, onUpgrade }: SidebarProps) {
   const sessions = useAppStore((s) => s.sessions)
   const viewingSessionId = useAppStore((s) => s.viewingSessionId)
   const refreshSessions = useAppStore((s) => s.refreshSessions)
@@ -182,6 +188,28 @@ function Sidebar({ active, onSelect, open, onToggle }: SidebarProps) {
           )
         })}
       </nav>
+
+      {/* Upgrade / plans entry point. Always available so a convinced trial
+          user can pay on day 2 instead of waiting to be locked out. */}
+      {onUpgrade && (
+        <div className="px-3 pb-2 shrink-0">
+          <button
+            type="button"
+            onClick={onUpgrade}
+            className="w-full flex items-center gap-3 rounded-lg px-3 py-2.5 text-left border border-emerald-500/25 bg-emerald-500/5 hover:bg-emerald-500/10 transition-colors"
+          >
+            <Sparkles className="w-4 h-4 shrink-0 text-emerald-400" />
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-medium leading-none text-emerald-100">Upgrade to Pro</div>
+              <div className="text-[11px] text-emerald-400/70 mt-1 leading-none">
+                {typeof trialDaysLeft === 'number' && trialDaysLeft > 0
+                  ? `${trialDaysLeft} ${trialDaysLeft === 1 ? 'day' : 'days'} left in trial`
+                  : '₹1,500 / month'}
+              </div>
+            </div>
+          </button>
+        </div>
+      )}
 
       {/* Chat sessions — New chat + recency-ordered history (ChatGPT-style). */}
       <div className="px-3 pt-2 pb-2 shrink-0 border-t border-zinc-800/70">
@@ -787,10 +815,51 @@ const PAY_LINK =
   `upi://pay?pa=${encodeURIComponent(PAY_UPI_ID)}&pn=${encodeURIComponent('MetricAI')}` +
   `&am=${PAY_AMOUNT}&cu=INR&tn=${encodeURIComponent('MetricAI subscription')}`
 
-function AccessBlocked({ status, email }: { status: string; email?: string }) {
+const FREE_FEATURES = [
+  'Full access for 7 days',
+  'Upload CSV & Excel files',
+  'Ask unlimited questions',
+  'Charts & dashboard',
+  'Answers in English & Hindi',
+]
+
+const PRO_FEATURES = [
+  'Everything in the free trial',
+  'Keeps working after 7 days',
+  'Unlimited questions & uploads',
+  'Priority WhatsApp support',
+  'New features as they launch',
+]
+
+function FeatureItem({ children }: { children: ReactNode }) {
+  return (
+    <li className="flex items-start gap-2.5 text-sm text-zinc-300">
+      <Check className="w-4 h-4 mt-0.5 shrink-0 text-emerald-400" />
+      <span>{children}</span>
+    </li>
+  )
+}
+
+/**
+ * Plans page. Doubles as the access-blocked screen (trial expired / denied /
+ * pending) and as the voluntary "Upgrade" view — `onBack` is supplied only in
+ * the latter case, which swaps the Sign-out button for a back-to-app one.
+ */
+function AccessBlocked({
+  status,
+  email,
+  daysLeft,
+  onBack,
+}: {
+  status: string
+  email?: string
+  daysLeft?: number | null
+  onBack?: () => void
+}) {
   const [copied, setCopied] = useState(false)
   const pending = status === 'pending'
   const expired = status === 'expired'
+  const onTrial = status === 'trial' || status === 'allowed'
 
   const copyUpi = () => {
     void navigator.clipboard?.writeText(PAY_UPI_ID).then(
@@ -799,85 +868,147 @@ function AccessBlocked({ status, email }: { status: string; email?: string }) {
     )
   }
 
+  const heading = pending
+    ? 'Account being set up'
+    : expired
+      ? 'Your free trial has ended'
+      : onTrial
+        ? 'Your plan'
+        : 'Subscription inactive'
+
+  const subheading = pending
+    ? 'Your MetricAI account is being activated — you’ll have access shortly.'
+    : expired
+      ? 'Upgrade to keep asking questions about your shop’s data.'
+      : onTrial
+        ? 'Upgrade any time to keep MetricAI after your trial.'
+        : 'Your subscription is inactive. Upgrade to restore access.'
+
   return (
-    <div className="min-h-screen w-screen overflow-y-auto flex items-center justify-center bg-zinc-950 text-zinc-100 p-4 sm:p-6">
-      <div className="max-w-md w-full rounded-2xl border border-zinc-800 bg-zinc-900/60 p-6 sm:p-8 shadow-xl">
+    <div className="min-h-screen w-screen overflow-y-auto bg-zinc-950 text-zinc-100">
+      <div className="max-w-4xl mx-auto px-4 py-10 sm:px-6 sm:py-14">
+        {/* Header */}
         <div className="text-center">
-          <div className="mx-auto mb-5 w-14 h-14 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
-            <Logo className="w-6 h-6 text-emerald-400" />
+          <div className="mx-auto mb-5 w-12 h-12 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
+            <Logo className="w-5 h-5 text-emerald-400" />
           </div>
-          <h1 className="text-lg font-semibold tracking-tight">
-            {pending ? 'Account being set up' : expired ? 'Your free trial has ended' : 'Subscription inactive'}
-          </h1>
-          <p className="mt-2 text-sm text-zinc-400 leading-relaxed">
-            {pending
-              ? 'Your MetricAI account is being activated — you’ll have access shortly.'
-              : expired
-                ? 'Your 7-day free trial is over. Continue using MetricAI for ₹1,500/month.'
-                : 'Your MetricAI subscription is inactive. Pay ₹1,500 to restore access.'}
-          </p>
+          <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight">{heading}</h1>
+          <p className="mt-2.5 text-sm text-zinc-400 max-w-md mx-auto leading-relaxed">{subheading}</p>
         </div>
 
-        {!pending && (
-          <>
-            <div className="mt-6 rounded-xl border border-emerald-500/30 bg-emerald-950/20 p-5 text-center">
-              <div className="text-3xl font-bold tracking-tight text-emerald-50">₹1,500</div>
-              <div className="mt-1 text-xs uppercase tracking-wider text-zinc-500">per month · unlimited questions</div>
-            </div>
-
-            <a
-              href={PAY_LINK}
-              className="btn btn-primary w-full justify-center mt-4 h-11 text-sm font-semibold"
-            >
-              Pay ₹1,500 with any UPI app
-            </a>
-
-            <div className="mt-4 flex flex-col items-center">
-              <div className="text-[11px] uppercase tracking-wider text-zinc-500 mb-2">Or scan to pay</div>
-              <img
-                src={UPI_QR_DATA_URI}
-                alt="UPI QR code to pay ₹1,500 to MetricAI"
-                width={160}
-                height={160}
-                className="rounded-lg bg-white p-2"
-              />
-            </div>
-
-            <div className="mt-3">
-              <div className="text-[11px] uppercase tracking-wider text-zinc-500 mb-1.5">Or pay to this UPI ID</div>
-              <button
-                type="button"
-                onClick={copyUpi}
-                className="w-full flex items-center justify-between gap-3 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2.5 text-left hover:border-zinc-700 transition-colors"
-                title="Copy UPI ID"
-              >
-                <span className="font-mono text-sm text-zinc-200 truncate">{PAY_UPI_ID}</span>
-                <span className="text-[11px] font-medium text-emerald-400 shrink-0">
-                  {copied ? 'Copied' : 'Copy'}
+        {/* Plan cards */}
+        <div className="mt-9 grid gap-4 md:grid-cols-2 items-start">
+          {/* Free trial */}
+          <div className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-6">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-sm font-medium text-zinc-400">Free Trial</div>
+              {onTrial && typeof daysLeft === 'number' && daysLeft > 0 && (
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-emerald-400 bg-emerald-500/10 border border-emerald-500/25 rounded-full px-2.5 py-1">
+                  {daysLeft} {daysLeft === 1 ? 'day' : 'days'} left
                 </span>
-              </button>
-            </div>
-
-            <div className="mt-5 rounded-xl border border-zinc-800 bg-zinc-950/40 p-4">
-              <div className="text-xs font-semibold text-zinc-300 mb-2">After paying</div>
-              <p className="text-xs text-zinc-400 leading-relaxed">
-                Call or WhatsApp{' '}
-                <a href={`tel:${PAY_PHONE}`} className="text-emerald-400 font-medium">{PAY_PHONE}</a>{' '}
-                and tell us your account email. We’ll activate it right away.
-              </p>
-              {email && (
-                <div className="mt-3">
-                  <div className="text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Your account email</div>
-                  <div className="font-mono text-sm text-zinc-200 break-all">{email}</div>
-                </div>
+              )}
+              {expired && (
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-amber-400 bg-amber-500/10 border border-amber-500/25 rounded-full px-2.5 py-1">
+                  Expired
+                </span>
               )}
             </div>
-          </>
+            <h2 className="mt-3 text-xl font-semibold tracking-tight">Try MetricAI</h2>
+            <p className="mt-1.5 text-sm text-zinc-400 leading-relaxed">
+              See your shop’s numbers answered in plain language, on your own data.
+            </p>
+            <div className="mt-5 flex items-baseline gap-1.5">
+              <span className="text-4xl font-bold tracking-tight">₹0</span>
+              <span className="text-sm text-zinc-500">/ 7 days</span>
+            </div>
+            <div className="mt-5 h-11 rounded-lg border border-zinc-800 bg-zinc-950/40 flex items-center justify-center text-sm text-zinc-500">
+              {expired ? 'Trial ended' : 'Your current plan'}
+            </div>
+            <ul className="mt-6 space-y-3">
+              {FREE_FEATURES.map((f) => <FeatureItem key={f}>{f}</FeatureItem>)}
+            </ul>
+          </div>
+
+          {/* Pro */}
+          <div className="rounded-2xl border border-emerald-500/40 bg-gradient-to-b from-emerald-950/30 to-zinc-900/40 p-6 shadow-lg shadow-emerald-950/30">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-sm font-medium text-emerald-300">MetricAI Pro</div>
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-emerald-300 bg-emerald-500/15 border border-emerald-500/30 rounded-full px-2.5 py-1">
+                Recommended
+              </span>
+            </div>
+            <h2 className="mt-3 text-xl font-semibold tracking-tight">Your shop’s analyst</h2>
+            <p className="mt-1.5 text-sm text-zinc-400 leading-relaxed">
+              Keep asking about profit, stock and trends — every day, all year.
+            </p>
+            <div className="mt-5 flex items-baseline gap-1.5">
+              <span className="text-4xl font-bold tracking-tight text-emerald-50">₹1,500</span>
+              <span className="text-sm text-zinc-500">/ month</span>
+            </div>
+            <a
+              href={PAY_LINK}
+              className="btn btn-primary w-full justify-center mt-5 h-11 text-sm font-semibold"
+            >
+              Upgrade to Pro — ₹1,500
+            </a>
+            <ul className="mt-6 space-y-3">
+              {PRO_FEATURES.map((f) => <FeatureItem key={f}>{f}</FeatureItem>)}
+            </ul>
+          </div>
+        </div>
+
+        {/* Payment details */}
+        {!pending && (
+          <div className="mt-8 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-6">
+            <h3 className="text-sm font-semibold text-zinc-200">How to pay</h3>
+            <div className="mt-5 grid gap-6 sm:grid-cols-[auto_1fr] sm:items-start">
+              <div className="flex flex-col items-center sm:items-start">
+                <img
+                  src={UPI_QR_DATA_URI}
+                  alt="UPI QR code to pay ₹1,500 to MetricAI"
+                  width={148}
+                  height={148}
+                  className="rounded-lg bg-white p-2"
+                />
+                <div className="mt-2 text-[11px] text-zinc-500">Scan with any UPI app</div>
+              </div>
+
+              <div className="min-w-0">
+                <div className="text-[11px] uppercase tracking-wider text-zinc-500 mb-1.5">Or pay to this UPI ID</div>
+                <button
+                  type="button"
+                  onClick={copyUpi}
+                  className="w-full flex items-center justify-between gap-3 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2.5 text-left hover:border-zinc-700 transition-colors"
+                  title="Copy UPI ID"
+                >
+                  <span className="font-mono text-sm text-zinc-200 truncate">{PAY_UPI_ID}</span>
+                  <span className="text-[11px] font-medium text-emerald-400 shrink-0">
+                    {copied ? 'Copied' : 'Copy'}
+                  </span>
+                </button>
+
+                <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-950/40 p-4">
+                  <div className="text-xs font-semibold text-zinc-300 mb-1.5">After paying</div>
+                  <p className="text-xs text-zinc-400 leading-relaxed">
+                    Call or WhatsApp{' '}
+                    <a href={`tel:${PAY_PHONE}`} className="text-emerald-400 font-medium">{PAY_PHONE}</a>{' '}
+                    and tell us your account email — we’ll activate it right away.
+                  </p>
+                  {email && (
+                    <div className="mt-3">
+                      <div className="text-[11px] uppercase tracking-wider text-zinc-500 mb-1">Your account email</div>
+                      <div className="font-mono text-sm text-zinc-200 break-all">{email}</div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
         )}
 
         {pending && (
-          <div className="mt-5 rounded-xl border border-zinc-800 bg-zinc-950/40 p-4 text-center">
-            <p className="text-xs text-zinc-400 leading-relaxed">
+          <div className="mt-8 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-6 text-center">
+            <p className="text-sm text-zinc-400 leading-relaxed">
               Need it activated now? Call or WhatsApp{' '}
               <a href={`tel:${PAY_PHONE}`} className="text-emerald-400 font-medium">{PAY_PHONE}</a>
               {email ? <> and mention <span className="font-mono text-zinc-300 break-all">{email}</span></> : null}.
@@ -885,9 +1016,17 @@ function AccessBlocked({ status, email }: { status: string; email?: string }) {
           </div>
         )}
 
-        <button type="button" onClick={() => clearAuth()} className="btn btn-secondary w-full justify-center mt-5">
-          Sign out
-        </button>
+        <div className="mt-8 flex justify-center">
+          {onBack ? (
+            <button type="button" onClick={onBack} className="btn btn-secondary">
+              Back to MetricAI
+            </button>
+          ) : (
+            <button type="button" onClick={() => clearAuth()} className="btn btn-secondary">
+              Sign out
+            </button>
+          )}
+        </div>
       </div>
     </div>
   )
@@ -918,7 +1057,11 @@ export default function App() {
   // Access control (Phase 2). Populated from /auth/me once logged in.
   // { enforced } is the backend rollout flag; { status } is this account's
   // access_status. The blocked screen shows only when enforced && != allowed.
-  const [access, setAccess] = useState<{ status?: string; enforced?: boolean; email?: string } | null>(null)
+  const [access, setAccess] = useState<
+    { status?: string; enforced?: boolean; email?: string; daysLeft?: number | null } | null
+  >(null)
+  // Voluntary plans/upgrade view (opened from the sidebar).
+  const [showPlans, setShowPlans] = useState(false)
 
   // Probe /health on boot to discover whether AUTH_ENABLED=true. Result
   // lives in store.auth.authEnabled — the gate below renders only when
@@ -937,7 +1080,21 @@ export default function App() {
     const check = async () => {
       try {
         const me = await fetchAuthMe()
-        if (alive) setAccess({ status: me.access_status, enforced: me.access_enforced, email: me.email })
+        // Days remaining in the free trial, rounded up (0.2 days left → "1 day
+        // left"), so the badge never reads "0 days" while access still works.
+        let daysLeft: number | null = null
+        if (me.trial_ends_at) {
+          const ms = new Date(me.trial_ends_at).getTime() - Date.now()
+          if (!Number.isNaN(ms)) daysLeft = Math.max(0, Math.ceil(ms / 86400000))
+        }
+        if (alive) {
+          setAccess({
+            status: me.access_status,
+            enforced: me.access_enforced,
+            email: me.email,
+            daysLeft,
+          })
+        }
       } catch { /* transient — do not lock the app on an error */ }
     }
     void check()
@@ -1015,8 +1172,8 @@ export default function App() {
   // access screen without any account state or enforcement. Pure UI — reads no
   // data and changes nothing — so it's safe to open (and handy for demos).
   const previewMode = new URLSearchParams(window.location.search).get('preview')
-  if (previewMode && ['expired', 'denied', 'pending'].includes(previewMode)) {
-    return <AccessBlocked status={previewMode} email="shop.owner@example.com" />
+  if (previewMode && ['expired', 'denied', 'pending', 'trial'].includes(previewMode)) {
+    return <AccessBlocked status={previewMode} email="shop.owner@example.com" daysLeft={4} />
   }
 
   // Password-reset deep link takes precedence over every gate: the user
@@ -1060,7 +1217,25 @@ export default function App() {
   // Access enforcement (Phase 2): when the backend is enforcing and this
   // customer isn't 'allowed', show the blocked screen instead of the app.
   if (access?.enforced && access.status && access.status !== 'allowed') {
-    return <AccessBlocked status={access.status} email={access.email} />
+    return (
+      <AccessBlocked
+        status={access.status}
+        email={access.email}
+        daysLeft={access.daysLeft}
+      />
+    )
+  }
+
+  // Voluntary "Upgrade" view — same plans page, but with a way back into the app.
+  if (showPlans) {
+    return (
+      <AccessBlocked
+        status={access?.status === 'allowed' ? 'trial' : (access?.status || 'trial')}
+        email={access?.email}
+        daysLeft={access?.daysLeft}
+        onBack={() => setShowPlans(false)}
+      />
+    )
   }
 
   return (
@@ -1090,6 +1265,8 @@ export default function App() {
       <Sidebar
         active={view}
         open={sidebarOpen}
+        trialDaysLeft={access?.status === 'trial' ? access?.daysLeft ?? null : null}
+        onUpgrade={() => { setShowPlans(true); setSidebarOpen(false) }}
         onToggle={() => setSidebarOpen((v) => !v)}
         onSelect={(key) => {
           setView(key)

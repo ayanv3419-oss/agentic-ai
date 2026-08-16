@@ -479,6 +479,7 @@ async def auth_me(request: Request) -> dict:
             # right blocked screen. `access_enforced` tells it whether the
             # backend is actually gating on it yet (the rollout flag).
             access = await identity.get_access_status(principal.user_id)
+            trial_ends_at = await identity.get_trial_ends_at(principal.user_id)
             # Drive connection is now PER-TENANT: report status for THIS
             # principal's tenant only.
             try:
@@ -492,6 +493,7 @@ async def auth_me(request: Request) -> dict:
                 "tenant_id": principal.tenant_id,
                 "access_status": access,
                 "access_enforced": settings.access_enforcement,
+                "trial_ends_at": trial_ends_at,
                 "authenticated": connected,
                 "drive_connected": connected,
                 "google_configured": google_drive.is_configured(),

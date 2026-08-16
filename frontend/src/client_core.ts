@@ -249,6 +249,8 @@ export interface AuthMe {
   // access_enforced = whether the backend is actually gating on it yet.
   access_status?: string
   access_enforced?: boolean
+  // ISO timestamp when the free trial ends (null when not on a trial).
+  trial_ends_at?: string | null
 }
 
 export interface DriveFile {
