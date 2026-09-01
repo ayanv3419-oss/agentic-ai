@@ -92,8 +92,9 @@
     text-shadow: 0 0 8px rgba(52,211,153,0.55), 0 0 16px rgba(16,185,129,0.35);
     font-size: 1.4rem; font-weight: 800; line-height: 1;
     box-shadow: 0 8px 24px -8px rgba(16,185,129,0.55), inset 0 1px 0 rgba(255,255,255,0.15);
-    flex: none;
+    flex: none; overflow: hidden;
   }
+  .sigma img{ width:100%; height:100%; object-fit:cover; }
   .brand-text { display: flex; flex-direction: column; line-height: 1.15; min-width: 0; }
   .brand-title { font-size: 1.12rem; font-weight: 700; letter-spacing: -0.01em; }
   .brand-title .muted { color: var(--text-dim); font-weight: 500; }
@@ -369,7 +370,7 @@
 <!-- Full-page gate -->
 <div id="gate" class="fullpage hidden">
   <div class="box glass">
-    <div class="sigma">&Sigma;</div>
+    <div class="sigma"><img src="logo-crystal.png" alt=""></div>
     <h1 id="gate-title">No admin key</h1>
     <p id="gate-msg"></p>
   </div>
@@ -379,7 +380,7 @@
 <div id="app" class="wrap hidden">
   <header class="top">
     <div class="brand">
-      <span class="sigma" aria-hidden="true">&Sigma;</span>
+      <span class="sigma" aria-hidden="true"><img src="logo-crystal.png" alt=""></span>
       <span class="brand-text">
         <span class="brand-title">MetricAI <span class="muted">Admin</span></span>
         <span class="brand-sub"><span class="live-dot" aria-hidden="true"></span> Owner console</span>

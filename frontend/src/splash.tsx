@@ -83,7 +83,6 @@ export function SplashScreen({ onDone }: { onDone: () => void }) {
   }, [phase])
 
   const tileClass = reduced ? 'splash-tile-static' : 'splash-tile-in'
-  const drawClass = reduced ? 'splash-sigma-static' : 'splash-sigma-draw'
   const wordClass = reduced ? 'splash-rise-static' : 'splash-word-in'
   const tagClass = reduced ? 'splash-rise-static' : 'splash-tag-in'
 
@@ -129,22 +128,11 @@ export function SplashScreen({ onDone }: { onDone: () => void }) {
             '0 0 90px 10px rgba(16,185,129,0.18), 0 0 34px rgba(16,185,129,0.32), inset 0 0 22px rgba(16,185,129,0.07)',
         }}
       >
-        <svg
-          viewBox="0 0 48 48"
-          fill="none"
-          stroke="#34d399"
-          strokeWidth={7}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          style={{
-            width: 52,
-            height: 52,
-            filter: 'drop-shadow(0 0 8px rgba(52,211,153,0.7)) drop-shadow(0 0 20px rgba(16,185,129,0.45))',
-          }}
-        >
-          <path d="M37 10H13l12 14-12 14h24" pathLength={100} className={drawClass} />
-        </svg>
+        <img
+          src="/logo-crystal.png"
+          alt="Metric AI"
+          style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: 'inherit' }}
+        />
       </div>
 
       {/* Wordmark + tagline, staggered. */}

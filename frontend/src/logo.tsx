@@ -1,24 +1,18 @@
 /**
- * Logo — the Metric AI brand mark: a Greek sigma "Σ" (the sum of every metric).
+ * Logo — the MetricAi brand mark: the emerald crystal.
  *
- * Drawn as an inline SVG so it inherits its size and colour from `className`
- * exactly like the lucide icons it replaced. Use it the same way, e.g.:
- *   <Logo className="w-3.5 h-3.5 text-emerald-400" />
+ * Rendered as an <img> that fills and covers its parent tile, so it drops into
+ * the existing rounded logo tiles exactly like the old mark did, e.g.:
+ *   <div className="w-7 h-7 rounded-md ..."><Logo className="..." /></div>
+ * `className` is accepted for compatibility; the size comes from the parent tile.
  */
 export function Logo({ className }: { className?: string }) {
   return (
-    <svg
-      viewBox="0 0 48 48"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={7}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
+    <img
+      src="/logo-crystal.png"
+      alt="MetricAi"
       className={className}
-      style={{ filter: 'drop-shadow(0 0 2px rgba(16,185,129,0.95)) drop-shadow(0 0 6px rgba(16,185,129,0.5))' }}
-    >
-      <path d="M37 10H13l12 14-12 14h24" />
-    </svg>
+      style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: 'inherit' }}
+    />
   )
 }
