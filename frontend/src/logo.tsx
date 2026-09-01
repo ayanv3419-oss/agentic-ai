@@ -11,11 +11,12 @@ export function Logo({ className }: { className?: string }) {
       viewBox="0 0 48 48"
       fill="none"
       stroke="currentColor"
-      strokeWidth={5}
+      strokeWidth={7}
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden="true"
       className={className}
+      style={{ filter: 'drop-shadow(0 0 2px rgba(16,185,129,0.95)) drop-shadow(0 0 6px rgba(16,185,129,0.5))' }}
     >
       <path d="M37 10H13l12 14-12 14h24" />
     </svg>
